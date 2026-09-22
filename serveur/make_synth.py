@@ -4,6 +4,7 @@
 Crée /srv/oura/oura.db (schéma open_oura) + /srv/oura/derived.db (tables dérivées)
 avec 30 nuits plausibles.  Usage : make_synth.py [nb_nuits] [prefixe]
 """
+import os
 import json
 import math
 import random
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS baselines (
     metric TEXT PRIMARY KEY, mean REAL, sd REAL, updated_unix INTEGER);
 """
 
-SERIAL = "RING_SERIAL"
+SERIAL = os.environ.get("OURA_SERIAL", "0000000000000000")
 
 
 def night_rows():

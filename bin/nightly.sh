@@ -7,7 +7,7 @@
 #   - score estimé (anchors publiés + poids officiels Oura)
 #   - température nocturne + baselines (EMA asymétrique ecore)
 #   - briefing LLM (llama-swap 127.0.0.1:8012) de la dernière nuit
-# puis met à jour derived.db lu par le portail oura.example.com.
+# puis met à jour derived.db lu par le portail.
 #
 # Logique complète : /srv/oura/bin/derive_night.py
 # (source : repo oura-ring, serveur/derive_night.py)

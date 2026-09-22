@@ -4,8 +4,8 @@ After=bluetooth.target
 
 [Service]
 Type=oneshot
-ExecStart=$HOME/.local/bin/oura-run.sh sync
-ExecStartPost=$HOME/.local/bin/oura-push.sh
+ExecStart=%h/.local/bin/oura-run.sh sync
+ExecStartPost=%h/.local/bin/oura-push.sh
 # anneau hors de portée = échec poli, le timer réessaiera
 SuccessExitStatus=1
 TimeoutStartSec=600

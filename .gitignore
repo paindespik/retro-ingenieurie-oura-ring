@@ -28,3 +28,6 @@ AGENTS.md
 AGENTS.override.md
 CLAUDE.md
 .pi/
+
+# documentation interne (contexte personnel, non publiée)
+docs/

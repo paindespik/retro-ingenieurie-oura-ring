@@ -6,9 +6,17 @@
 # Strategie : scan actif (l'anneau doit annoncer), connexion via le bond existant,
 # puis execution de la commande dans la fenetre de connexion.
 set -uo pipefail
+# Configuration locale (hors depot) : OURA_ID, OURA_KEY, OURA_DB...
+# OURA_ID = adresse d'identite BLE de VOTRE anneau, visible avec `oura scan`.
+[ -f "$HOME/.oura/config" ] && . "$HOME/.oura/config"
 K="${OURA_KEY:-$HOME/.oura/ring.key}"
 DB="${OURA_DB:-$HOME/.oura/oura.db}"
-ID="${OURA_ID:-XX:XX:XX:XX:XX:XX}"
+ID="${OURA_ID:-}"
+if [ -z "$ID" ]; then
+  echo "OURA_ID non defini : renseignez l'adresse d'identite BLE de l'anneau" >&2
+  echo "  echo 'OURA_ID=XX:XX:XX:XX:XX:XX' >> ~/.oura/config" >&2
+  exit 2
+fi
 SCAN=/tmp/oura-run-scan.log
 BUDGET="${OURA_BUDGET:-240}"
 
