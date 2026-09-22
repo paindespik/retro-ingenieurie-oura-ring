@@ -439,7 +439,22 @@ pub extern "C" fn core_create(
 pub extern "C" fn core_start_sync(core: *mut Core) {
     let core = unsafe { &*core };
     let inner = core.inner.clone();
+    reset_status(&inner, "auth", "démarrage…");
     core.runtime.spawn(run_sync(inner));
+}
+
+/// Remet le statut à zéro **de façon synchrone** avant de lancer une tâche.
+/// Sinon Kotlin, qui sonde le statut dès le retour de cette fonction, lit
+/// encore l'état terminal du cycle précédent ("done"/"error") et conclut à
+/// tort avant même que la nouvelle tâche ait été pollée.
+fn reset_status(inner: &Arc<Inner>, state: &str, detail: &str) {
+    let mut s = inner.status.lock().unwrap();
+    s.state = state.into();
+    s.detail = detail.into();
+    s.auth = String::new();
+    s.events = 0;
+    s.inserted = 0;
+    s.bytes_left = 0;
 }
 
 /// Cérémonie de bascule (factory-reset → clé → features → sync complète).
@@ -447,6 +462,7 @@ pub extern "C" fn core_start_sync(core: *mut Core) {
 pub extern "C" fn core_start_ceremony(core: *mut Core) {
     let core = unsafe { &*core };
     let inner = core.inner.clone();
+    reset_status(&inner, "ceremony", "démarrage…");
     core.runtime.spawn(run_ceremony(inner));
 }
 

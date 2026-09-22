@@ -26,5 +26,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- reprise immédiate quand le Bluetooth est rallumé
+             (STATE_CHANGED fait partie des broadcasts implicites autorisés) -->
+        <receiver
+            android:name=".BtStateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

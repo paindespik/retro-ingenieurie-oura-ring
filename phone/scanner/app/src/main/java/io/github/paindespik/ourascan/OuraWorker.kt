@@ -53,8 +53,12 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
 
         val adapter = (appCtx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (adapter == null || !adapter.isEnabled) {
-            log("Bluetooth éteint → retry")
-            return Result.retry()
+            // `success` et non `retry` : un retry ferait croître le backoff
+            // exponentiel (jusqu'à 5 h) et retarderait la reprise quand le
+            // Bluetooth revient. Le cycle périodique repasse dans 15 min, et
+            // BtStateReceiver relance immédiatement à l'allumage du BT.
+            log("Bluetooth éteint → rien à faire (prochain cycle dans 15 min)")
+            return Result.success()
         }
 
         // 1. clé + core
@@ -73,14 +77,13 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
         // 2. scan de l'anneau (≤ 25 s)
         val addr = scanForOura(adapter, 25_000)
         if (addr == null) {
-            log("aucune annonce Oura en 25 s → retry")
-            return Result.retry()
+            // anneau hors de portée / en charge : normal, silencieux
+            log("aucune annonce Oura en 25 s → prochain cycle")
+            maybeWarnStale(appCtx)
+            return Result.success()
         }
         log("annonce Oura vue : $addr")
-        notify(
-            if (ceremony) "Oura : bascule en cours…" else "Oura : sync en cours…",
-            "connexion à l'anneau ($addr)" + if (ceremony) " + bond" else ""
-        )
+        if (ceremony) notify("Oura : bascule en cours…", "connexion + bond ($addr)", ongoing = true)
 
         // 3. GATT + (ceremony | sync) (core Rust)
         var state = "error"
@@ -120,9 +123,20 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
             .putString("last_push", pushDetail)
             .putLong("last_unix", System.currentTimeMillis() / 1000)
             .apply()
-        val emoji = if (state == "done") "✅" else "⚠️"
-        val titre = if (ceremony) "Oura : $emoji bascule $state" else "Oura : $emoji $state"
-        notify(titre, "$detail ${pushDetail}".trim())
+        // Notifications : silencieuses en fonctionnement normal. Seuls cas
+        // notifiés : la cérémonie (on veut son résultat) et l'absence de sync
+        // réussie depuis plus de 2 h (même seuil que l'alerte du portail).
+        val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (state == "done") {
+            appCtx.getSharedPreferences("oura", Context.MODE_PRIVATE).edit()
+                .putLong("last_ok_unix", System.currentTimeMillis() / 1000).apply()
+            if (ceremony) notify("Oura : ✅ bascule terminée", "$detail $pushDetail".trim())
+            else runCatching { nm.cancel(NOTIF_ID) }
+        } else if (ceremony) {
+            notify("Oura : ⚠️ bascule échouée", detail)
+        } else {
+            maybeWarnStale(appCtx)
+        }
         return if (state == "done") Result.success() else Result.retry()
     }
 
@@ -170,7 +184,19 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
         return n
     }
 
-    private fun notify(title: String, text: String) {
+    /** Alerte unique (remplacée, jamais empilée) si aucune sync depuis 2 h. */
+    private fun maybeWarnStale(ctx: Context) {
+        val prefs = ctx.getSharedPreferences("oura", Context.MODE_PRIVATE)
+        val lastOk = prefs.getLong("last_ok_unix", 0)
+        if (lastOk == 0L) return
+        val h = (System.currentTimeMillis() / 1000 - lastOk) / 3600.0
+        if (h >= 2) {
+            notify("Oura : ⚠️ aucune sync depuis ${"%.1f".format(h)} h",
+                "Bluetooth activé ? anneau à portée ?")
+        }
+    }
+
+    private fun notify(title: String, text: String, ongoing: Boolean = false) {
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val ch = NotificationChannel(CH_ID, "Sync Oura", NotificationManager.IMPORTANCE_LOW)
         nm.createNotificationChannel(ch)
@@ -178,7 +204,9 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
             .setSmallIcon(android.R.drawable.ic_menu_upload)
             .setContentTitle(title)
             .setContentText(text)
-            .setOngoing(true)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setOngoing(ongoing)
+            .setAutoCancel(!ongoing)
             .build()
         runCatching { nm.notify(NOTIF_ID, n) }
     }

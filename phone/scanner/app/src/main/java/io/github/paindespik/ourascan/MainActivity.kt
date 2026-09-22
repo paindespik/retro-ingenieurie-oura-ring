@@ -11,6 +11,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
+import androidx.work.BackoffPolicy
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
@@ -100,6 +101,9 @@ class MainActivity : Activity() {
             text = "Enregistrer le periodic 15 min"
             setOnClickListener {
                 val req = PeriodicWorkRequestBuilder<OuraWorker>(Config.WORK_PERIOD_MIN, TimeUnit.MINUTES)
+                    // backoff borné : sans ça, des échecs répétés poussent le
+                    // prochain essai jusqu'à 5 h (exponentiel par défaut)
+                    .setBackoffCriteria(BackoffPolicy.LINEAR, 2, TimeUnit.MINUTES)
                     .build()
                 WorkManager.getInstance(this@MainActivity)
                     .enqueueUniquePeriodicWork(Config.WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req)
