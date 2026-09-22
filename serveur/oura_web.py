@@ -36,10 +36,14 @@ TAG_NAMES = {65: "ring_start", 66: "time_sync", 69: "state_change", 70: "temp_ev
              97: "debug_data", 107: "motion_period", 128: "ibi_hr", 139: "spo2_r_pi"}
 
 # Token par source au-dessus du Basic Auth nginx (header X-Oura-Token).
-# Le téléphone est la première source API ; le PC passera ici s'il le faut.
+# JAMAIS de valeur en dur : le secret vient de l'environnement du service
+# (EnvironmentFile=/etc/oura/ingest.env dans oura-web.service). Si la variable
+# est absente, l'ingest refuse tout — plutôt qu'accepter un token connu.
 INGEST_TOKENS = {
-    "phone": os.environ.get(
-        "OURA_PHONE_TOKEN", "TOKEN_RETIRE"),
+    s: t for s, t in {
+        "phone": os.environ.get("OURA_PHONE_TOKEN", ""),
+        "pc": os.environ.get("OURA_PC_TOKEN", ""),
+    }.items() if t
 }
 
 app = FastAPI(title="oura-web")
@@ -747,6 +751,10 @@ async def ingest_events(request: Request):
     Dédup sur UNIQUE(serial, tag, ring_timestamp, body) ; la télémétrie de
     fraîcheur (push_telemetry) alimente le portail et l'alerte > 2 h.
     """
+    if not INGEST_TOKENS:
+        raise HTTPException(
+            503, "aucun token d'ingest configuré (OURA_PHONE_TOKEN absent — voir "
+                 "/etc/oura/ingest.env)")
     token = request.headers.get("x-oura-token", "")
     src = next((s for s, t in INGEST_TOKENS.items() if t == token), None)
     if src is None:

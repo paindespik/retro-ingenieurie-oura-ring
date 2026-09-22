@@ -3,19 +3,27 @@ package io.github.paindespik.ourascan
 /**
  * Constantes de déploiement.
  *
- * WEB_USER / WEB_PASS = Basic Auth nginx existant de oura.example.com
- * (identique à ce que le navigateur envoie) — à renseigner au déploiement.
- * PHONE_TOKEN = X-Oura-Token (identifié la source « téléphone » côté serveur).
+ * Les secrets ne sont PAS dans le code : ils viennent de
+ * `phone/scanner/secrets.properties` (gitignoré) ou de l'environnement, et
+ * sont injectés dans `BuildConfig` par Gradle. Voir `secrets.properties.example`.
  */
 object Config {
-    const val SERVER = "https://oura.example.com"
+    /** Vhost du portail (Basic Auth nginx + TLS Let's Encrypt). */
+    val SERVER: String = BuildConfig.OURA_SERVER
     const val INGEST_PATH = "/ingest/events"
 
-    const val WEB_USER = "oura"
-    const val WEB_PASS = "MOT_DE_PASSE_RETIRE"
-    const val PHONE_TOKEN = "TOKEN_RETIRE"
+    /** Basic Auth du portail. */
+    val WEB_USER: String = BuildConfig.WEB_USER
+    val WEB_PASS: String = BuildConfig.WEB_PASS
 
-    const val RING_SERIAL = "RING_SERIAL"
+    /** En-tête X-Oura-Token : identifie la source côté serveur. */
+    val PHONE_TOKEN: String = BuildConfig.PHONE_TOKEN
+
+    val RING_SERIAL: String = BuildConfig.RING_SERIAL
+
+    /** `true` si le build a bien reçu les secrets (sinon : push impossible). */
+    val configured: Boolean
+        get() = WEB_PASS.isNotBlank() && PHONE_TOKEN.isNotBlank()
 
     /** Période WorkManager (min) — minimum Android = 15. */
     const val WORK_PERIOD_MIN = 15L

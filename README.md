@@ -50,8 +50,11 @@ les stocker en SQLite, les répliquer sur `serv` et les exposer sur un dashboard
 
 ## 3. Accès
 
-- Dashboard : **https://oura.example.com** — utilisateur `oura`, mot de passe `MOT_DE_PASSE_RETIRE`
-  (fichier `/etc/nginx/conf.d/oura.htpasswd` sur `serv`)
+- Dashboard : **https://oura.example.com** — Basic Auth, utilisateur `oura`.
+  Le mot de passe est dans le fichier htpasswd de la machine
+  (`/etc/nginx/conf.d/oura.htpasswd` sur `serv`) ; il n'est **pas** dans ce dépôt.
+  Rotation : `sudo htpasswd /etc/nginx/conf.d/oura.htpasswd oura && sudo systemctl reload nginx`
+  (penser à mettre à jour `phone/scanner/secrets.properties` et à reconstruire l'app).
 - API JSON : `/api/overview`, `/api/activity?date=…`, `/api/nights`, `/api/night?date=…`,
   `/api/trends?days=90`, `/api/briefing`, `/api/telemetry?hours=24`, `/api/events`,
   `/api/health`, `POST /api/chat`
@@ -65,10 +68,49 @@ les stocker en SQLite, les répliquer sur `serv` et les exposer sur un dashboard
 | [`docs/pieges-bluez.md`](docs/pieges-bluez.md) | **Les 5 pièges** qui ont coûté une soirée — à lire avant toute intervention BLE |
 | [`docs/serveur.md`](docs/serveur.md) | Installation complète côté `serv` (nginx, TLS, systemd, base, web) |
 | [`docs/etat-des-lieux.md`](docs/etat-des-lieux.md) | Ce qui tourne, ce qui reste à faire |
+| [`docs/etude-sync-telephone.md`](docs/etude-sync-telephone.md) | **Migration BLE vers le téléphone** : étude, bascule effectuée, pièges Android (Doze, scans BLE, callbacks API 33+) |
 
-## 5. Contenu du dossier
+## 5. Secrets et construction de l'app téléphone
+
+**Aucun secret n'est versionné.** Trois éléments vivent hors du dépôt :
+
+| Secret | Emplacement | Rôle |
+|---|---|---|
+| Clé app-auth de l'anneau (16 o) | `~/.oura/ring.key` (PC), `files/ring.key.hex` (téléphone) | authentification auprès de l'anneau |
+| Basic Auth du portail | `/etc/nginx/conf.d/oura.htpasswd` (serv) | accès au dashboard et à l'ingest |
+| Token d'ingest (`X-Oura-Token`) | `/etc/oura/ingest.env` (serv, `root:oura` 0640) | identifie la source d'un push |
+
+Côté serveur, `oura-web.service` charge le token via `EnvironmentFile=` ; si la
+variable manque, l'endpoint d'ingest répond 503 plutôt que d'accepter un token
+par défaut. Côté téléphone, Gradle lit `phone/scanner/secrets.properties`
+(gitignoré) et l'injecte dans `BuildConfig` ; un build sans secrets refuse de
+solliciter l'anneau.
+
+Construction complète depuis un clone frais :
+
+```sh
+rustup target add aarch64-linux-android          # cible Android
+export ANDROID_NDK=/opt/android-ndk              # NDK r27+
+cp phone/scanner/secrets.properties.example phone/scanner/secrets.properties
+$EDITOR phone/scanner/secrets.properties         # renseigner les valeurs
+./phone/build.sh                                 # core Rust + APK
+```
+
+Le `.so` ARM64 n'est pas versionné (artefact) : `phone/build.sh` le reconstruit
+et le place dans `jniLibs/`. L'APK sort dans
+`phone/scanner/app/build/outputs/apk/debug/`. Pose de la clé sur le téléphone :
+
+```sh
+adb shell "run-as io.github.paindespik.ourascan sh -c 'cat > files/ring.key.hex'" < ~/.oura/ring.key
+```
+
+## 6. Contenu du dossier
 
 ```
+phone/
+  build.sh                 construit le core Rust (ARM64) puis l'APK
+  core/                    core Rust : FFI/JNI + crates open_oura vendorisés
+  scanner/                 app Android (GATT, WorkManager, push HTTPS)
 scripts/
   oura-agent.py            agent d'appairage D-Bus auto-accept (→ /usr/local/bin/)
   oura-run.sh              lanceur de commandes avec reconnexion fiable (→ ~/.local/bin/)
@@ -76,20 +118,19 @@ scripts/
   bootstrap-appairage.sh   tout-en-un post-reset : clé + capteurs + premier sync
 bin/
   nightly.sh               job 05:35 sur serv (Phase 2 : dérive + score + briefing)
-serveur/
-  oura_web.py              copie ANCIENNE du dashboard (source canon : web/oura_web.py)
-  swap.sh                  swap atomique du snapshot
-  make_synth.py            générateur de données synthétiques (tests)
+serveur/                   miroir des fichiers déployés sur serv (source canonique)
+  oura_web.py              dashboard FastAPI + ingest /ingest/events (→ /srv/oura/web/)
+  swap.sh                  merge idempotent du snapshot PC (→ /srv/oura/bin/)
   derive_night.py          dérivation des nuits (stdlib Python, → /srv/oura/bin/)
-web/
-  oura_web.py              dashboard FastAPI (source canon, → /srv/oura/web/)
+  make_synth.py            générateur de données synthétiques (tests)
+  test-run.sh              lance le dashboard en local sur les bases de test/
 systemd/
   pc-user/     oura-sync.{service,timer}
   pc-system/   oura-agent.service
   serveur/     oura-web.service, oura-swap.timer, oura-nightly.timer, nginx-oura.conf
 ```
 
-## 6. Sources amont
+## 7. Sources amont
 
 - [`Th0rgal/open_oura`](https://github.com/Th0rgal/open_oura) — client Rust (cloné dans `~/src/open_oura`)
 - [`LogosIsLife/open_ring`](https://github.com/LogosIsLife/open_ring) — spécification protocole (Ring 4)

@@ -13,8 +13,18 @@ phone/scanner/app/build/
 phone/scanner/local.properties
 phone/scanner/app/src/main/jniLibs/
 
-# secrets
+# secrets — jamais dans le dépôt (voir secrets.properties.example)
 ring.key.backup
+phone/scanner/secrets.properties
+*.htpasswd
+ingest.env
+secrets.env
 
 # fixtures de test
 test/*.db
+
+# mémoire de l'assistant (contexte local, propre à la machine)
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+.pi/

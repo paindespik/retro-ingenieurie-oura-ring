@@ -1,7 +1,18 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// Secrets hors du dépôt : phone/scanner/secrets.properties (gitignoré), sinon
+// variables d'environnement. Voir secrets.properties.example.
+val secretsFile = rootProject.file("secrets.properties")
+val secretsProps = Properties().apply {
+    if (secretsFile.exists()) secretsFile.inputStream().use { load(it) }
+}
+fun secret(key: String, fallback: String = ""): String =
+    secretsProps.getProperty(key) ?: System.getenv(key) ?: fallback
 
 android {
     namespace = "io.github.paindespik.ourascan"
@@ -13,6 +24,16 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField("String", "OURA_SERVER", "\"${secret("OURA_SERVER", "https://oura.example.com")}\"")
+        buildConfigField("String", "WEB_USER", "\"${secret("WEB_USER")}\"")
+        buildConfigField("String", "WEB_PASS", "\"${secret("WEB_PASS")}\"")
+        buildConfigField("String", "PHONE_TOKEN", "\"${secret("PHONE_TOKEN")}\"")
+        buildConfigField("String", "RING_SERIAL", "\"${secret("RING_SERIAL")}\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {

@@ -84,6 +84,13 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
             return Result.success()
         }
 
+        if (!Config.configured) {
+            // build sans secrets.properties : inutile de solliciter l'anneau,
+            // le push serait de toute façon refusé par le serveur
+            log("build sans secrets (voir secrets.properties.example) → abandon")
+            return Result.failure()
+        }
+
         // 1. clé + core
         val keyFile = File(appCtx.filesDir, Config.KEY_FILE)
         if (!keyFile.exists()) {

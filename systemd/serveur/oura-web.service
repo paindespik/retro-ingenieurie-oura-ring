@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 User=oura
+# secrets hors du code et hors du dépôt : OURA_PHONE_TOKEN (=X-Oura-Token)
+# fichier root:oura 0640, créé à la main sur la machine
+EnvironmentFile=/etc/oura/ingest.env
 WorkingDirectory=/srv/oura/web
 ExecStart=/srv/oura/.venv/bin/uvicorn oura_web:app --host 127.0.0.1 --port 8091
 Restart=on-failure
