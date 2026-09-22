@@ -27,10 +27,12 @@ import android.util.Log
  */
 class OuraGatt(
     private val ctx: Context,
+    private val ceremony: Boolean,
     private val onResult: (state: String, detail: String) -> Unit
 ) {
     private val thread = HandlerThread("oura-gatt").also { it.start() }
     private val handler = Handler(thread.looper)
+    private var dev: BluetoothDevice? = null
     private var gatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
     private var notifyChar: BluetoothGattCharacteristic? = null
@@ -47,17 +49,19 @@ class OuraGatt(
 
     private fun doConnect(addr: String) {
         val adapter = (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        val dev = adapter?.getRemoteDevice(addr)
+        val d = adapter?.getRemoteDevice(addr)
             ?: return finish("error", "BT adapter indisponible")
-        Log.i(TAG, "connectGatt $addr")
-        gatt = dev.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE)
+        dev = d
+        Log.i(TAG, "connectGatt $addr${if (ceremony) " [cérémonie]" else ""}")
+        gatt = d.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE)
         idleSince = SystemClock.elapsedRealtime()
     }
 
     private fun finish(state: String, detail: String) {
         if (finished) return
         finished = true
-        Log.i(TAG, "FIN $state — $detail")
+        val raw = runCatching { Core.status() }.getOrDefault("<status KO>")
+        Log.i(TAG, "FIN $state — $detail | status brut = $raw")
         onResult(state, detail)
     }
 
@@ -65,8 +69,14 @@ class OuraGatt(
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(TAG, "GATT connecté → discoverServices")
-                    g.discoverServices()
+                    Log.i(TAG, "GATT connecté")
+                    if (ceremony && dev?.bondState != BluetoothDevice.BOND_BONDED) {
+                        Log.i(TAG, "bond SMP (createBond) → attente BOND_BONDED")
+                        runCatching { dev?.createBond() }
+                        pollBond()
+                    } else {
+                        g.discoverServices()
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     // si le core n'a pas déjà conclu, c'est une perte de lien
@@ -114,25 +124,66 @@ class OuraGatt(
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 return finish("error", "write CCC status=$status")
             }
-            Log.i(TAG, "notifications actives → core.startSync() + pump")
             idleSince = SystemClock.elapsedRealtime()
-            Core.startSync()
+            if (ceremony) {
+                Log.i(TAG, "notifications actives → core.startCeremony() + pump")
+                Core.startCeremony()
+            } else {
+                Log.i(TAG, "notifications actives → core.startSync() + pump")
+                Core.startSync()
+            }
             pump()
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            Log.i(TAG, "write confirmé status=$status")
             inFlight = false
             idleSince = SystemClock.elapsedRealtime()
             if (status == BluetoothGatt.GATT_SUCCESS) pump()
             else finish("error", "write GATT status=$status")
         }
 
+        // API < 33 (dépréciée) — gardée par compatibilité
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            val v = ch.value ?: return
-            Core.feed(v)
-            idleSince = SystemClock.elapsedRealtime()
-            pump()
+            onNotify(ch.value ?: return)
         }
+
+        // API 33+ : c'est CELLE-CI qu'Android appelle quand on cible SDK 33+.
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            onNotify(value)
+        }
+    }
+
+    private fun onNotify(v: ByteArray) {
+        if (finished) return
+        Log.i(TAG, "← notif ${v.size} o : ${v.take(12).joinToString("") { "%02x".format(it) }}")
+        Core.feed(v)
+        idleSince = SystemClock.elapsedRealtime()
+        pump()
+    }
+
+    private fun pollBond() {
+        val deadline = SystemClock.elapsedRealtime() + 40_000
+        val r = object : Runnable {
+            override fun run() {
+                if (finished) return
+                val bs = dev?.bondState
+                when {
+                    bs == BluetoothDevice.BOND_BONDED -> {
+                        Log.i(TAG, "bondé → discoverServices")
+                        gatt?.discoverServices()
+                    }
+                    SystemClock.elapsedRealtime() > deadline ->
+                        finish("error", "bond SMP échoué (timeout 40 s)")
+                    else -> handler.postDelayed(this, 500)
+                }
+            }
+        }
+        handler.postDelayed(r, 500)
     }
 
     private fun enableNotifications() {
@@ -141,22 +192,52 @@ class OuraGatt(
         runCatching { g.setCharacteristicNotification(n, true) }
         val ccc = n.getDescriptor(CCC_UUID)
         if (ccc == null) return finish("error", "descripteur CCC introuvable")
-        ccc.value = 0x0100.toByteArray() // ENABLE_NOTIFICATION
-        g.writeDescriptor(ccc)
+        val on = byteArrayOf(0x01, 0x00) // ENABLE_NOTIFICATION_VALUE
+        val rc = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            g.writeDescriptor(ccc, on)
+        } else {
+            @Suppress("DEPRECATION")
+            ccc.value = on
+            @Suppress("DEPRECATION")
+            if (g.writeDescriptor(ccc)) 0 else -1
+        }
+        Log.i(TAG, "write CCC rc=$rc (props notify=${n.properties})")
+        if (rc != 0) finish("error", "writeDescriptor CCC rc=$rc")
     }
 
+    private val pumpRunnable = Runnable { pumpOnce() }
+
+    /** Relance la pompe (dédoublonne les sondages déjà programmés). */
     private fun pump() {
-        if (finished || inFlight) return
-        handler.post {
-            if (finished || inFlight) return@post
+        if (finished) return
+        handler.removeCallbacks(pumpRunnable)
+        handler.post(pumpRunnable)
+    }
+
+    private fun pumpOnce() {
+        run {
+            if (finished || inFlight) return
             val pkt = Core.nextWrite()
             if (pkt != null) {
                 inFlight = true
-                writeChar!!.value = pkt
-                gatt!!.writeCharacteristic(writeChar!!)
-                return@post
+                val w = writeChar!!
+                val rc = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                    gatt!!.writeCharacteristic(w, pkt, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                } else {
+                    @Suppress("DEPRECATION")
+                    w.value = pkt
+                    @Suppress("DEPRECATION")
+                    if (gatt!!.writeCharacteristic(w)) 0 else -1
+                }
+                Log.i(TAG, "→ write ${pkt.size} o rc=$rc : ${pkt.take(12).joinToString("") { "%02x".format(it) }}")
+                if (rc != 0) {
+                    inFlight = false
+                    finish("error", "writeCharacteristic rc=$rc")
+                }
+                return
             }
-            // file vide : le core attend une notification (ou a conclu)
+            // File vide : soit le core a conclu, soit il travaille encore
+            // (le paquet suivant arrivera de manière asynchrone) → on re-sonde.
             val st = Core.status()
             when {
                 st.contains("\"done\"") -> finish("done", detailOf(st))
@@ -165,6 +246,7 @@ class OuraGatt(
                     finish("error", "timeout global ${TOTAL_TIMEOUT_MS / 1000 / 60} min")
                 SystemClock.elapsedRealtime() - idleSince > IDLE_TIMEOUT_MS ->
                     finish("error", "anneau silencieux ${IDLE_TIMEOUT_MS / 1000} s")
+                else -> handler.postDelayed(pumpRunnable, PUMP_POLL_MS)
             }
         }
     }
@@ -189,6 +271,9 @@ class OuraGatt(
         private const val TAG = "OuraSync"
         private const val TOTAL_TIMEOUT_MS = 15 * 60 * 1000L
         private const val IDLE_TIMEOUT_MS = 90 * 1000L
+
+        /** Sondage de la file d'écriture du core (production asynchrone). */
+        private const val PUMP_POLL_MS = 30L
         private val OURA_SVC = java.util.UUID.fromString("98ed0001-a541-11e4-b6a0-0002a5d5c51b")
         private val OURA_WRITE = java.util.UUID.fromString("98ed0002-a541-11e4-b6a0-0002a5d5c51b")
         private val OURA_NOTIFY = java.util.UUID.fromString("98ed0003-a541-11e4-b6a0-0002a5d5c51b")

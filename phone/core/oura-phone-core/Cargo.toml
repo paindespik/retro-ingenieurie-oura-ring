@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 oura-protocol = { path = "../vendor/oura-protocol" }
 oura-link = { path = "../vendor/oura-link", default-features = false }
 oura-store = { path = "../vendor/oura-store" }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"
 anyhow = "1"
 hex = "0.4"

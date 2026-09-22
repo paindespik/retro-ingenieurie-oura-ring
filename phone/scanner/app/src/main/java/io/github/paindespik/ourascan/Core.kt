@@ -37,6 +37,9 @@ object Core {
 
     fun startSync() = nativeStartSync(ptr)
 
+    /** Cérémonie de bascule : factory-reset → set_auth_key → features → sync. */
+    fun startCeremony() = nativeStartCeremony(ptr)
+
     fun feed(data: ByteArray) = nativeFeed(ptr, data)
 
     fun nextWrite(): ByteArray? = nativeNextWrite(ptr)
@@ -55,6 +58,7 @@ object Core {
 
     private external fun nativeCreate(keyHex: ByteArray, dbPath: ByteArray): Long
     private external fun nativeStartSync(p: Long)
+    private external fun nativeStartCeremony(p: Long)
     private external fun nativeFeed(p: Long, data: ByteArray)
     private external fun nativeNextWrite(p: Long): ByteArray?
     private external fun nativeStatus(p: Long): String

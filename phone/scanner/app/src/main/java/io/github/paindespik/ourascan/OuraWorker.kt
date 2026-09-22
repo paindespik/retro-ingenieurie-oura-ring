@@ -26,11 +26,30 @@ import kotlin.coroutines.resume
  * En cas d'échec (BT off, anneau absent, lien perdu…) → Result.retry()
  * (WorkManager réessaie avec backoff — aucune perte : l'anneau bufferise).
  */
-class OuraWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+class OuraWorker(ctx: Context, private val params: WorkerParameters) : CoroutineWorker(ctx, params) {
+    // Un seul cycle à la fois : le Core natif est un singleton (une seule
+    // machine à états / une seule file d'écriture). Deux workers simultanés
+    // (periodic + one-shot + cérémonie) corrompraient le flux.
+    private object Lock {
+        val running = java.util.concurrent.atomic.AtomicBoolean(false)
+    }
 
     override suspend fun doWork(): Result {
         val appCtx = applicationContext
-        log("doWork — début")
+        val ceremony = params.inputData.getInt("ceremony", 0) == 1
+        if (!Lock.running.compareAndSet(false, true)) {
+            log("un cycle est déjà en cours → abandon de celui-ci")
+            return Result.retry()
+        }
+        try {
+            return runCycle(appCtx, ceremony)
+        } finally {
+            Lock.running.set(false)
+        }
+    }
+
+    private suspend fun runCycle(appCtx: Context, ceremony: Boolean): Result {
+        log("doWork — début${if (ceremony) " [CÉRÉMONIE]" else ""}")
 
         val adapter = (appCtx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (adapter == null || !adapter.isEnabled) {
@@ -58,19 +77,30 @@ class OuraWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             return Result.retry()
         }
         log("annonce Oura vue : $addr")
-        notify("Oura : sync en cours…", "connexion à l'anneau ($addr)")
+        notify(
+            if (ceremony) "Oura : bascule en cours…" else "Oura : sync en cours…",
+            "connexion à l'anneau ($addr)" + if (ceremony) " + bond" else ""
+        )
 
-        // 3. GATT + sync (core Rust)
+        // 3. GATT + (ceremony | sync) (core Rust)
         var state = "error"
         var detail = ""
         val latch = CountDownLatch(1)
-        val gatt = OuraGatt(appCtx) { s, d ->
+        val gatt = OuraGatt(appCtx, ceremony) { s, d ->
             state = s
             detail = d
             latch.countDown()
         }
         gatt.connect(addr)
-        latch.await(TOTAL_TIMEOUT_S, TimeUnit.SECONDS)
+        // trace de la machine à états pendant l'attente (diagnostic)
+        val deadline = System.currentTimeMillis() + TOTAL_TIMEOUT_MIN * 60_000
+        while (!latch.await(2, TimeUnit.SECONDS)) {
+            log("… ${runCatching { Core.status() }.getOrDefault("<KO>")}")
+            if (System.currentTimeMillis() > deadline) {
+                detail = "timeout worker $TOTAL_TIMEOUT_MIN min"
+                break
+            }
+        }
         gatt.close()
         log("sync terminé : $state — $detail")
 
@@ -91,7 +121,8 @@ class OuraWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             .putLong("last_unix", System.currentTimeMillis() / 1000)
             .apply()
         val emoji = if (state == "done") "✅" else "⚠️"
-        notify("Oura : $emoji $state", "$detail ${pushDetail}".trim())
+        val titre = if (ceremony) "Oura : $emoji bascule $state" else "Oura : $emoji $state"
+        notify(titre, "$detail ${pushDetail}".trim())
         return if (state == "done") Result.success() else Result.retry()
     }
 
@@ -158,8 +189,11 @@ class OuraWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         private const val TAG = "OuraWorker"
         private const val CH_ID = "oura-sync"
         private const val NOTIF_ID = 42
-        private const val TOTAL_TIMEOUT_S = 15L
-        private const val PUSH_LIMIT = 1500
+        /** minutes : une première sync complète (drain du buffer) peut être longue. */
+        private const val TOTAL_TIMEOUT_MIN = 15L
+        /** Delta re-poussé à chaque cycle (le serveur dédup) — large marge
+         *  pour rattraper un premier drain ou des pushes manqués. */
+        private const val PUSH_LIMIT = 5000
         private const val OURA_UUID = "98ed0001-a541-11e4-b6a0-0002a5d5c51b"
         private const val CONFIG_KEY = "KEY"
     }

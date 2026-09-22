@@ -234,6 +234,150 @@ async fn run_sync(inner: Arc<Inner>) {
     set("done", &detail);
 }
 
+/// Cérémonie de bascule (miroir de `bootstrap-appairage.sh` côté PC) :
+///   anneau factory-reset (keyless) → set_auth_key (notre clé) → authenticate
+///   → setup + time-sync → features HR/SpO2 → sleep-analyze → drain complet.
+/// Le bond SMP est fait côté Kotlin (createBond) avant d'appeler ce flux.
+async fn run_ceremony(inner: Arc<Inner>) {
+    use oura_protocol::protocol::{feature, feature_mode};
+
+    let status = inner.status.clone();
+    let set = |st: &str, detail: &str| {
+        let mut s = status.lock().unwrap();
+        s.state = st.into();
+        s.detail = detail.into();
+    };
+
+    let transport = AndroidTransport {
+        out: inner.out.clone(),
+        in_tx: inner.in_tx.clone(),
+    };
+    let client = OuraClient::new(transport);
+    let key = inner.key;
+    let store = inner.store.clone();
+
+    // 1/5 installation de la clé (anneau keyless → SetAuthKey sans auth préalable)
+    set("ceremony", "1/5 installation de la clé…");
+    let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
+    status.lock().unwrap().serial = serial.clone();
+    // Si une tentative précédente a déjà posé la clé, SetAuthKey échouera :
+    // ce n'est pas fatal, on vérifie ensuite par l'authentification.
+    let key_set = match client.set_auth_key(&key).await {
+        Ok(()) => "OK",
+        Err(e) => {
+            set("ceremony", &format!("set_auth_key KO ({e}) → test de l'auth…"));
+            "déjà posée ?"
+        }
+    };
+
+    // 2/5 vérification de l'auth avec la clé installée
+    set("ceremony", "2/5 authentification…");
+    match client.authenticate(&key).await {
+        Ok(AuthResult::Success) => {}
+        Ok(a) => {
+            set("error", &format!("auth refusée : {a:?} (set_auth_key {key_set})"));
+            return;
+        }
+        Err(e) => {
+            set("error", &format!("auth: {e} (set_auth_key {key_set})"));
+            return;
+        }
+    }
+    status.lock().unwrap().auth = "success".into();
+
+    // 3/5 setup + time-sync + features HR/SpO2 + sleep-analyze
+    set("ceremony", "3/5 setup + time-sync…");
+    if let Err(e) = client.setup_app_stream().await {
+        set("error", &format!("setup: {e}"));
+        return;
+    }
+    if let Err(e) = client.sync_time_app().await {
+        set("error", &format!("sync_time: {e}"));
+        return;
+    }
+    let info = client.firmware().await.ok();
+    let battery = client.battery().await.ok();
+    {
+        let mut s = status.lock().unwrap();
+        if let Some(b) = &battery {
+            s.battery = b.percent as i64;
+        }
+    }
+    set("ceremony", "4/5 features HR/SpO2 + sleep-analyze…");
+    let feats = client
+        .set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC)
+        .await
+        .map(|()| "HR")
+        .err();
+    let spo2 = client
+        .set_feature_mode(feature::SPO2, feature_mode::AUTOMATIC)
+        .await
+        .map(|()| "SpO2")
+        .err();
+    let sleep = client.check_sleep_analysis(true).await.err();
+    // non fatals : la sync passe quand même
+    let feat_detail = format!(
+        "features {} {} {}",
+        feats.map(|e| format!("KO ({e})")).unwrap_or_else(|| "OK".into()),
+        spo2.map(|e| format!("KO ({e})")).unwrap_or_else(|| "OK".into()),
+        sleep.map(|e| format!("KO ({e})")).unwrap_or_else(|| "OK".into()),
+    );
+    {
+        let st = store.lock().unwrap();
+        let _ = st.upsert_device(&serial, None, info.as_ref());
+    }
+
+    // 4/5 drain complet
+    set("ceremony", "5/5 drain des événements…");
+    let cursor = store.lock().unwrap().cursor(&serial).unwrap_or(0);
+    let pending: Mutex<Vec<oura_protocol::events::RingEvent>> = Mutex::new(Vec::new());
+    let outcome = match client
+        .drain_events(
+            cursor,
+            |ev| {
+                pending.lock().unwrap().push(ev.clone());
+                true
+            },
+            |p| {
+                let events = std::mem::take(&mut *pending.lock().unwrap());
+                let st = store.lock().unwrap();
+                match st.commit_batch(&serial, &events, p.next_cursor) {
+                    Ok(n) => {
+                        let mut s = status.lock().unwrap();
+                        s.cursor = p.next_cursor as i64;
+                        s.bytes_left = p.bytes_left as i64;
+                        s.events = p.events_synced as i64;
+                        s.inserted += n as i64;
+                    }
+                    Err(e) => {
+                        set("error", &format!("db: {e}"));
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            set("error", &format!("drain: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = store.lock().unwrap().set_cursor(&serial, outcome.next_cursor) {
+        set("error", &format!("curseur final: {e}"));
+        return;
+    }
+    let s = status.lock().unwrap();
+    let detail = format!(
+        "clé installée, {} — {} événements, curseur {}",
+        feat_detail, outcome.events_synced, outcome.next_cursor
+    );
+    drop(s);
+    set("done", &detail);
+}
+
 // ---------------------------------------------------------------------------
 // API FFI (C ABI)
 // ---------------------------------------------------------------------------
@@ -263,7 +407,10 @@ pub extern "C" fn core_create(
             .map_err(|_| anyhow::anyhow!("clé != 16 octets"))?;
         let path = OsStr::from_bytes(db_bytes);
         let store = Store::open(path)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // multi-thread obligatoire : on utilise `spawn()` sans `block_on`,
+        // or un runtime current-thread ne poll ses tâches que dans `block_on`.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()?;
         let (in_tx, _) = tokio::sync::broadcast::channel(2048);
@@ -293,6 +440,14 @@ pub extern "C" fn core_start_sync(core: *mut Core) {
     let core = unsafe { &*core };
     let inner = core.inner.clone();
     core.runtime.spawn(run_sync(inner));
+}
+
+/// Cérémonie de bascule (factory-reset → clé → features → sync complète).
+#[no_mangle]
+pub extern "C" fn core_start_ceremony(core: *mut Core) {
+    let core = unsafe { &*core };
+    let inner = core.inner.clone();
+    core.runtime.spawn(run_ceremony(inner));
 }
 
 /// Notification GATT reçue → alimente la machine à états.
@@ -426,6 +581,13 @@ pub extern "system" fn Java_io_github_paindespik_ourascan_Core_nativeStartSync<'
     _env: JNIEnv<'local>, _cls: JClass<'local>, ptr: jlong,
 ) {
     core_start_sync(ptr as *mut Core);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_paindespik_ourascan_Core_nativeStartCeremony<'local>(
+    _env: JNIEnv<'local>, _cls: JClass<'local>, ptr: jlong,
+) {
+    core_start_ceremony(ptr as *mut Core);
 }
 
 #[no_mangle]

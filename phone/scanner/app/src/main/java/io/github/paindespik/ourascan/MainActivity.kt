@@ -12,6 +12,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -77,6 +78,24 @@ class MainActivity : Activity() {
                 true
             }
         }
+        val btnStop = Button(this).apply {
+            text = "Stop (annuler tous les cycles)"
+            setOnClickListener {
+                WorkManager.getInstance(this@MainActivity).cancelAllWork()
+                appendLog("tous les cycles annulés")
+            }
+        }
+        val btnCeremony = Button(this).apply {
+            text = "Bascule (factory-reset → clé → sync)"
+            setOnClickListener {
+                val req = OneTimeWorkRequestBuilder<OuraWorker>()
+                    .setInputData(androidx.work.Data.Builder().putInt("ceremony", 1).build())
+                    .build()
+                WorkManager.getInstance(this@MainActivity)
+                    .enqueueUniqueWork("oura-ceremony", ExistingWorkPolicy.REPLACE, req)
+                refreshStatus()
+            }
+        }
         val btnPeriodic = Button(this).apply {
             text = "Enregistrer le periodic 15 min"
             setOnClickListener {
@@ -93,7 +112,9 @@ class MainActivity : Activity() {
             addView(statusView)
             addView(detailView)
             addView(btnNow)
+            addView(btnCeremony)
             addView(btnPeriodic)
+            addView(btnStop)
         }
         setContentView(ScrollView(this).apply { addView(root) })
 
