@@ -106,8 +106,14 @@ class MainActivity : Activity() {
                     .setBackoffCriteria(BackoffPolicy.LINEAR, 2, TimeUnit.MINUTES)
                     .build()
                 WorkManager.getInstance(this@MainActivity)
-                    .enqueueUniquePeriodicWork(Config.WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req)
-                refreshStatus()
+                    .enqueueUniquePeriodicWork(Config.WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, req)
+                Heartbeat.schedule(this@MainActivity)
+                appendLog("cycle 15 min + battement anti-Doze armés")
+            }
+            setOnLongClickListener { // test : battement dans 60 s (vérif Doze)
+                Heartbeat.schedule(this@MainActivity, 60_000)
+                appendLog("battement de test dans 60 s")
+                true
             }
         }
         val root = LinearLayout(this).apply {
@@ -123,6 +129,9 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
 
         ensurePermissions()
+        // le battement se réarme tout seul à chaque déclenchement ; on le
+        // (re)pose à l'ouverture de l'app par sécurité
+        Heartbeat.schedule(this)
         refreshStatus()
     }
 

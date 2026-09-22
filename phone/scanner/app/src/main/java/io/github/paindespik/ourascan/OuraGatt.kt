@@ -28,6 +28,9 @@ import android.util.Log
 class OuraGatt(
     private val ctx: Context,
     private val ceremony: Boolean,
+    /** `true` pour un appareil déjà appairé : la pile BLE établit le lien dès
+     *  que l'anneau est joignable, sans scan préalable (fonctionne en Doze). */
+    private val autoConnect: Boolean = false,
     private val onResult: (state: String, detail: String) -> Unit
 ) {
     private val thread = HandlerThread("oura-gatt").also { it.start() }
@@ -38,6 +41,7 @@ class OuraGatt(
     private var notifyChar: BluetoothGattCharacteristic? = null
     private var inFlight = false
     private var finished = false
+    private var connected = false
     private var mtuDone = false
     private var cccWritten = false
     private var idleSince = 0L
@@ -52,9 +56,14 @@ class OuraGatt(
         val d = adapter?.getRemoteDevice(addr)
             ?: return finish("error", "BT adapter indisponible")
         dev = d
-        Log.i(TAG, "connectGatt $addr${if (ceremony) " [cérémonie]" else ""}")
-        gatt = d.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE)
+        Log.i(TAG, "connectGatt $addr auto=$autoConnect${if (ceremony) " [cérémonie]" else ""}")
+        gatt = d.connectGatt(ctx, autoConnect, cb, BluetoothDevice.TRANSPORT_LE)
         idleSince = SystemClock.elapsedRealtime()
+        // chien de garde : sans lien établi, on rend la main au lieu de
+        // mobiliser la radio jusqu'au timeout global
+        handler.postDelayed({
+            if (!connected && !finished) finish("error", "anneau injoignable en ${CONNECT_TIMEOUT_MS / 1000} s")
+        }, CONNECT_TIMEOUT_MS)
     }
 
     private fun finish(state: String, detail: String) {
@@ -69,6 +78,7 @@ class OuraGatt(
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    connected = true
                     Log.i(TAG, "GATT connecté")
                     if (ceremony && dev?.bondState != BluetoothDevice.BOND_BONDED) {
                         Log.i(TAG, "bond SMP (createBond) → attente BOND_BONDED")
@@ -271,6 +281,7 @@ class OuraGatt(
         private const val TAG = "OuraSync"
         private const val TOTAL_TIMEOUT_MS = 15 * 60 * 1000L
         private const val IDLE_TIMEOUT_MS = 90 * 1000L
+        private const val CONNECT_TIMEOUT_MS = 150 * 1000L
 
         /** Sondage de la file d'écriture du core (production asynchrone). */
         private const val PUMP_POLL_MS = 30L

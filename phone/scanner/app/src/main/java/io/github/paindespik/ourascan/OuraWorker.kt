@@ -5,12 +5,15 @@ import android.app.NotificationManager
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import android.os.Build
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -48,6 +51,26 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
         }
     }
 
+    /** Repli si WorkManager doit exécuter le cycle en service de premier plan
+     *  (expedited sans quota, ou API < 31). Type `connectedDevice` : c'est
+     *  exactement notre cas d'usage (dialogue BLE avec l'anneau). */
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(
+            NotificationChannel(CH_ID, "Sync Oura", NotificationManager.IMPORTANCE_LOW)
+        )
+        val n = NotificationCompat.Builder(applicationContext, CH_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_upload)
+            .setContentTitle("Oura : sync de l'anneau…")
+            .setOngoing(true)
+            .build()
+        return if (Build.VERSION.SDK_INT >= 29) {
+            ForegroundInfo(NOTIF_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            ForegroundInfo(NOTIF_ID, n)
+        }
+    }
+
     private suspend fun runCycle(appCtx: Context, ceremony: Boolean): Result {
         log("doWork — début${if (ceremony) " [CÉRÉMONIE]" else ""}")
 
@@ -75,21 +98,37 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
         }
 
         // 2. scan de l'anneau (≤ 25 s)
-        val addr = scanForOura(adapter, 25_000)
-        if (addr == null) {
-            // anneau hors de portée / en charge : normal, silencieux
-            log("aucune annonce Oura en 25 s → prochain cycle")
-            maybeWarnStale(appCtx)
-            return Result.success()
+        // Anneau déjà appairé → connexion directe sur son adresse d'IDENTITÉ,
+        // sans scan : la reconnexion est prise en charge par le contrôleur BLE,
+        // qui lui fonctionne en Doze (tout scan BLE est bloqué écran éteint).
+        // Le scan filtré ne sert plus qu'à l'appairage initial (cérémonie).
+        val bonded = runCatching { adapter.bondedDevices }.getOrNull()
+            ?.firstOrNull { (it.name ?: "").contains("oura", ignoreCase = true) }
+        val addr: String
+        val auto: Boolean
+        if (bonded != null && !ceremony) {
+            addr = bonded.address
+            auto = true
+            log("anneau appairé ($addr) → connexion directe, sans scan")
+        } else {
+            val found = scanForOura(adapter, 25_000)
+            if (found == null) {
+                // anneau hors de portée / en charge : normal, silencieux
+                log("aucune annonce Oura en 25 s → prochain cycle")
+                maybeWarnStale(appCtx)
+                return Result.success()
+            }
+            addr = found
+            auto = false
+            log("annonce Oura vue : $addr")
         }
-        log("annonce Oura vue : $addr")
         if (ceremony) notify("Oura : bascule en cours…", "connexion + bond ($addr)", ongoing = true)
 
         // 3. GATT + (ceremony | sync) (core Rust)
         var state = "error"
         var detail = ""
         val latch = CountDownLatch(1)
-        val gatt = OuraGatt(appCtx, ceremony) { s, d ->
+        val gatt = OuraGatt(appCtx, ceremony, auto) { s, d ->
             state = s
             detail = d
             latch.countDown()
@@ -158,7 +197,18 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
                         }
                     }
                 }
-                runCatching { scanner.startScan(cb) }
+                // Filtre OBLIGATOIRE : depuis Android 8.1, un scan BLE sans
+                // filtre ne remonte aucun résultat quand l'écran est éteint
+                // (c'est exactement notre cas la nuit).
+                val filters = listOf(
+                    ScanFilter.Builder()
+                        .setServiceUuid(android.os.ParcelUuid.fromString(OURA_UUID))
+                        .build()
+                )
+                val settings = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build()
+                runCatching { scanner.startScan(filters, settings, cb) }
                 cont.invokeOnCancellation { runCatching { scanner.stopScan(cb) } }
             }
         }
