@@ -200,6 +200,27 @@ machine à états protocolaire. L'artefact `.so` n'est pas versionné :
 
 ## Licence
 
-Projet personnel publié tel quel, sans garantie. Les marques citées
-appartiennent à leurs détenteurs respectifs ; ce dépôt n'est affilié ni à Ōura
-Health Oy ni à aucun de ses services.
+MIT — voir [`LICENSE`](LICENSE).
+
+Le dossier `phone/core/vendor/` contient une copie figée de crates du projet
+[`open_oura`](https://github.com/Th0rgal/open_oura) (Thomas Marchand), sous
+licence MIT également : licence et provenance dans
+[`phone/core/vendor/LICENSE`](phone/core/vendor/LICENSE) et
+[`NOTICE.md`](phone/core/vendor/NOTICE.md).
+
+## Avertissement
+
+Projet personnel publié tel quel, **sans garantie**, à des fins
+d'interopérabilité avec un appareil dont on est propriétaire.
+
+Ce dépôt ne contient **aucun code, micrologiciel, ressource ou clé** provenant
+d'Ōura Health Oy : il implémente un client indépendant qui dialogue avec
+l'anneau au moyen d'une clé applicative que l'utilisateur génère lui-même.
+
+« Oura » est une marque d'Ōura Health Oy ; elle n'est employée ici qu'à titre
+descriptif, pour désigner l'appareil avec lequel ce logiciel est compatible. Ce
+projet n'est ni affilié à Ōura Health Oy, ni approuvé ou soutenu par elle.
+
+L'utilisation d'un client tiers est susceptible de contrevenir aux conditions
+d'utilisation du service officiel et d'affecter la garantie de l'appareil :
+chacun reste responsable de son propre usage.
