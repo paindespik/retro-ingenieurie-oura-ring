@@ -1,0 +1,20 @@
+# runtime / caches
+venv/
+__pycache__/
+*.pyc
+
+# build Rust (core)
+phone/core/target/
+
+# build Gradle/Android
+phone/scanner/.gradle/
+phone/scanner/build/
+phone/scanner/app/build/
+phone/scanner/local.properties
+phone/scanner/app/src/main/jniLibs/
+
+# secrets
+ring.key.backup
+
+# fixtures de test
+test/*.db

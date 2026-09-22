@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "oura-phone-core",
+    "vendor/oura-protocol",
+    "vendor/oura-store",
+    "vendor/oura-link",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Th0rgal/open_oura"
+
+# Vendu depuis Th0rgal/open_oura @ 945470c (2026-09) — conserver ces 3 crates
+# en synchro avec le binaire PC `oura` si on pousse des fixes en amont.
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"

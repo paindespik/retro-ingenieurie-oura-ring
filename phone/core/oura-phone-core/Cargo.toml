@@ -1,0 +1,21 @@
+[package]
+name = "oura-phone-core"
+version = "0.1.0"
+edition = "2021"
+description = "FFI core for the Oura Android app: reuses oura-protocol / oura-link / oura-store (vendored, pinned to Th0rgal/open_oura @ 945470c)"
+
+[lib]
+name = "oura_phone_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+oura-protocol = { path = "../vendor/oura-protocol" }
+oura-link = { path = "../vendor/oura-link", default-features = false }
+oura-store = { path = "../vendor/oura-store" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+async-trait = "0.1"
+anyhow = "1"
+hex = "0.4"
+serde_json = "1"
+tracing = "0.1"
+jni = "0.21"

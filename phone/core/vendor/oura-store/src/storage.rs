@@ -1,0 +1,519 @@
+//! Optional SQLite persistence (feature `storage`).
+//!
+//! Events are stored with their raw body retained, so unknown event types are
+//! never lost and can be decoded later. A per-device sync cursor enables
+//! incremental syncs. Re-syncing is idempotent: identical events are de-duped.
+
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::error::Result;
+use oura_protocol::device::{Battery, DeviceInfo};
+use oura_protocol::events::RingEvent;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS device (
+    serial        TEXT PRIMARY KEY,
+    hardware_id   TEXT,
+    firmware      TEXT,
+    api_version   TEXT,
+    mac           TEXT,
+    updated_unix  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    serial        TEXT PRIMARY KEY,
+    next_cursor   INTEGER NOT NULL,
+    last_sync_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial         TEXT NOT NULL,
+    tag            INTEGER NOT NULL,
+    name           TEXT NOT NULL,
+    ring_timestamp INTEGER NOT NULL,
+    body           BLOB NOT NULL,
+    decoded_json   TEXT,
+    captured_unix  INTEGER NOT NULL,
+    UNIQUE(serial, tag, ring_timestamp, body)
+);
+CREATE INDEX IF NOT EXISTS idx_events_serial_tag ON events(serial, tag);
+CREATE INDEX IF NOT EXISTS idx_events_capture ON events(captured_unix, id);
+CREATE INDEX IF NOT EXISTS idx_events_tag_time ON events(tag, ring_timestamp);
+
+CREATE TABLE IF NOT EXISTS readings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial        TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    value         REAL NOT NULL,
+    unit          TEXT,
+    captured_unix INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_readings_serial_kind ON readings(serial, kind);
+"#;
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A SQLite-backed store for ring data.
+pub struct Store {
+    conn: Connection,
+}
+
+impl Store {
+    /// Open (creating if needed) a database at `path` and ensure the schema.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let conn = Connection::open(path)?;
+        // Health data + device identifiers are sensitive; keep the DB owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
+        }
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if mode != "wal" {
+            return Err(crate::error::Error::Storage(format!(
+                "WAL unavailable: {mode}"
+            )));
+        }
+        conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self { conn })
+    }
+
+    /// Read without changing schema, permissions, or journal mode (including bundled seeds).
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        Ok(Self { conn })
+    }
+
+    /// Commit a complete protocol batch and its cursor together, before ACK/progress.
+    pub fn commit_batch(&self, serial: &str, events: &[RingEvent], cursor: u32) -> Result<u32> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut inserted = 0;
+        for event in events {
+            inserted += u32::from(self.insert_event(serial, event)?);
+        }
+        self.set_cursor(serial, cursor)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn integrity_check(&self) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))?)
+    }
+
+    /// Open an in-memory database (useful for tests).
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self { conn })
+    }
+
+    /// Record/refresh device metadata.
+    pub fn upsert_device(
+        &self,
+        serial: &str,
+        hardware_id: Option<&str>,
+        info: Option<&DeviceInfo>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO device (serial, hardware_id, firmware, api_version, mac, updated_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(serial) DO UPDATE SET
+               hardware_id=COALESCE(excluded.hardware_id, device.hardware_id),
+               firmware=COALESCE(excluded.firmware, device.firmware),
+               api_version=COALESCE(excluded.api_version, device.api_version),
+               mac=COALESCE(excluded.mac, device.mac),
+               updated_unix=excluded.updated_unix",
+            params![
+                serial,
+                hardware_id,
+                info.map(|i| i.firmware_version.clone()),
+                info.map(|i| i.api_version.clone()),
+                info.map(|i| i.mac.clone()),
+                now_unix(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Device identity + last-sync for display: the most-recently-updated device
+    /// row joined with its sync state.
+    /// Returns `(serial, hardware_id, firmware, api_version, mac, updated_unix, last_sync_unix, next_cursor)`.
+    #[allow(clippy::type_complexity)]
+    pub fn device_info(
+        &self,
+    ) -> Result<Option<(String, String, String, String, String, i64, i64, i64)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT d.serial, COALESCE(d.hardware_id,''), COALESCE(d.firmware,''),
+                        COALESCE(d.api_version,''), COALESCE(d.mac,''), COALESCE(d.updated_unix,0),
+                        COALESCE(s.last_sync_unix,0), COALESCE(s.next_cursor,0)
+                 FROM device d LEFT JOIN sync_state s ON s.serial = d.serial
+                 ORDER BY d.updated_unix DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The persisted incremental-sync cursor (deciseconds), or 0 if none.
+    pub fn cursor(&self, serial: &str) -> Result<u32> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT next_cursor FROM sync_state WHERE serial = ?1",
+                params![serial],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) as u32)
+    }
+
+    /// Persist the next sync cursor.
+    pub fn set_cursor(&self, serial: &str, cursor: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_state (serial, next_cursor, last_sync_unix)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(serial) DO UPDATE SET
+               next_cursor=excluded.next_cursor,
+               last_sync_unix=excluded.last_sync_unix",
+            params![serial, cursor as i64, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// Insert an event, ignoring exact duplicates. Returns true if a row was added.
+    pub fn insert_event(&self, serial: &str, ev: &RingEvent) -> Result<bool> {
+        let decoded = ev
+            .decoded
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO events
+               (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                serial,
+                ev.tag as i64,
+                ev.name,
+                ev.timestamp as i64,
+                ev.body,
+                decoded,
+                now_unix(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Record a scalar reading (e.g. live HR bpm, SpO2 %, battery %).
+    pub fn insert_reading(&self, serial: &str, kind: &str, value: f64, unit: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO readings (serial, kind, value, unit, captured_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![serial, kind, value, unit, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// Convenience: store a battery reading.
+    pub fn insert_battery(&self, serial: &str, battery: &Battery) -> Result<()> {
+        self.insert_reading(serial, "battery_percent", battery.percent as f64, "%")
+    }
+
+    /// Re-decode every stored event body with the current decoders, updating
+    /// `decoded_json`. Returns `(rows_with_decode, total_rows)`. Lets new decoders
+    /// be applied to events captured before they existed — no re-sync needed.
+    pub fn redecode(&self) -> Result<(usize, usize)> {
+        let rows: Vec<(i64, i64, Vec<u8>)> = {
+            let mut stmt = self.conn.prepare("SELECT id, tag, body FROM events")?;
+            let collected = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            collected
+        };
+        let total = rows.len();
+        let mut decoded_count = 0;
+        for (id, tag, body) in rows {
+            let decoded = oura_protocol::events::decode_event_body(tag as u8, &body)
+                .map(|v| serde_json::to_string(&v).unwrap_or_default());
+            if decoded.is_some() {
+                decoded_count += 1;
+            }
+            let name = oura_protocol::events::event_name(tag as u8);
+            self.conn.execute(
+                "UPDATE events SET decoded_json = ?1, name = ?2 WHERE id = ?3",
+                params![decoded, name, id],
+            )?;
+        }
+        Ok((decoded_count, total))
+    }
+
+    /// All decoded events as `(ring_timestamp_deciseconds, tag, decoded_json,
+    /// captured_unix)`, ordered by ring time. For analysis/reporting commands that
+    /// reconstruct time series from stored events.
+    /// Les `limit` événements les plus récents du serial, prêts à être poussés
+    /// (plus récents d'abord). `body` en hex ; `decoded_json` tel quel (TEXT).
+    pub fn recent_events(
+        &self,
+        serial: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, u8, String, i64, String, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT serial, tag, name, ring_timestamp, body, decoded_json, captured_unix
+             FROM events WHERE serial = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let it = stmt.query_map(params![serial, limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u8>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                hex::encode(r.get::<_, Vec<u8>>(4)?),
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        it.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn decoded_events(&self) -> Result<Vec<(i64, u8, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ring_timestamp, tag, decoded_json, captured_unix FROM events \
+             WHERE decoded_json IS NOT NULL ORDER BY captured_unix, id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u8,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct device serials that have stored events.
+    pub fn device_serials(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT serial FROM events ORDER BY serial")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Count stored events grouped by event name (descending).
+    pub fn event_counts(&self, serial: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, COUNT(*) FROM events WHERE serial = ?1 GROUP BY name ORDER BY 2 DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![serial], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event() -> RingEvent {
+        RingEvent {
+            tag: 0x43,
+            name: "debug_event",
+            timestamp: 42,
+            body: vec![1, 2, 3],
+            decoded: None,
+        }
+    }
+
+    #[test]
+    fn full_database_keeps_the_previous_checkpoint() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_cursor("S1", 7).unwrap();
+        let pages: u32 = store
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        store
+            .conn
+            .execute_batch(&format!("PRAGMA max_page_count={pages};"))
+            .unwrap();
+        let mut event = sample_event();
+        event.body = vec![42; 1024 * 1024];
+        let error = store.commit_batch("S1", &[event], 43).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::Sqlite { code: 13, .. }
+        ));
+        assert_eq!(store.cursor("S1").unwrap(), 7);
+        assert!(store.event_counts("S1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_cursor_commit_rolls_back_entire_batch() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_cursor("S1", 7).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_cursor BEFORE UPDATE ON sync_state BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END;").unwrap();
+        let error = store.commit_batch("S1", &[sample_event()], 43).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::Sqlite { code: 19, .. }
+        ));
+        assert_eq!(store.cursor("S1").unwrap(), 7);
+        assert!(store.event_counts("S1").unwrap().is_empty());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_cursor;")
+            .unwrap();
+        assert_eq!(store.commit_batch("S1", &[sample_event()], 43).unwrap(), 1);
+        assert_eq!(store.commit_batch("S1", &[sample_event()], 43).unwrap(), 0);
+        assert_eq!(store.cursor("S1").unwrap(), 43);
+    }
+
+    #[test]
+    fn failed_insert_rolls_back_earlier_rows_and_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_row BEFORE INSERT ON events WHEN NEW.ring_timestamp=99 BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;").unwrap();
+        let mut bad = sample_event();
+        bad.timestamp = 99;
+        assert!(store
+            .commit_batch("S1", &[sample_event(), bad], 100)
+            .is_err());
+        assert!(store.event_counts("S1").unwrap().is_empty());
+        assert_eq!(store.cursor("S1").unwrap(), 0);
+    }
+
+    #[test]
+    fn read_only_open_does_not_initialize_schema_or_create_file() {
+        let path = std::env::temp_dir().join(format!("oura-missing-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE sentinel(value);").unwrap();
+        }
+        let reader = Store::open_read_only(&path).unwrap();
+        assert!(reader.event_counts("S1").is_err());
+        assert_eq!(reader.integrity_check().unwrap(), "ok");
+        drop(reader);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_enables_wal_on_writable_file() {
+        let dir = std::env::temp_dir().join(format!("oura-store-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal.db");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reader_survives_open_writer_transaction() {
+        let dir = std::env::temp_dir().join(format!("oura-store-rw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.db");
+        let _ = std::fs::remove_file(&path);
+        let writer = Store::open(&path).unwrap();
+        writer.insert_event("S1", &sample_event()).unwrap();
+        // Hold an uncommitted write open — under WAL a reader still gets a
+        // consistent snapshot instead of SQLITE_BUSY / a partial read.
+        writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        writer
+            .conn
+            .execute(
+                "INSERT INTO readings (serial, kind, value, unit, captured_unix)
+                 VALUES ('S1', 'battery_percent', 50.0, '%', 0)",
+                [],
+            )
+            .unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        let counts = reader.event_counts("S1").unwrap();
+        assert_eq!(counts, vec![("debug_event".to_string(), 1)]);
+        writer.conn.execute_batch("COMMIT;").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn events_dedup_and_cursor_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let ev = RingEvent {
+            tag: 0x43,
+            name: "debug_event",
+            timestamp: 42,
+            body: vec![1, 2, 3],
+            decoded: None,
+        };
+        assert!(store.insert_event("S1", &ev).unwrap());
+        assert!(!store.insert_event("S1", &ev).unwrap()); // duplicate ignored
+
+        store.set_cursor("S1", 1234).unwrap();
+        assert_eq!(store.cursor("S1").unwrap(), 1234);
+
+        let counts = store.event_counts("S1").unwrap();
+        assert_eq!(counts, vec![("debug_event".to_string(), 1)]);
+    }
+
+    #[test]
+    fn decoded_events_preserve_capture_order_across_clock_reset() {
+        let store = Store::open_in_memory().unwrap();
+        for timestamp in [5_000_000, 10] {
+            let event = RingEvent {
+                tag: 0x42,
+                name: "time_sync",
+                timestamp,
+                body: vec![0, 0, 0, 0],
+                decoded: Some(serde_json::json!({"unix_time": 1_700_000_000})),
+            };
+            assert!(store.insert_event("S1", &event).unwrap());
+        }
+        let timestamps: Vec<i64> = store
+            .decoded_events()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(timestamps, [5_000_000, 10]);
+    }
+}
