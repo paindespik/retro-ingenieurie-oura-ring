@@ -48,6 +48,11 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
             return runCycle(appCtx, ceremony)
         } finally {
             Lock.running.set(false)
+            // Filet : on réarme le battement à CHAQUE cycle, pas seulement dans
+            // le receveur. Un battement perdu (processus tué pendant la
+            // réception, alarme non délivrée) interrompait sinon la chaîne
+            // définitivement.
+            runCatching { Heartbeat.schedule(appCtx) }
         }
     }
 
@@ -153,13 +158,12 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
         gatt.close()
         log("sync terminé : $state — $detail")
 
-        // 4. push delta (si OK)
+        // 4. envoi de tout le retard (par lots, avec repère de progression)
         var pushDetail = ""
         if (state == "done") {
             val cursor = cursorFromStatus()
-            val events = Core.recentEvents(PUSH_LIMIT)
-            log("push de ${countEvents(events)} événement(s), curseur $cursor")
-            pushDetail = Pusher.push(appCtx, events, cursor)
+            pushDetail = Pusher.pushPending(appCtx, cursor)
+            log("envoi : $pushDetail")
         }
 
         // 5. persistance + notification
@@ -183,7 +187,11 @@ class OuraWorker(ctx: Context, private val params: WorkerParameters) : Coroutine
         } else {
             maybeWarnStale(appCtx)
         }
-        return if (state == "done") Result.success() else Result.retry()
+        // Jamais `retry` : le backoff exponentiel de WorkManager éloignait les
+        // tentatives d'heure en heure après quelques échecs (anneau hors de
+        // portée la nuit, par exemple) et la cadence ne revenait plus. Le
+        // battement de 15 min et le cycle périodique suffisent à la régularité.
+        return Result.success()
     }
 
     private suspend fun scanForOura(adapter: BluetoothAdapter, timeoutMs: Long): String? {

@@ -102,13 +102,20 @@ def time_axis(con):
             anchors.append((rt, int(j["unix_time"])))
     if anchors:
         def t_of(rt):
-            off = None
+            # `ring_timestamp` est en DECISECONDES (cf. docstring) : l'ancre
+            # donne l'instant unix d'un tick, le temps ecoule depuis cette
+            # ancre vaut (rt - art) / 10 secondes. Additionner les ticks comme
+            # s'ils etaient des secondes decalait de ~2 h par quart d'heure.
+            anchor = None
             for art, au in anchors:
                 if art <= rt:
-                    off = au - art
+                    anchor = (art, au)
                 else:
                     break
-            return rt + off if off is not None else None
+            if anchor is None:
+                return None
+            art, au = anchor
+            return au + (rt - art) / 10.0
         return t_of, "sync"
     pairs = [(r[0], r[1]) for r in con.execute("SELECT ring_timestamp, captured_unix FROM events")]
     epochs = build_epochs(pairs)
@@ -317,7 +324,14 @@ def ashr_round(t, shift):
 
 
 def ema_baseline(samples, age_days=0):
-    """Port ecore baseline_update_lt_mean_and_dev (ported/baseline.rs), replié."""
+    """Port ecore baseline_update_lt_mean_and_dev (ported/baseline.rs), replié.
+
+    Les échantillons sont des **entièrs en centièmes de degré** : l'algorithme
+    d'origine travaille en virgule fixe (décalages de bits), les biais et
+    magnitudes sont exprimés dans cette unité. Le résultat est dans la même
+    unité que l'entrée.
+    """
+    samples = [int(round(s)) for s in samples]
     mean_x8 = dev_x8 = 0
     for i, s in enumerate(samples):
         s8 = s << 3
@@ -444,7 +458,9 @@ def compute_night(con, night, prev_temps):
     temp_dev = None
     if tnight_centi is not None and prev_temps:
         bmean, _ = ema_baseline(prev_temps, age_days=len(prev_temps) - 1)
-        temp_dev = round(tnight_centi / 100.0 - bmean, 2)
+        # bmean est dans l'unité des échantillons (centièmes de degré) : la
+        # différence se fait AVANT la conversion en degrés.
+        temp_dev = round((tnight_centi - bmean) / 100.0, 2)
 
     # timing : midpoint heure locale (0..24 h, replié en 12 h si > midi)
     a = datetime.fromtimestamp(night["start_unix"]).hour + datetime.fromtimestamp(night["start_unix"]).minute / 60
@@ -563,12 +579,15 @@ def update_baselines(con, now):
             continue
         con.execute("INSERT OR REPLACE INTO baselines (metric, mean, sd, updated_unix)"
                     " VALUES (?,?,?,?)", (metric, round(mean, 3), round(sd, 3), now))
-    # température : EMA asymétrique ecore replié sur les nuits précédentes
-    temps = [r[6] for r in rows[:-1] if r[6] is not None]
+    # température : EMA asymétrique ecore replié sur les nuits précédentes.
+    # `sleep_scores.temp_mean` est en degrés ; ema_baseline attend des centièmes
+    # (même convention qu'à l'appel de compute_night).
+    temps = [int(round(r[6] * 100)) for r in rows[:-1] if r[6] is not None]
     if temps:
         bmean, bdev = ema_baseline(temps, age_days=max(0, len(temps) - 1))
         con.execute("INSERT OR REPLACE INTO baselines (metric, mean, sd, updated_unix)"
-                    " VALUES (?,?,?,?)", ("temp_nightly", round(bmean, 2), round(bdev, 2), now))
+                    " VALUES (?,?,?,?)",
+                    ("temp_nightly", round(bmean / 100.0, 2), round(bdev / 100.0, 2), now))
 
 
 # ---------------------------------------------------------------- briefing
@@ -667,7 +686,12 @@ def main():
               f"({row['total']} h, eff {row['efficiency']} %, latence {row['latency']} min, "
               f"staging {row['staging_source']}, axe horaire: {mode})")
 
-    update_baselines(der, time.time())
+    # Les nuits sont déjà écrites : un incident sur les lignes de base ne doit
+    # pas empêcher leur enregistrement.
+    try:
+        update_baselines(der, time.time())
+    except Exception as e:  # noqa: BLE001
+        print(f"nightly: lignes de base ignorées ({e})", file=sys.stderr)
     der.commit()
 
     if args.briefing:

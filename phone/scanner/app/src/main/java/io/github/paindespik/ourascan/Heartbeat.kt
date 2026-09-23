@@ -51,9 +51,11 @@ object Heartbeat {
 class HeartbeatReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         Log.i(Heartbeat.TAG, "battement → cycle + réarmement")
+        // REPLACE et non KEEP : avec KEEP, un travail resté en attente de
+        // reprise (backoff) bloquait définitivement tous les battements suivants.
         WorkManager.getInstance(ctx).enqueueUniqueWork(
             "oura-sync-heartbeat",
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.REPLACE,
             OneTimeWorkRequestBuilder<OuraWorker>()
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()

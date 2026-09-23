@@ -48,6 +48,9 @@ object Core {
 
     fun recentEvents(limit: Int): String = nativeRecentEvents(ptr, limit)
 
+    /** Lot d'événements d'identifiant > [afterId], ordre croissant. */
+    fun eventsSince(afterId: Long, limit: Int): String = nativeEventsSince(ptr, afterId, limit)
+
     fun drop() {
         if (ptr != 0L) {
             nativeDrop(ptr)
@@ -63,5 +66,6 @@ object Core {
     private external fun nativeNextWrite(p: Long): ByteArray?
     private external fun nativeStatus(p: Long): String
     private external fun nativeRecentEvents(p: Long, limit: Int): String
+    private external fun nativeEventsSince(p: Long, afterId: Long, limit: Int): String
     private external fun nativeDrop(p: Long)
 }

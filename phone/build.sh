@@ -45,11 +45,16 @@ fi
 # deux builds : sinon la signature change et `pm install -r` échoue avec
 # INSTALL_FAILED_UPDATE_INCOMPATIBLE.
 if command -v docker >/dev/null 2>&1 && [ -z "${ANDROID_HOME:-}" ]; then
-  mkdir -p /tmp/gradle-home /tmp/android-user-home
+  # ATTENTION : garder ces dossiers hors de /tmp. La cle de debug y est
+  # stockee ; si elle est recreee, la signature change et la mise a jour de
+  # l'app echoue (INSTALL_FAILED_UPDATE_INCOMPATIBLE, reinstallation complete).
+  GRADLE_HOME_DIR="${OURA_GRADLE_HOME:-$HOME/.cache/oura-gradle}"
+  ANDROID_HOME_DIR="${OURA_ANDROID_HOME:-$HOME/.oura/android-home}"
+  mkdir -p "$GRADLE_HOME_DIR" "$ANDROID_HOME_DIR"
   docker run --rm \
     -v "$ROOT/phone/scanner":/app -w /app \
-    -v /tmp/gradle-home:/root/.gradle \
-    -v /tmp/android-user-home:/root/.android \
+    -v "$GRADLE_HOME_DIR":/root/.gradle \
+    -v "$ANDROID_HOME_DIR":/root/.android \
     -e ANDROID_HOME=/opt/android-sdk-linux \
     ghcr.io/cirruslabs/flutter:stable \
     ./gradlew --no-daemon assembleDebug

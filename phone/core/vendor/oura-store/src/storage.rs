@@ -281,6 +281,46 @@ impl Store {
     /// reconstruct time series from stored events.
     /// Les `limit` événements les plus récents du serial, prêts à être poussés
     /// (plus récents d'abord). `body` en hex ; `decoded_json` tel quel (TEXT).
+    /// Numéro de série du seul appareil connu de la base, s'il y en a un.
+    pub fn only_serial(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare("SELECT serial FROM device LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(r) => Ok(r.get::<_, String>(0)?),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// Événements d'identifiant strictement supérieur à `after_id`, par ordre
+    /// croissant. Permet un envoi *exhaustif* par lots avec repère de
+    /// progression, là où `recent_events` ne voit jamais ce qui est passé sous
+    /// sa limite.
+    pub fn events_since(
+        &self,
+        serial: &str,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, u8, String, i64, String, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, serial, tag, name, ring_timestamp, body, decoded_json, captured_unix
+             FROM events WHERE serial = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+        )?;
+        let it = stmt.query_map(params![serial, after_id, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u8>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                hex::encode(r.get::<_, Vec<u8>>(5)?),
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })?;
+        it.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn recent_events(
         &self,
         serial: &str,

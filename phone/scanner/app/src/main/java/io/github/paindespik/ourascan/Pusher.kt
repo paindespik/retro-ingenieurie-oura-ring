@@ -27,6 +27,39 @@ object Pusher {
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * Envoie **tout** le retard, par lots, en mémorisant un repère de
+     * progression (identifiant du dernier événement accepté par le serveur).
+     *
+     * L'ancienne approche « les N plus récents » laissait définitivement de
+     * côté tout ce qui passait sous la limite dès qu'un cycle rattrapait
+     * plusieurs heures de retard.
+     */
+    suspend fun pushPending(ctx: Context, cursor: Long): String {
+        val prefs = ctx.getSharedPreferences("oura", Context.MODE_PRIVATE)
+        var mark = prefs.getLong("push_mark", 0L)
+        var total = 0
+        var lots = 0
+        while (lots < MAX_LOTS) {
+            val batch = runCatching { Core.eventsSince(mark, BATCH) }.getOrDefault("[]")
+            val arr = runCatching { JSONArray(batch) }.getOrDefault(JSONArray())
+            if (arr.length() == 0) break
+            val res = push(ctx, batch, cursor)
+            if (!res.startsWith("push OK")) {
+                return if (total > 0) "$total événements envoyés puis $res" else res
+            }
+            mark = arr.getJSONObject(arr.length() - 1).optLong("id", mark)
+            prefs.edit().putLong("push_mark", mark).apply()
+            total += arr.length()
+            lots++
+            if (arr.length() < BATCH) break
+        }
+        return if (total == 0) "rien à envoyer" else "push OK ($total événements, repère $mark)"
+    }
+
+    private const val BATCH = 2000
+    private const val MAX_LOTS = 40   // 80 000 événements par cycle au maximum
+
     suspend fun push(ctx: Context, eventsJson: String, cursor: Long): String = withContext(Dispatchers.IO) {
         val payload = JSONObject()
             .put("source", "phone")

@@ -554,6 +554,69 @@ pub extern "C" fn core_recent_events(core: *mut Core, limit: i32, len_out: *mut 
     }
 }
 
+/// Lot d'événements d'identifiant > `after_id` (ordre croissant), avec leur
+/// `id` : permet à Kotlin d'envoyer *tout* le retard par lots successifs et de
+/// mémoriser un repère de progression.
+/// JSON : [{"id","serial","tag","name","ring_timestamp","body_hex","decoded_json","captured_unix"}]
+#[no_mangle]
+pub extern "C" fn core_events_since(
+    core: *mut Core,
+    after_id: i64,
+    limit: i32,
+    len_out: *mut i32,
+) -> *mut u8 {
+    let core = unsafe { &*core };
+    let serial = core.inner.status.lock().unwrap().serial.clone();
+    let serial = if serial.is_empty() {
+        // statut vierge (aucun cycle dans ce processus) : on retombe sur le
+        // seul appareil connu de la base
+        core.inner
+            .store
+            .lock()
+            .unwrap()
+            .only_serial()
+            .unwrap_or_default()
+    } else {
+        serial
+    };
+    let rows = {
+        let st = core.inner.store.lock().unwrap();
+        st.events_since(&serial, after_id, limit as i64)
+    };
+    let b = match rows {
+        Ok(rows) => {
+            let arr: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(id, serial, tag, name, ring_ts, body_hex, decoded, captured)| {
+                    let decoded_value = decoded
+                        .as_ref()
+                        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({
+                        "id": id,
+                        "serial": serial,
+                        "tag": tag,
+                        "name": name,
+                        "ring_timestamp": ring_ts,
+                        "body_hex": body_hex,
+                        "decoded_json": decoded_value,
+                        "captured_unix": captured,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()).into_bytes()
+        }
+        Err(e) => {
+            eprintln!("core_events_since: {e:#}");
+            b"[]".to_vec()
+        }
+    };
+    if !len_out.is_null() {
+        unsafe { *len_out = b.len() as i32 };
+    }
+    to_bytes(b)
+}
+
 /// Libère un tampon de longueur connue.
 #[no_mangle]
 pub extern "C" fn core_free_buf_len(ptr: *mut u8, len: i32) {
@@ -653,6 +716,18 @@ pub extern "system" fn Java_io_github_paindespik_ourascan_Core_nativeRecentEvent
 ) -> JString<'local> {
     let mut len = 0i32;
     let p = core_recent_events(ptr as *mut Core, limit, &mut len);
+    let s = unsafe { std::slice::from_raw_parts(p, len as usize) };
+    let out = String::from_utf8_lossy(s).into_owned();
+    core_free_buf_len(p, len);
+    env.new_string(out).unwrap_or_else(|_| JString::default())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_paindespik_ourascan_Core_nativeEventsSince<'local>(
+    env: JNIEnv<'local>, _cls: JClass<'local>, ptr: jlong, after_id: jlong, limit: i32,
+) -> JString<'local> {
+    let mut len = 0i32;
+    let p = core_events_since(ptr as *mut Core, after_id as i64, limit, &mut len);
     let s = unsafe { std::slice::from_raw_parts(p, len as usize) };
     let out = String::from_utf8_lossy(s).into_owned();
     core_free_buf_len(p, len);
