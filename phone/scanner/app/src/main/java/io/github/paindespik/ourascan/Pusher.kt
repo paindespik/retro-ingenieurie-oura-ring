@@ -25,6 +25,12 @@ object Pusher {
         .connectTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        // Ne pas suivre les redirections : un portail d'authentification
+        // (SSO) placé devant renvoie 302 vers une page de connexion qui
+        // répond 200 en HTML — l'envoi paraîtrait réussi alors que rien n'est
+        // ingéré. On veut un échec explicite.
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
 
     /**
@@ -80,11 +86,17 @@ object Pusher {
             try {
                 client.newCall(req).execute().use { r ->
                     val body = r.body?.string()?.take(300) ?: ""
-                    if (r.isSuccessful) {
+                    // Le serveur répond {"inserted":N,...} : l'exiger évite de
+                    // prendre une page intermédiaire quelconque pour un succès.
+                    if (r.isSuccessful && body.contains("\"inserted\"")) {
                         Log.i(TAG, "push OK: $body")
                         return@withContext "push OK (HTTP ${r.code})"
                     }
-                    lastErr = "HTTP ${r.code} $body"
+                    lastErr = if (r.isSuccessful) {
+                        "HTTP ${r.code} mais réponse inattendue (portail d'authentification ?)"
+                    } else {
+                        "HTTP ${r.code} $body"
+                    }
                     Log.w(TAG, "push KO (tentative $attempt): $lastErr")
                 }
             } catch (e: Exception) {
