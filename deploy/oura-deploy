@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# oura-deploy — installe une version du serveur reçue sur l'entrée standard.
+#
+# Appelé par la CI via une clé SSH à commande forcée :
+#   restrict,command="sudo -n /usr/local/sbin/oura-deploy" ssh-ed25519 … oura-deploy-ci
+# et autorisé sans mot de passe par /etc/sudoers.d/oura-deploy (sans argument).
+#
+# Ce script tourne en root : il est installé À LA MAIN (deploy/bootstrap-serveur.sh)
+# et n'est JAMAIS mis à jour par la CI. Il ne fait qu'installer une liste blanche
+# de fichiers appartenant à l'utilisateur de service, qui exécute déjà ce code :
+# une clé compromise ne donne donc pas plus que l'accès en écriture au dépôt.
+#
+# Étapes : extraction (en tant que l'utilisateur de service) → contrôles →
+# sauvegarde → installation → recalcul des nuits (derived.db sauvegardé) →
+# redémarrage → contrôle de santé → retour arrière automatique en cas d'échec.
+set -euo pipefail
+umask 022
+
+SRV=${OURA_SRV:-/srv/oura}
+SVC_USER=${OURA_USER:-oura}
+WEB=$SRV/web
+BIN=$SRV/bin
+REL=$SRV/releases
+PORT=${OURA_PORT:-8091}
+KEEP=6
+MAX_BYTES=$((20 * 1024 * 1024))
+
+log() { printf 'deploy: %s\n' "$*" >&2; }
+die() { log "ÉCHEC : $*"; exit 1; }
+
+exec 8>/run/oura-deploy.lock
+flock -w 300 8 || die "un autre déploiement est en cours"
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+TMP=$(mktemp -d /tmp/oura-deploy.XXXXXX)
+chown "$SVC_USER:$SVC_USER" "$TMP"
+trap 'rm -rf "$TMP"' EXIT
+
+# ------------------------------------------------------------ 1. extraction
+# En tant que l'utilisateur de service : une archive piégée (chemins « .. »,
+# liens) ne peut pas écrire plus loin que ce que ce compte peut déjà écrire.
+head -c "$MAX_BYTES" | runuser -u "$SVC_USER" -- tar -x -C "$TMP" --no-same-owner --no-same-permissions -f - \
+  || die "archive illisible"
+[ -z "$(find "$TMP" -type l -print -quit)" ] || die "liens symboliques refusés dans l'archive"
+
+PY_WEB=(oura_web.py oura_core.py staging.py)
+PY_BIN=(derive_night.py oura_core.py staging.py)
+REQUIRED=(serveur/oura_web.py serveur/oura_core.py serveur/staging.py serveur/derive_night.py
+          serveur/static/index.html serveur/static/app.js serveur/static/app.css bin/nightly.sh)
+for f in "${REQUIRED[@]}"; do [ -f "$TMP/$f" ] || die "fichier manquant : $f"; done
+REV=$(tr -dc 'a-f0-9' < "$TMP/REVISION" 2>/dev/null | head -c 40 || true)
+log "révision ${REV:-inconnue}"
+
+# ------------------------------------------------------------ 2. contrôles
+runuser -u "$SVC_USER" -- "$SRV/.venv/bin/python" -m py_compile "${PY_WEB[@]/#/$TMP/serveur/}" \
+  || die "compilation (venv du portail)"
+runuser -u "$SVC_USER" -- python3 -m py_compile "${PY_BIN[@]/#/$TMP/serveur/}" \
+  || die "compilation (python3 du job nightly)"
+bash -n "$TMP/bin/nightly.sh" || die "nightly.sh invalide"
+find "$TMP" -name __pycache__ -prune -exec rm -rf {} +
+
+# ------------------------------------------------------------ 3. sauvegarde
+PREV=$REL/$STAMP-avant
+install -d -o root -g root -m 0750 "$REL" "$PREV"
+for f in "${PY_WEB[@]}"; do if [ -f "$WEB/$f" ]; then cp -p "$WEB/$f" "$PREV/web-$f"; fi; done
+if [ -d "$WEB/static" ]; then cp -rp "$WEB/static" "$PREV/web-static"; fi
+for f in "${PY_BIN[@]}" nightly.sh; do if [ -f "$BIN/$f" ]; then cp -p "$BIN/$f" "$PREV/bin-$f"; fi; done
+if [ -f "$SRV/derived.db" ]; then sqlite3 "$SRV/derived.db" ".backup '$PREV/derived.db'"; fi
+
+rollback() {
+  log "retour arrière vers $PREV"
+  for f in "${PY_WEB[@]}"; do
+    if [ -f "$PREV/web-$f" ]; then cp -p "$PREV/web-$f" "$WEB/$f"; else rm -f "$WEB/$f"; fi
+  done
+  rm -rf "$WEB/static"
+  if [ -d "$PREV/web-static" ]; then cp -rp "$PREV/web-static" "$WEB/static"; fi
+  for f in "${PY_BIN[@]}" nightly.sh; do
+    if [ -f "$PREV/bin-$f" ]; then cp -p "$PREV/bin-$f" "$BIN/$f"; else rm -f "$BIN/$f"; fi
+  done
+  if [ -f "$PREV/derived.db" ]; then
+    install -o "$SVC_USER" -g "$SVC_USER" -m 0644 "$PREV/derived.db" "$SRV/derived.db"
+  fi
+  find "$WEB" "$BIN" -name __pycache__ -prune -exec rm -rf {} +
+  systemctl restart oura-web || true
+}
+
+# ------------------------------------------------------------ 4. installation
+for f in "${PY_WEB[@]}"; do install -o "$SVC_USER" -g "$SVC_USER" -m 0644 "$TMP/serveur/$f" "$WEB/$f"; done
+rm -rf "$WEB/static.new"
+cp -r "$TMP/serveur/static" "$WEB/static.new"
+chown -R "$SVC_USER:$SVC_USER" "$WEB/static.new"
+chmod -R u=rwX,go=rX "$WEB/static.new"
+rm -rf "$WEB/static" && mv "$WEB/static.new" "$WEB/static"
+for f in "${PY_BIN[@]}"; do install -o "$SVC_USER" -g "$SVC_USER" -m 0644 "$TMP/serveur/$f" "$BIN/$f"; done
+install -o "$SVC_USER" -g "$SVC_USER" -m 0755 "$TMP/bin/nightly.sh" "$BIN/nightly.sh"
+find "$WEB" "$BIN" -name __pycache__ -prune -exec rm -rf {} +
+
+# ------------------------------------------------------------ 5. recalcul
+# Toutes les nuits avec le nouveau code (migration du schéma incluse), sans
+# résumé LLM : le passage nightly suivant s'en charge.
+if ! runuser -u "$SVC_USER" -- timeout 900 python3 "$BIN/derive_night.py" \
+      --db "$SRV/oura.db" --derived "$SRV/derived.db" --all >&2; then
+  rollback
+  die "le recalcul des nuits a échoué"
+fi
+
+# ------------------------------------------------------------ 6. redémarrage + santé
+systemctl restart oura-web
+ok=""
+for _ in $(seq 1 30); do
+  sleep 1
+  if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/api/health" \
+     && curl -fsS -o /dev/null "http://127.0.0.1:$PORT/api/overview" \
+     && curl -fsS "http://127.0.0.1:$PORT/" | grep -q 'app.js'; then
+    ok=1
+    break
+  fi
+done
+if [ -z "$ok" ]; then
+  journalctl -u oura-web -n 30 --no-pager >&2 || true
+  rollback
+  die "le portail ne répond pas après redémarrage"
+fi
+
+# ------------------------------------------------------------ 7. bilan
+printf '%s %s\n' "$STAMP" "${REV:-inconnue}" > "$SRV/DEPLOYED"
+chown "$SVC_USER:$SVC_USER" "$SRV/DEPLOYED"
+# unités systemd : jamais installées par la CI, seulement comparées
+if [ -d "$TMP/systemd/serveur" ]; then
+  for u in "$TMP"/systemd/serveur/*.service "$TMP"/systemd/serveur/*.timer; do
+    [ -f "$u" ] || continue
+    n=$(basename "$u")
+    if [ -f "/etc/systemd/system/$n" ] && ! cmp -s "$u" "/etc/systemd/system/$n"; then
+      log "ATTENTION : /etc/systemd/system/$n diffère du dépôt (installation manuelle requise)"
+    fi
+  done
+fi
+ls -1dt "$REL"/*-avant 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -rf
+log "OK — révision ${REV:-inconnue} en service (sauvegarde : $PREV)"

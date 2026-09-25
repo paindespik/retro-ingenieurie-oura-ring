@@ -31,3 +31,6 @@ CLAUDE.md
 
 # documentation interne (contexte personnel, non publiée)
 docs/
+
+# captures des tests navigateur
+.playwright-mcp/

@@ -1,0 +1,96 @@
+# Serveur : tests puis déploiement continu (branche main).
+# L'application Android reste construite et installée à la main (phone/build.sh).
+#
+# Secrets du dépôt (Paramètres → Actions → Secrets) :
+#   OURA_DEPLOY_KEY          clé privée SSH dédiée (commande forcée côté serveur)
+#   OURA_DEPLOY_HOST         hôte du serveur (joignable depuis le runner)
+#   OURA_DEPLOY_USER         compte SSH portant la clé
+#   OURA_DEPLOY_KNOWN_HOSTS  ligne(s) known_hosts du serveur (ssh-keyscan)
+# Installation côté serveur : deploy/bootstrap-serveur.sh (une fois, en root).
+name: Serveur — tests et déploiement
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "serveur/**"
+      - "bin/nightly.sh"
+      - "deploy/**"
+      - "systemd/serveur/**"
+      - ".forgejo/workflows/serveur.yml"
+  pull_request:
+    paths:
+      - "serveur/**"
+      - "bin/nightly.sh"
+  workflow_dispatch:
+
+jobs:
+  python:
+    runs-on: docker
+    container:
+      image: python:3.13-slim
+    steps:
+      - name: Récupérer le dépôt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          apt-get update -qq && apt-get install -y -qq git >/dev/null
+          SERVER_URL="${{ github.server_url }}"
+          git clone --depth=1 --branch="${{ github.ref_name }}" \
+            "${SERVER_URL%%://*}://x-access-token:${GITHUB_TOKEN}@${SERVER_URL#*://}/${{ github.repository }}.git" .
+          git log -1 --oneline
+      - name: Dépendances (mêmes versions que le serveur)
+        run: pip install -q "fastapi==0.141.1" "starlette==1.6.0" "httpx==0.28.1"
+      - name: Tests (dérivations + API sur base synthétique)
+        run: cd serveur && python -m unittest discover -s tests -v
+
+  js:
+    runs-on: docker
+    container:
+      image: node:20-bookworm-slim
+    steps:
+      - name: Récupérer le dépôt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          apt-get update -qq && apt-get install -y -qq git >/dev/null
+          SERVER_URL="${{ github.server_url }}"
+          git clone --depth=1 --branch="${{ github.ref_name }}" \
+            "${SERVER_URL%%://*}://x-access-token:${GITHUB_TOKEN}@${SERVER_URL#*://}/${{ github.repository }}.git" .
+      - name: Syntaxe de l'interface
+        run: node --check serveur/static/app.js
+
+  deploy:
+    needs: [python, js]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: docker
+    container:
+      image: alpine:3.20
+    steps:
+      - name: Outils
+        run: apk add --no-cache -q git openssh-client tar
+      - name: Récupérer le dépôt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          SERVER_URL="${{ github.server_url }}"
+          git clone --depth=1 --branch="${{ github.ref_name }}" \
+            "${SERVER_URL%%://*}://x-access-token:${GITHUB_TOKEN}@${SERVER_URL#*://}/${{ github.repository }}.git" .
+          git rev-parse HEAD > REVISION
+      - name: Clé SSH
+        env:
+          KEY: ${{ secrets.OURA_DEPLOY_KEY }}
+          KNOWN: ${{ secrets.OURA_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" | tr -d '\r' > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+      - name: Déployer (la commande est forcée côté serveur)
+        env:
+          HOST: ${{ secrets.OURA_DEPLOY_HOST }}
+          USER_SSH: ${{ secrets.OURA_DEPLOY_USER }}
+        run: |
+          tar -c --exclude=__pycache__ --exclude=serveur/tests \
+            REVISION bin/nightly.sh systemd/serveur \
+            serveur/oura_web.py serveur/oura_core.py serveur/staging.py serveur/derive_night.py serveur/static \
+          | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER_SSH@$HOST"

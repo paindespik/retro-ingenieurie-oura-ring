@@ -83,8 +83,10 @@ scripts/oura-push.sh         # envoie un instantané vers le serveur
 ```sh
 # base et code
 install -d /srv/oura/{web,bin,inbox}
-cp serveur/oura_web.py /srv/oura/web/
-cp serveur/{swap.sh,derive_night.py} /srv/oura/bin/
+cp serveur/{oura_web.py,oura_core.py,staging.py} /srv/oura/web/
+cp -r serveur/static /srv/oura/web/
+cp serveur/{swap.sh,derive_night.py,oura_core.py,staging.py} /srv/oura/bin/
+cp bin/nightly.sh /srv/oura/bin/
 
 # secret d'ingestion (voir « Secrets »)
 install -d /etc/oura
@@ -95,13 +97,63 @@ chown root:oura /etc/oura/ingest.env && chmod 640 /etc/oura/ingest.env
 cp systemd/serveur/*.{service,timer} /etc/systemd/system/
 cp systemd/serveur/nginx-oura.conf /etc/nginx/sites-available/oura.conf   # adapter le domaine
 htpasswd -c /etc/nginx/conf.d/oura.htpasswd oura                          # accès au portail
-systemctl daemon-reload && systemctl enable --now oura-web.service
+systemctl daemon-reload && systemctl enable --now oura-web.service oura-nightly.timer
 ```
 
-Le portail écoute derrière nginx (TLS + authentification basique) et expose
-`/api/overview`, `/api/activity`, `/api/nights`, `/api/night`, `/api/trends`,
-`/api/briefing`, `/api/telemetry`, `/api/events`, `/api/health`, ainsi que
-`POST /ingest/events` pour les hôtes qui poussent directement.
+Le portail écoute derrière nginx (TLS + authentification basique). L'interface
+(`serveur/static/`, JavaScript sans étape de build) couvre : aujourd'hui,
+sommeil (hypnogramme, FC, HRV, respiration, température), récupération,
+activité, tendances, journal, assistant LLM local et données brutes. API :
+`/api/overview`, `/api/night`, `/api/nights`, `/api/readiness`, `/api/activity`,
+`/api/trends`, `/api/telemetry`, `/api/events`, `/api/tags`, `/api/health`,
+`/api/briefing`, `/api/chat`, ainsi que `POST /ingest/events` pour les hôtes
+qui poussent directement.
+
+#### Dérivations
+
+`derive_night.py` (lancé par `oura-nightly.timer`) calcule tout localement, sans
+modèle propriétaire. Les valeurs sont des **estimations** :
+
+| Mesure | Méthode |
+|---|---|
+| Fenêtre de sommeil | analyse embarquée de l'anneau (`bedtime_period`) |
+| Stades (30 s) | heuristique ouverte : mouvement + FC et régularité battement par battement, lissage par modèle de Markov caché, a priori circadiens, plafonds physiologiques — non validée contre polysomnographie |
+| FC la plus basse, FC moyenne, HRV | bins de 5 min calculés par l'anneau (minimum des moyennes 10 min, moyenne des RMSSD) |
+| Indice de récupération | sommeil restant après la FC la plus basse |
+| Respiration (expérimental) | arythmie sinusale respiratoire extraite des intervalles entre battements |
+| Température | capteur cutané pendant le sommeil ; écart à la médiane des nuits précédentes |
+| Récupération, signes de tension | écarts à la ligne de base personnelle (barèmes locaux) |
+| Activité | MET par minute de l'anneau, temps inactif, MET-min modérées/intenses |
+
+Aucune saturation en oxygène (%) n'est calculée : le rapport R brut de
+l'oxymètre exige un étalonnage propre au capteur.
+
+Tests (base synthétique, sans donnée réelle) :
+
+```sh
+cd serveur && python3 -m unittest discover -s tests -v
+```
+
+#### Déploiement continu (Forgejo Actions)
+
+`.forgejo/workflows/serveur.yml` teste puis déploie le serveur à chaque push
+sur `main`. La CI envoie une archive par SSH avec une clé dédiée dont la
+commande est **forcée** côté serveur : elle ne peut que livrer l'archive à
+`/usr/local/sbin/oura-deploy`. Ce script root, installé à la main et jamais
+modifié par la CI, extrait l'archive sous le compte de service, installe une
+liste blanche de fichiers, recalcule les nuits (base dérivée sauvegardée),
+redémarre le portail, vérifie sa santé et revient en arrière en cas d'échec.
+Les unités systemd et nginx restent installées à la main.
+
+```sh
+ssh-keygen -t ed25519 -N "" -C oura-deploy-ci -f oura-deploy-ci   # clé dédiée
+sudo deploy/bootstrap-serveur.sh <compte_ssh> oura-deploy-ci.pub  # sur le serveur, une fois
+```
+
+Puis, dans les secrets du dépôt : `OURA_DEPLOY_KEY` (clé privée),
+`OURA_DEPLOY_HOST`, `OURA_DEPLOY_USER` et `OURA_DEPLOY_KNOWN_HOSTS`
+(`ssh-keyscan -t ed25519 <hôte>`). L'application Android reste construite et
+installée à la main.
 
 ### 4. Hôte téléphone (optionnel)
 
@@ -164,13 +216,21 @@ scripts/
   oura-push.sh             instantané + envoi vers le serveur
   oura-agent.py            agent D-Bus d'acceptation d'appairage
 serveur/
-  oura_web.py              portail FastAPI + point d'ingestion
+  oura_web.py              portail FastAPI (API + ingestion)
+  oura_core.py             briques partagées : axe horaire, battements, respiration
+  staging.py               hypnogramme estimé (HMM)
+  derive_night.py          dérivations : nuits, récupération, activité, résumé LLM
+  static/                  interface web (HTML/CSS/JS sans build)
+  tests/                   tests unitaires sur base synthétique
   swap.sh                  fusion idempotente d'un instantané dans la base
-  derive_night.py          dérivation des nuits
-  make_synth.py            génération de données synthétiques (tests)
+  make_synth.py            génération de données synthétiques (démo)
   test-run.sh              portail en local sur les bases de test
 bin/
   nightly.sh               traitement nocturne (dérivations, résumés)
+deploy/
+  oura-deploy              installation côté serveur (root, appelé par la CI)
+  bootstrap-serveur.sh     mise en place initiale du déploiement continu
+.forgejo/workflows/        CI : tests + déploiement du serveur
 systemd/                   unités PC et serveur, modèle de configuration nginx
 ```
 
