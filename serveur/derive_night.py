@@ -712,24 +712,39 @@ PLAUSIBLE = {"hr_min": (30, 120), "hr_mean": (30, 140), "hrv_rmssd": (3, 250), "
 # Noms explicites (unités comprises) : un petit modèle confond sinon score de
 # sommeil et score de récupération, heures et minutes.
 BRIEF_KEYS = {
-    "night": "nuit", "score": "score_sommeil", "total": "sommeil_total_h", "deep": "profond_h",
-    "rem": "rem_h", "light": "leger_h", "efficiency": "efficacite_pct", "latency": "latence_min",
+    "night": "nuit", "score": "score_sommeil", "total": "sommeil_total", "deep": "sommeil_profond",
+    "rem": "sommeil_rem", "light": "sommeil_leger", "efficiency": "efficacite_pct", "latency": "latence_min",
     "waso": "eveil_apres_endormissement_min", "awakenings": "reveils_de_plus_de_5_min",
-    "timing": "milieu_du_sommeil_heure_decimale", "hr_min": "fc_la_plus_basse_bpm",
+    "timing": "milieu_du_sommeil", "hr_min": "fc_la_plus_basse_bpm",
     "hr_mean": "fc_moyenne_sommeil_bpm", "hrv_rmssd": "hrv_moyen_ms",
-    "recovery_index": "indice_de_recuperation_h", "resp_rate": "respiration_par_min_experimental",
+    "recovery_index": "indice_de_recuperation", "resp_rate": "respiration_par_min_experimental",
     "temp_mean": "temperature_nuit_c", "temp_dev": "ecart_temperature_c",
     "temp_status": "fiabilite_reference_temperature",
 }
 
 
+HOUR_FIELDS = ("total", "deep", "rem", "light", "recovery_index")
+
+
+def _hmin(h):
+    m = int(round(h * 60))
+    return f"{m // 60} h {m % 60:02d}"
+
+
 def _brief_night(n):
+    """Durées déjà formatées (« 7 h 13 ») : en heures décimales, le modèle lit
+    7,22 h comme « 7 h 22 »."""
     o = {}
     for k, name in BRIEF_KEYS.items():
         v = n.get(k)
         lo_hi = PLAUSIBLE.get(k)
         if v is None or (lo_hi and not lo_hi[0] <= v <= lo_hi[1]):
             continue
+        if k in HOUR_FIELDS:
+            v = _hmin(v)
+        elif k == "timing":
+            m = int(round((v % 24) * 60))
+            v = f"{m // 60:02d}:{m % 60:02d}"
         o[name] = v
     return o
 
