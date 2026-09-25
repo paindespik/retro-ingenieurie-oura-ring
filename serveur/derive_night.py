@@ -1,322 +1,74 @@
 #!/usr/bin/env python3
-"""derive_night.py — dérivation Phase 2 (job nightly 05:35 sur serv).
+"""derive_night.py — dérivations locales (job nightly sur le serveur).
 
-Lit /srv/oura/oura.db (brut open_oura, lecture seule) et écrit
-/srv/oura/derived.db (sleep_scores, night_staging, baselines, llm_briefings).
-Tout est calculé depuis les bruts, sans modèle propriétaire :
+Lit oura.db (brut open_oura, lecture seule) et écrit derived.db :
 
-- Axe horaire : ds anneau → unix. Priorité : événements time_sync (tag 66) ;
-  sinon ancrage par epoch de boot (port de open_oura tools/epoch_time.py :
-  le ds maximal de chaque epoch est collé à l'heure de capture de l'événement
-  qui le porte).
-- Fenêtre de sommeil : bedtime_period (tag 118) — analyse embarquée de l'anneau,
-  déclenchée par `oura sleep-analyze --force`.
-- Staging 30 s : heuristique ouverte (mouvement sleep_acm_period + FC IBI),
-  étiqueté « estimé ». Le Ring 5 n'émet pas les sleep_phase_* (confirmé en
-  amont, open_oura crates/README).
-- Sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo, avec
-  corrections des bugs de transcription visibles dans son code — voir docstring
-  de subscore_*), pondération officielle 35/15/10/10/10/10/10 (confirmée par
-  la calibration open_oura, R²=0.9987 — docs/algorithms/score-weights.md).
-- Température nocturne + baseline EMA asymétrique : ports ecore
-  (open_oura crates/oura-analysis/src/ported/{temperature,baseline}.rs).
-- Briefing LLM via llama-swap (127.0.0.1:8012), modèle qwen3.5-4b.
+  sleep_scores    une ligne par nuit : durées, stades, efficacité, latence,
+                  WASO, réveils, FC la plus basse (et son heure), FC moyenne,
+                  HRV moyen/max, Recovery Index, fréquence respiratoire
+                  (expérimentale), température et écart à la ligne de base,
+                  sous-scores et score (estimé)
+  night_staging   hypnogramme 30 s (heuristique ouverte, cf. staging.py)
+  night_series    séries 5 min pour les graphes (FC, HRV, respiration, mouvement, T°)
+  baselines       lignes de base personnelles (nuits antérieures à la dernière)
+  readiness       contributeurs de récupération + signes de tension, par jour
+  activity_daily  activité par jour civil (MET, inactivité, calories estimées)
+  llm_briefings   résumé LLM de la dernière nuit (régénéré si ses entrées changent)
+
+Définitions alignées sur la documentation Oura quand elle existe :
+- FC la plus basse = minimum des moyennes glissantes 10 min (bins 5 min de
+  l'anneau) pendant le sommeil ; HRV = moyenne des RMSSD 5 min (+ max) ;
+- Recovery Index = sommeil restant après la FC la plus basse (optimal ≥ 6 h) ;
+- écart de température = nuit − médiane des nuits précédentes (≤ 30),
+  « provisoire » avant 14 nuits (Oura : ~2 semaines de calibrage).
+
+Tout est calculé localement, sans modèle propriétaire ; les scores sont des
+ESTIMATIONS (staging heuristique, pondérations publiques ou locales).
 
 Usage :
-  python3 derive_night.py --db /srv/oura/oura.db --derived /srv/oura/derived.db [--briefing]
+  derive_night.py --db oura.db --derived derived.db [--briefing] [--all]
 """
 import argparse
 import bisect
+import hashlib
 import json
+import os
 import sqlite3
 import statistics
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
-EPOCH_S = 30
-EPOCH_DS = 300                       # 30 s en décisecondes
-SLACK_DS = 6 * 3600 * 10            # port de epoch_time.py
+import oura_core as oc
+import staging
 
-# Tags open_oura (décimaux)
-TAG_TSYNC, TAG_TEMP, TAG_STEMP, TAG_HRV, TAG_IBI, TAG_GREEN, TAG_ACM, TAG_BEDTIME = (
-    66, 70, 117, 93, 96, 128, 114, 118)
-
-MOTION_AWAKE = 2.0                  # max MAD > 2.0 → éveil (nuit réelle : p90 ≈ 0.15)
-MOTION_RESTLESS = 0.5               # > 0.5 pendant le sommeil → minute agitée
-HR_OUTLIER = 120                    # battements > 120 bpm ignorés (artefacts IBI documentés)
-LLM_URL = "http://127.0.0.1:8012/v1/chat/completions"
-LLM_MODEL = "qwen3.5-4b"
-SCORE_SOURCE = "anchors dmturner44 + poids officiels (estimé, non calibré)"
+VERSION = 2                      # incrémenter → recalcul de toutes les nuits
+LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
+LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.5-4b")
+SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo) + "
+                "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
+SLEEP_NEED_H = 8.0               # milieu de la plage NSF 7–9 h (adultes)
+TEMP_BASE_NIGHTS = 30
+BASE_RELIABLE_N = 14
 
 
-def jget(s):
-    if not s:
-        return None
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
+# ---------------------------------------------------------------- utilitaires
+
+def r(x, nd=1):
+    return None if x is None else round(x, nd)
 
 
-# ---------------------------------------------------------------- horloge
-
-def build_epochs(pairs):
-    """Port de open_oura tools/epoch_time.py : epochs de boot, ancrés."""
-    order = sorted((cu, ds) for ds, cu in pairs)
-    epochs = []
-    for cu, ds in order:
-        if epochs and ds >= epochs[-1][1] - SLACK_DS:
-            e = epochs[-1]
-            if ds >= e[1]:
-                e[1] = ds
-                e[2] = cu
-            e[0] = min(e[0], ds)
-        else:
-            epochs.append([ds, ds, cu])
-    return epochs
+def local_hours(unix):
+    d = datetime.fromtimestamp(unix)
+    return d.hour + d.minute / 60 + d.second / 3600
 
 
-def make_unix(epochs):
-    def unix_s(ds):
-        best = None
-        for e in epochs:
-            if e[0] - SLACK_DS <= ds <= e[1] + SLACK_DS:
-                span = e[1] - e[0]
-                if best is None or span < best[0]:
-                    best = (span, e)
-        e = best[1] if best else (epochs[-1] if epochs else None)
-        if e is None:
-            return None
-        return e[2] - (e[1] - ds) / 10.0
-    return unix_s
-
-
-def time_axis(con):
-    """ds → unix. Renvoie (t_of, mode) avec mode ∈ {sync, epoch, capture}."""
-    anchors = []
-    for rt, dj in con.execute(
-            "SELECT ring_timestamp, decoded_json FROM events WHERE tag=66 ORDER BY ring_timestamp"):
-        j = jget(dj)
-        if j and isinstance(j.get("unix_time"), (int, float)):
-            anchors.append((rt, int(j["unix_time"])))
-    if anchors:
-        # L'ancre time_sync porte l'horloge de l'HÔTE BLE (téléphone/PC), pas
-        # celle du serveur : si cette horloge dérive, les nuits sont datées sur
-        # la mauvaise journée. Calage sur la captured_unix du dernier événement
-        # (même correction que oura_web.time_axis, tolérance 15 min).
-        last = con.execute(
-            "SELECT ring_timestamp, captured_unix FROM events ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        drift = 0.0
-        if last:
-            anc = None
-            for art, au in anchors:
-                if art <= last[0]:
-                    anc = (art, au)
-                else:
-                    break
-            if anc:
-                drift = (anc[1] + (last[0] - anc[0]) / 10.0) - last[1]
-        if abs(drift) <= 900:
-            drift = 0.0
-
-        def t_of(rt):
-            # `ring_timestamp` est en DECISECONDES (cf. docstring) : l'ancre
-            # donne l'instant unix d'un tick, le temps ecoule depuis cette
-            # ancre vaut (rt - art) / 10 secondes. Additionner les ticks comme
-            # s'ils etaient des secondes decalait de ~2 h par quart d'heure.
-            anchor = None
-            for art, au in anchors:
-                if art <= rt:
-                    anchor = (art, au)
-                else:
-                    break
-            if anchor is None:
-                return None
-            art, au = anchor
-            return au + (rt - art) / 10.0 - drift
-        return t_of, "sync"
-    pairs = [(r[0], r[1]) for r in con.execute("SELECT ring_timestamp, captured_unix FROM events")]
-    epochs = build_epochs(pairs)
-    if epochs:
-        return make_unix(epochs), "epoch"
-    return (lambda rt: None), "capture"
-
-
-# ---------------------------------------------------------------- nuits
-
-def load_nights(con, t_of):
-    """Fenêtres de sommeil depuis bedtime_period, dédupliquées (chevauchement ≥ 50 %)."""
-    rows = []
-    for rt, dj in con.execute(
-            "SELECT ring_timestamp, decoded_json FROM events WHERE tag=118 ORDER BY ring_timestamp"):
-        j = jget(dj)
-        if not j:
-            continue
-        s, e = j.get("bedtime_start_ds"), j.get("bedtime_end_ds")
-        if not s or not e or not (3 * 36000 <= e - s <= 16 * 36000):
-            continue
-        su, eu = t_of(s), t_of(e)
-        if su is None or eu is None or eu <= su:
-            continue
-        rows.append({"start_ds": s, "end_ds": e, "ref_ds": rt,
-                     "start_unix": int(su), "end_unix": int(eu)})
-    rows.sort(key=lambda r: r["ref_ds"])
-    out = []
-    for r in rows:
-        merged = False
-        for o in out:
-            overlap = min(r["end_ds"], o["end_ds"]) - max(r["start_ds"], o["start_ds"])
-            span = max(r["end_ds"] - r["start_ds"], o["end_ds"] - o["start_ds"])
-            if overlap > 0 and span > 0 and overlap / span > 0.5:
-                o.update(r)   # la plus récente l'emporte
-                merged = True
-                break
-        if not merged:
-            out.append(dict(r))
-    for r in out:
-        r["night"] = datetime.fromtimestamp(r["end_unix"]).strftime("%Y-%m-%d")
-        r["bedtime"] = datetime.fromtimestamp(r["start_unix"]).strftime("%H:%M")
-        r["wake_time"] = datetime.fromtimestamp(r["end_unix"]).strftime("%H:%M")
-    out.sort(key=lambda r: r["night"])
-    return out
-
-
-# ---------------------------------------------------------------- staging
-
-def night_signals(con, S, E):
-    """Retourne (stages 30 s, motion par epoch, hr par epoch) pour [S, E)."""
-    n = max(1, int(round((E - S) / EPOCH_DS)))
-    motion = [0.0] * n
-    for rt, dj in con.execute(
-            "SELECT ring_timestamp, decoded_json FROM events"
-            " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?", (TAG_ACM, S, E)):
-        j = jget(dj)
-        if not j:
-            continue
-        vals = j.get("acm_mad") or []
-        if not vals:
-            continue
-        i = min(n - 1, max(0, round((rt - S) / EPOCH_DS)))
-        motion[i] = max(motion[i], max(vals))
-
-    hrs = []
-    for rt, dj in con.execute(
-            "SELECT ring_timestamp, decoded_json FROM events"
-            " WHERE tag IN (?,?) AND ring_timestamp>=? AND ring_timestamp<? ORDER BY ring_timestamp",
-            (TAG_IBI, TAG_GREEN, S, E)):
-        j = jget(dj)
-        if not j:
-            continue
-        beats = [b for b in (j.get("hr_bpm") or []) if b <= HR_OUTLIER]
-        if not beats:
-            continue
-        ibi = j.get("ibi_ms") or []
-        tmid = rt + (sum(ibi) / 2000.0 if ibi else 15.0)
-        hrs.append((tmid, sorted(beats)[len(beats) // 2]))
-    hrs.sort()
-    H = [h[0] for h in hrs]
-
-    def hr_at(ds):
-        if not hrs:
-            return None
-        i = bisect.bisect_left(H, ds)
-        cands = []
-        if i < len(hrs):
-            cands.append(hrs[i])
-        if i > 0:
-            cands.append(hrs[i - 1])
-        if not cands:
-            return None
-        c = min(cands, key=lambda p: abs(p[0] - ds))
-        return c[1] if abs(c[0] - ds) <= 240 else None
-
-    hr_e = [hr_at(S + EPOCH_DS / 2 + i * EPOCH_DS) for i in range(n)]
-    awake = [m > MOTION_AWAKE for m in motion]
-    asleep_hr = [h for i, h in enumerate(hr_e) if not awake[i] and h is not None]
-    q33 = q66 = None
-    if len(asleep_hr) >= 8:
-        s = sorted(asleep_hr)
-        q33, q66 = s[len(s) // 3], s[2 * len(s) // 3]
-    stages = []
-    for i in range(n):
-        m = motion[i]
-        if m > MOTION_AWAKE:
-            st = "awake"
-        else:
-            h = hr_e[i]
-            if h is not None and q33 is not None and m < MOTION_RESTLESS:
-                st = "deep" if h <= q33 else ("rem" if h >= q66 else "light")
-            else:
-                st = "light"
-        stages.append(st)
-    return stages, motion, hr_e
-
-
-def summarize_night(stages):
-    """Port de la logique d'agrégation ecore (open_oura ported/sleep.rs summarize)."""
-    d = {"deep": 0, "light": 0, "rem": 0, "awake": 0}
-    first_sleep = None
-    prev_awake = True
-    wake_count = 0
-    for i, st in enumerate(stages):
-        d[st] += EPOCH_S
-        asleep = st != "awake"
-        if asleep and first_sleep is None:
-            first_sleep = i
-        if first_sleep is not None and st == "awake" and not prev_awake:
-            wake_count += 1
-        prev_awake = st == "awake"
-    total = d["deep"] + d["light"] + d["rem"]
-    # latence : 1re période de sommeil soutenue (20 epochs = 10 min sans éveil)
-    latency = 0
-    for i in range(len(stages)):
-        if i + 20 <= len(stages) and all(s != "awake" for s in stages[i:i + 20]):
-            latency = i * EPOCH_S
-            break
-    # segments de sommeil contigus
-    periods, in_seg = 0, False
-    for st in stages:
-        if st != "awake" and not in_seg:
-            periods += 1
-            in_seg = True
-        elif st == "awake":
-            in_seg = False
-    return {**d, "total": total, "latency": latency,
-            "wake_count": wake_count, "periods": periods}
-
-
-# ---------------------------------------------------------------- métriques
-
-def hrv_window(con, S, E):
-    vals = []
-    for dj, in con.execute(
-            "SELECT decoded_json FROM events WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
-            (TAG_HRV, S, E)):
-        j = jget(dj)
-        if j:
-            vals.extend(v for v in (j.get("rmssd_ms") or []) if v)
-    if not vals:
-        return None
-    vals.sort()
-    return vals[len(vals) // 2]
-
-
-def temp_window(con, S, E):
-    temps = []
-    for tag in (TAG_TEMP, TAG_STEMP):
-        for dj, in con.execute(
-                "SELECT decoded_json FROM events WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
-                (tag, S, E)):
-            j = jget(dj)
-            if j:
-                temps.extend(int(round(t * 100)) for t in (j.get("temps_c") or []) if t > 5)
-    return temps
-
+# ---------------------------------------------------------------- température
 
 def nightly_temperature_centi(samples):
-    """Port ecore nightly_temperature_calculate (ported/temperature.rs)."""
+    """Port ecore nightly_temperature_calculate (ported/temperature.rs) :
+    médiane glissante sur 7 échantillons, maxima par fenêtres de 30 à faible
+    amplitude, puis minimum de ces maxima (niveau stable de la nuit)."""
     WINDOW, RANGE, MIN_W = 30, 250, 4
     ring = [0] * 7
     idx = 0
@@ -338,76 +90,58 @@ def nightly_temperature_centi(samples):
     return min(maxima)
 
 
-def ashr_round(t, shift):
-    adj = t + ((1 << shift) - 1) if t < 0 else t
-    return adj >> shift
-
-
-def ema_baseline(samples, age_days=0):
-    """Port ecore baseline_update_lt_mean_and_dev (ported/baseline.rs), replié.
-
-    Les échantillons sont des **entièrs en centièmes de degré** : l'algorithme
-    d'origine travaille en virgule fixe (décalages de bits), les biais et
-    magnitudes sont exprimés dans cette unité. Le résultat est dans la même
-    unité que l'entrée.
-    """
-    samples = [int(round(s)) for s in samples]
-    mean_x8 = dev_x8 = 0
-    for i, s in enumerate(samples):
-        s8 = s << 3
-        delta = s8 - mean_x8
-        if i > 14:
-            bias = 16 if (delta != 0 and mean_x8 <= s8) else -16
-            mean_x8 += ashr_round(delta + bias, 5)
-        elif i >= 4:
-            bias = 4 if delta > 0 else -4
-            mean_x8 += ashr_round(delta + bias, 3)
-        else:
-            t = delta + 1 if delta > 0 else delta - 1
-            mean_x8 += ashr_round(t, 1)
-        absd = abs(s8 - mean_x8)
-        mag, shift = (32, 6) if i > 14 else ((8, 4) if i >= 4 else (4, 3))
-        bias2 = mag if (absd != dev_x8 and dev_x8 <= absd) else -mag
-        dev_x8 += ashr_round((absd - dev_x8) + bias2, shift)
-    return mean_x8 / 8.0, dev_x8 / 8.0
+def temp_samples(con, s_ds, e_ds, charging):
+    """(rt, °C) de température CUTANÉE pendant la nuit, hors charge et hors
+    bornes : sleep_temp_event (tag 117, dédié au sommeil) ; à défaut, le
+    capteur cutané [0] de temp_event (tag 70). Les deux autres capteurs de
+    temp_event (quantifié / interne) ne sont jamais mélangés à la peau."""
+    out = []
+    for rt, dj in oc.rows(con, "SELECT ring_timestamp, decoded_json FROM events WHERE tag=?"
+                               " AND ring_timestamp>=? AND ring_timestamp<? ORDER BY ring_timestamp",
+                          (oc.T_SLEEP_TEMP, s_ds, e_ds)):
+        if oc.in_intervals(rt, charging):
+            continue
+        for t in (oc.jget(dj) or {}).get("temps_c") or []:
+            if oc.SKIN_TEMP_MIN_C <= t <= oc.SKIN_TEMP_MAX_C:
+                out.append((rt, t))
+    if len(out) < 60:
+        out = []
+        for rt, dj in oc.rows(con, "SELECT ring_timestamp, decoded_json FROM events WHERE tag=?"
+                                   " AND ring_timestamp>=? AND ring_timestamp<? ORDER BY ring_timestamp",
+                              (oc.T_TEMP, s_ds, e_ds)):
+            t = oc.skin_temp(oc.jget(dj))
+            if t is not None and not oc.in_intervals(rt, charging):
+                out.append((rt, t))
+    return out
 
 
 # ---------------------------------------------------------------- sous-scores
-# Anchors publiés par dmturner44/oura_sleep_score_algo (constantes conservées ;
-# corrections des branches où le code public oubliait la multiplication —
-# voir chaque docstring).
-
+# Anchors publiés par dmturner44/oura_sleep_score_algo (constantes conservées,
+# branches corrigées là où le code public oubliait la multiplication).
 
 def subscore_total_sleep(tts_s):
-    """min(100, 100/9h × durée) — 100 pts à 9 h."""
     return max(0.0, min(100.0, 100.0 / (9 * 3600) * tts_s))
 
 
 def subscore_rem(rem_s):
-    """95 pts à 1 h 51:30 (6690 s) → 100 à 2 h 27 (8820 s)."""
     if rem_s < 6690:
         return max(0.0, 95.0 / 6690 * rem_s)
     return min(100.0, 95 + 5 / (8820 - 6690) * (rem_s - 6690))
 
 
 def subscore_deep(deep_s):
-    """95 pts à 1 h 33 (5580 s) → 100 à 2 h 24:30 (8670 s)."""
     if deep_s < 5580:
         return max(0.0, 95.0 / 5580 * deep_s)
     return min(100.0, 95 + 5 / (8670 - 5580) * (deep_s - 5580))
 
 
 def subscore_efficiency(eff_pct):
-    """37 pts à 65 % → 95 à 90 % → 100 à 95 % (linéaire par segments)."""
-    if eff_pct <= 65:
-        return max(0.0, 37 + (95 - 37) / (90 - 65) * (eff_pct - 65))
     if eff_pct <= 90:
-        return 37 + (95 - 37) / (90 - 65) * (eff_pct - 65)
+        return max(0.0, 37 + (95 - 37) / (90 - 65) * (eff_pct - 65))
     return min(100.0, 95 + 5 / (95 - 90) * (eff_pct - 90))
 
 
 def subscore_latency(lat_s):
-    """59 pts à 0 s → 100 à 15 min → 22 à 44:30 → 0 à 72:30 (U inversée)."""
     if lat_s <= 900:
         return 59 + (100 - 59) / 900 * lat_s
     if lat_s <= 2670:
@@ -417,317 +151,707 @@ def subscore_latency(lat_s):
     return 0.0
 
 
-def subscore_timing(mid_sec):
-    """Midpoint en s depuis 00:00 : 100 si ≤ 2 h 40 → 0 à 5 h 43 (linéaire)."""
-    if mid_sec <= 9620:
+def subscore_timing(mid_h):
+    """Milieu du sommeil (heure locale) : 100 jusqu'à 02:40, 0 à 05:43.
+    Un milieu avant minuit compte comme précoce (100)."""
+    sec = (mid_h - 24 if mid_h >= 12 else mid_h) * 3600
+    if sec <= 9620:
         return 100.0
-    if mid_sec >= 20620:
+    if sec >= 20620:
         return 0.0
-    return 100.0 * (20620 - mid_sec) / (20620 - 9620)
+    return 100.0 * (20620 - sec) / (20620 - 9620)
 
 
-def subscore_restfulness(awake_frac, restl_frac, r1, r2, r3, r4, periods):
-    """Régression publiée (30 s de mouvement catégorisées 1..4)."""
-    s = (86.019 - 27.603 * awake_frac - 2108.0 * restl_frac
-         + 0.025821 * r1 + 0.020323 * r2 - 0.55056 * r3 - 0.18264 * r4
-         + 2.0592 * periods)
-    return max(0.0, min(100.0, s))
+def subscore_restfulness(waso_min, awakenings, restless_frac):
+    """Formule locale et monotone (plus d'éveil ou d'agitation → note plus
+    basse), ancrée sur les seuils NSF 2017 pour l'adulte : WASO < 20 min,
+    ≤ 1 réveil de plus de 5 min. Remplace une régression publiée qui
+    récompensait la fragmentation (coefficient positif sur le nombre de
+    segments de sommeil)."""
+    w = oc.lerp_score(waso_min, [(20, 100), (50, 60), (100, 0)])
+    a = oc.lerp_score(awakenings, [(1, 100), (4, 40), (8, 0)])
+    m = oc.lerp_score(restless_frac * 100, [(5, 100), (20, 50), (40, 0)])
+    return 0.4 * w + 0.3 * a + 0.3 * m
 
 
-WEIGHTS = {
-    "total_sleep": 35, "restfulness": 15, "efficiency": 10,
-    "latency": 10, "deep": 10, "rem": 10, "timing": 10,
-}
+WEIGHTS = {"total_sleep": 35, "restfulness": 15, "efficiency": 10,
+           "latency": 10, "deep": 10, "rem": 10, "timing": 10}
 
 
-def compute_night(con, night, prev_temps):
+# ---------------------------------------------------------------- nuit
+
+def night_input_hash(con, night):
+    s, e = night["start_ds"], night["end_ds"]
+    cnt, mx = con.execute("SELECT COUNT(*), MAX(id) FROM events WHERE ring_timestamp>=?"
+                          " AND ring_timestamp<?", (s - 36000, e + 36000)).fetchone()
+    return hashlib.sha1(f"{VERSION}|{s}|{e}|{cnt}|{mx}".encode()).hexdigest()[:16]
+
+
+def compute_night(con, axis, night, charging):
     S, E = night["start_ds"], night["end_ds"]
-    stages, motion, hr_e = night_signals(con, S, E)
-    sum_ = summarize_night(stages)
+    n = max(1, int(round((E - S) / staging.EPOCH_DS)))
+    mev = []
+    for rt, dj in oc.rows(con, "SELECT ring_timestamp, decoded_json FROM events WHERE tag=?"
+                               " AND ring_timestamp>=? AND ring_timestamp<?", (oc.T_ACM, S, E)):
+        vals = (oc.jget(dj) or {}).get("acm_mad") or []
+        if vals:
+            mev.append((rt, max(vals)))
+    beats = oc.clean_beats(oc.load_beats(con, S, E))
+    stages, feats, capped = staging.stage_night(n, S, mev, beats)
+    sm = staging.summarize(stages, feats["motion"])
+
+    onset_ds = S + sm["onset"] * staging.EPOCH_DS
+    end_ds = S + (sm["end"] + 1) * staging.EPOCH_DS
+    total_s = sm["total"]
     in_bed_s = (E - S) / 10.0
 
-    # HR
-    hrs = [h for h in hr_e if h is not None]
-    hr_mean = round(sum(hrs) / len(hrs), 1) if hrs else None
-    hr_min = min(hrs) if hrs else None
+    # --- FC / HRV : bins 5 min calculés par l'anneau, pendant le sommeil
+    bins = oc.hrv_bins(con, S, E)
+    sleep_bins = [b for b in bins if onset_ds <= b[0] < end_ds]
+    hrs = [(c, h) for c, h, _ in sleep_bins if h is not None]
+    rms = [x for _, _, x in sleep_bins if x is not None]
+    hr_source = "anneau (hrv_event)"
+    if len(hrs) < 6:               # repli : FC 5 min depuis les battements
+        hr_source = "battements (tag 96)"
+        hrs = []
+        c = onset_ds
+        bt = [t for t, _ in beats]
+        while c + 3000 <= end_ds:
+            a, b = bisect.bisect_left(bt, c), bisect.bisect_left(bt, c + 3000)
+            ib = [x for _, x in beats[a:b]]
+            if len(ib) >= 150:
+                hrs.append((c + 1500, 60000.0 / (sum(ib) / len(ib))))
+            c += 3000
+    hr_mean = oc.mean([h for _, h in hrs])
+    hr_low, hr_low_at = None, None
+    for (c0, h0), (c1, h1) in zip(hrs, hrs[1:]):
+        if c1 - c0 <= 3300:        # deux bins de 5 min consécutifs = 10 min
+            v = (h0 + h1) / 2
+            if hr_low is None or v < hr_low:
+                hr_low, hr_low_at = v, (c0 + c1) / 2
+    if hr_low is None and hrs:
+        c, h = min(hrs, key=lambda p: p[1])
+        hr_low, hr_low_at = float(h), c
+    recovery_h = None
+    if hr_low_at is not None:
+        k = int((hr_low_at - S) // staging.EPOCH_DS)
+        recovery_h = sum(staging.EPOCH_DS / 10 for s in stages[max(0, k):] if s != "awake") / 3600
 
-    # HRV
-    hrv = hrv_window(con, S, E)
+    # RMSSD « maison » sur les battements : contrôle croisé seulement
+    own_rm = []
+    bt = [t for t, _ in beats]
+    c = onset_ds
+    while c + 3000 <= end_ds:
+        a, b = bisect.bisect_left(bt, c), bisect.bisect_left(bt, c + 3000)
+        seg = [x for _, x in beats[a:b]]
+        if len(seg) >= 150:
+            own_rm.append(oc.rmssd(seg))
+        c += 3000
 
-    # mouvement / agitations (minutes endormies avec motion > seuil)
-    restless_s = 0
-    restless_motions = []
-    for i, st in enumerate(stages):
-        if st == "awake":
-            continue
-        m = motion[i]
-        if m > MOTION_RESTLESS:
-            restless_s += EPOCH_S
-            restless_motions.append(m)
-    restless_motions.sort()
-    n_r = len(restless_motions)
-    q = max(1, n_r // 4)
-    r_counts = [0.0, 0.0, 0.0, 0.0]
-    for k, m in enumerate(restless_motions):
-        r_counts[min(3, k // q)] += EPOCH_S / 60.0
+    # --- respiration (expérimental)
+    resp = oc.resp_rate_windows(beats, onset_ds, end_ds)
+    resp_rate = oc.median([v for _, v in resp]) if len(resp) >= 12 else None
 
-    # température
-    temps = temp_window(con, S, E)
-    tnight_centi = nightly_temperature_centi(temps)
-    temp_mean = round(tnight_centi / 100.0, 2) if tnight_centi is not None else None
-    temp_dev = None
-    if tnight_centi is not None and prev_temps:
-        bmean, _ = ema_baseline(prev_temps, age_days=len(prev_temps) - 1)
-        # bmean est dans l'unité des échantillons (centièmes de degré) : la
-        # différence se fait AVANT la conversion en degrés.
-        temp_dev = round((tnight_centi - bmean) / 100.0, 2)
+    # --- température
+    temps = temp_samples(con, S, E, charging)
+    t_centi = nightly_temperature_centi([int(round(t * 100)) for _, t in temps])
+    temp_mean = (t_centi / 100.0) if t_centi is not None else (
+        oc.median([t for _, t in temps]) if len(temps) >= 60 else None)
 
-    # timing : midpoint heure locale (0..24 h, replié en 12 h si > midi)
-    a = datetime.fromtimestamp(night["start_unix"]).hour + datetime.fromtimestamp(night["start_unix"]).minute / 60
-    b = datetime.fromtimestamp(night["end_unix"]).hour + datetime.fromtimestamp(night["end_unix"]).minute / 60
-    if b < a:
-        b += 24
-    mid_h = (a + b) / 2
-    if mid_h > 12:
-        mid_h -= 12
+    # --- timing : milieu du SOMMEIL (et non du lit)
+    onset_u, end_u = axis(onset_ds), axis(end_ds)
+    mid_h = local_hours((onset_u + end_u) / 2) if onset_u and end_u else None
 
-    total_s = sum_["total"]
     eff = 100.0 * total_s / in_bed_s if in_bed_s else 0.0
-    awake_frac = sum_["awake"] / total_s if total_s else 0.0
-    restl_frac = restless_s / total_s if total_s else 0.0
-
+    sleep_epochs = sum(1 for s in stages[sm["onset"]:sm["end"] + 1] if s != "awake") or 1
+    restless_frac = sm["restless"] / 30 / sleep_epochs
     subs = {
         "total_sleep": subscore_total_sleep(total_s),
-        "rem": subscore_rem(sum_["rem"]),
-        "deep": subscore_deep(sum_["deep"]),
+        "rem": subscore_rem(sm["rem"]),
+        "deep": subscore_deep(sm["deep"]),
         "efficiency": subscore_efficiency(eff),
-        "latency": subscore_latency(sum_["latency"]),
-        "timing": subscore_timing(mid_h * 3600),
-        "restfulness": subscore_restfulness(awake_frac, restl_frac,
-                                            r_counts[0], r_counts[1], r_counts[2], r_counts[3],
-                                            sum_["periods"]),
+        "latency": subscore_latency(sm["latency"]),
+        "timing": subscore_timing(mid_h) if mid_h is not None else None,
+        "restfulness": subscore_restfulness(sm["waso"] / 60, sm["awakenings"], restless_frac),
     }
-    score = int(max(0, min(100, round(sum(WEIGHTS[k] * subs[k] for k in WEIGHTS) / 100.0))))
+    avail = {k: v for k, v in subs.items() if v is not None}
+    wsum = sum(WEIGHTS[k] for k in avail)
+    score = int(round(sum(WEIGHTS[k] * v for k, v in avail.items()) / wsum)) if wsum else None
+
+    # --- séries 5 min pour les graphes
+    series = {}
+
+    def slot(ds):
+        return int((ds - S) // 3000)
+    for c, h, x in bins:
+        d = series.setdefault(slot(c), {})
+        d["hr"], d["rmssd"] = h, x
+    for c, v in resp:
+        series.setdefault(slot(c), {})["resp"] = round(v, 1)
+    for i, m in enumerate(feats["motion"]):
+        d = series.setdefault(i // 10, {})
+        d["motion"] = max(d.get("motion", 0.0), m)
+    tbuck = {}
+    for rt, t in temps:
+        tbuck.setdefault(slot(rt), []).append(t)
+    for k, v in tbuck.items():
+        series.setdefault(k, {})["temp"] = round(statistics.median(v), 2)
+    series_rows = []
+    for k in sorted(series):
+        if 0 <= k < (E - S) / 3000 + 1:
+            t = axis(S + k * 3000 + 1500)
+            d = series[k]
+            series_rows.append((int(t), d.get("hr"), d.get("rmssd"), d.get("resp"),
+                                r(d.get("motion"), 2), d.get("temp")))
 
     row = {
         "night": night["night"],
         "score": score,
         "total": round(total_s / 3600, 2),
-        "deep": round(sum_["deep"] / 3600, 2),
-        "rem": round(sum_["rem"] / 3600, 2),
-        "light": round(sum_["light"] / 3600, 2),
-        "awake": round(sum_["awake"] / 3600, 2),
-        "in_bed": round((E - S) / 10 / 3600, 2),
+        "deep": round(sm["deep"] / 3600, 2),
+        "rem": round(sm["rem"] / 3600, 2),
+        "light": round(sm["light"] / 3600, 2),
+        "awake": round(sm["awake"] / 3600, 2),
+        "in_bed": round(in_bed_s / 3600, 2),
         "efficiency": round(eff, 1),
-        "latency": round(sum_["latency"] / 60, 1),          # minutes
-        "timing": round(mid_h, 2),                          # heures (midpoint)
+        "latency": round(sm["latency"] / 60, 1),
+        "timing": r(mid_h, 2),
         "restfulness": round(subs["restfulness"], 1),
-        "hr_min": hr_min, "hr_mean": hr_mean,
-        "hrv_rmssd": hrv,
-        "temp_mean": temp_mean, "temp_dev": temp_dev,
-        "movement": round(restless_s / 60, 1),             # minutes agitées
+        "waso": round(sm["waso"] / 60, 1),
+        "awakenings": sm["awakenings"],
+        "hr_min": r(hr_low, 1),
+        "hr_lowest_at": int(axis(hr_low_at)) if hr_low_at else None,
+        "hr_mean": r(hr_mean, 1),
+        "hrv_rmssd": r(oc.mean(rms), 1),
+        "hrv_max": max(rms) if rms else None,
+        "hrv_beats": r(oc.mean([x for x in own_rm if x]), 1),
+        "hr_source": hr_source,
+        "recovery_index": r(recovery_h, 2),
+        "resp_rate": r(resp_rate, 1),
+        "resp_n": len(resp),
+        "temp_mean": r(temp_mean, 2),
+        "temp_dev": None, "temp_n": 0, "temp_status": None,
+        "movement": round(sm["restless"] / 60, 1),
         "spo2": None,
-        "bedtime": night["bedtime"], "wake_time": night["wake_time"],
-        "staging_source": "heuristique",
-        "subscores": json.dumps({k: round(v, 1) for k, v in subs.items()}),
+        "bedtime": datetime.fromtimestamp(night["start_unix"]).strftime("%H:%M"),
+        "wake_time": datetime.fromtimestamp(night["end_unix"]).strftime("%H:%M"),
+        "start_unix": int(night["start_unix"]), "stop_unix": int(night["end_unix"]),
+        "onset_unix": int(onset_u) if onset_u else None,
+        "end_unix": int(end_u) if end_u else None,
+        "staging_source": "heuristique v2" + (" (plafond %s)" % "+".join(capped) if capped else ""),
+        "subscores": json.dumps({k: r(v, 1) for k, v in subs.items()}),
         "score_source": SCORE_SOURCE,
+        "axis_mode": axis.mode if night["start_ds"] >= (axis.first_anchor_ds or 0) else "extrapolé",
+        "version": VERSION,
         "ts": int(time.time()),
         "_stages": stages,
+        "_series": series_rows,
     }
     return row
 
 
-# ---------------------------------------------------------------- dérivées
+# ---------------------------------------------------------------- schéma
 
-EXTRA_COLS = [("in_bed", "REAL"), ("light", "REAL"), ("awake", "REAL"),
-              ("temp_mean", "REAL"), ("subscores", "TEXT"),
-              ("score_source", "TEXT"), ("ts", "INTEGER")]
+SLEEP_COLS = [
+    ("night", "TEXT PRIMARY KEY"), ("score", "REAL"), ("total", "REAL"), ("deep", "REAL"),
+    ("rem", "REAL"), ("light", "REAL"), ("awake", "REAL"), ("in_bed", "REAL"),
+    ("efficiency", "REAL"), ("latency", "REAL"), ("timing", "REAL"), ("restfulness", "REAL"),
+    ("waso", "REAL"), ("awakenings", "INTEGER"), ("hr_min", "REAL"), ("hr_lowest_at", "INTEGER"),
+    ("hr_mean", "REAL"), ("hrv_rmssd", "REAL"), ("hrv_max", "REAL"), ("hrv_beats", "REAL"),
+    ("hr_source", "TEXT"), ("recovery_index", "REAL"), ("resp_rate", "REAL"), ("resp_n", "INTEGER"),
+    ("temp_mean", "REAL"), ("temp_dev", "REAL"), ("temp_n", "INTEGER"), ("temp_status", "TEXT"),
+    ("movement", "REAL"), ("spo2", "REAL"), ("bedtime", "TEXT"), ("wake_time", "TEXT"),
+    ("start_unix", "INTEGER"), ("stop_unix", "INTEGER"), ("onset_unix", "INTEGER"),
+    ("end_unix", "INTEGER"), ("staging_source", "TEXT"), ("subscores", "TEXT"),
+    ("score_source", "TEXT"), ("axis_mode", "TEXT"), ("version", "INTEGER"),
+    ("input_hash", "TEXT"), ("ts", "INTEGER"),
+]
 
 
 def ensure_schema(con):
-    con.execute("""CREATE TABLE IF NOT EXISTS sleep_scores (
-        night TEXT PRIMARY KEY, score REAL, total REAL, deep REAL, rem REAL,
-        efficiency REAL, latency REAL, timing REAL, restfulness REAL,
-        hr_min REAL, hr_mean REAL, hrv_rmssd REAL, temp_dev REAL,
-        movement REAL, spo2 REAL, bedtime TEXT, wake_time TEXT, staging_source TEXT)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS night_staging (
-        night TEXT, epoch INTEGER, stage TEXT, PRIMARY KEY (night, epoch))""")
-    con.execute("""CREATE TABLE IF NOT EXISTS llm_briefings (
-        night TEXT, model TEXT, text TEXT, ts INTEGER)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS baselines (
-        metric TEXT PRIMARY KEY, mean REAL, sd REAL, updated_unix INTEGER)""")
-    cols = {r[1] for r in con.execute("PRAGMA table_info(sleep_scores)")}
-    for name, typ in EXTRA_COLS:
-        if name not in cols:
-            con.execute(f"ALTER TABLE sleep_scores ADD COLUMN {name} {typ}")
+    con.execute("CREATE TABLE IF NOT EXISTS sleep_scores (%s)"
+                % ", ".join(f"{c} {t}" for c, t in SLEEP_COLS))
+    have = {x[1] for x in con.execute("PRAGMA table_info(sleep_scores)")}
+    for c, t in SLEEP_COLS:
+        if c not in have:
+            con.execute(f"ALTER TABLE sleep_scores ADD COLUMN {c} {t.replace(' PRIMARY KEY', '')}")
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS night_staging (
+            night TEXT, epoch INTEGER, stage TEXT, PRIMARY KEY (night, epoch));
+        CREATE TABLE IF NOT EXISTS night_series (
+            night TEXT, t INTEGER, hr REAL, rmssd REAL, resp REAL, motion REAL, temp REAL,
+            PRIMARY KEY (night, t));
+        CREATE TABLE IF NOT EXISTS llm_briefings (
+            night TEXT, model TEXT, text TEXT, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS baselines (
+            metric TEXT PRIMARY KEY, mean REAL, sd REAL, updated_unix INTEGER);
+        CREATE TABLE IF NOT EXISTS readiness (
+            day TEXT PRIMARY KEY, score REAL, contributors TEXT, tension TEXT,
+            n_base INTEGER, provisional INTEGER, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS activity_daily (
+            day TEXT PRIMARY KEY, worn_min INTEGER, sleep_min INTEGER, inactive_min INTEGER,
+            low_min INTEGER, medium_min INTEGER, high_min INTEGER, met_min_mh REAL,
+            sedentary_bouts INTEGER, active_kcal REAL, easy_day INTEGER,
+            score REAL, contributors TEXT, partial INTEGER, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, kind TEXT NOT NULL,
+            note TEXT, created_unix INTEGER);
+        CREATE TABLE IF NOT EXISTS user_profile (
+            id INTEGER PRIMARY KEY CHECK (id=1), age_years INTEGER, height_cm INTEGER,
+            weight_kg REAL, sex TEXT, updated_unix INTEGER);
+    """)
+    for tab, col, typ in (("llm_briefings", "input_hash", "TEXT"), ("baselines", "median", "REAL"),
+                          ("baselines", "n", "INTEGER")):
+        if col not in {x[1] for x in con.execute(f"PRAGMA table_info({tab})")}:
+            con.execute(f"ALTER TABLE {tab} ADD COLUMN {col} {typ}")
 
 
-def write_night(con, row):
-    con.execute(
-        """INSERT OR REPLACE INTO sleep_scores
-           (night, score, total, deep, rem, light, awake, in_bed, efficiency, latency,
-            timing, restfulness, hr_min, hr_mean, hrv_rmssd, temp_mean, temp_dev,
-            movement, spo2, bedtime, wake_time, staging_source, subscores, score_source, ts)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (row["night"], row["score"], row["total"], row["deep"], row["rem"],
-         row["light"], row["awake"], row["in_bed"], row["efficiency"], row["latency"],
-         row["timing"], row["restfulness"], row["hr_min"], row["hr_mean"], row["hrv_rmssd"],
-         row["temp_mean"], row["temp_dev"], row["movement"], row["spo2"],
-         row["bedtime"], row["wake_time"], row["staging_source"],
-         row["subscores"], row["score_source"], row["ts"]))
+def write_night(con, row, input_hash):
+    cols = [c for c, _ in SLEEP_COLS if c != "input_hash"]
+    vals = [row.get(c) for c in cols] + [input_hash]
+    con.execute("INSERT OR REPLACE INTO sleep_scores (%s, input_hash) VALUES (%s)"
+                % (", ".join(cols), ", ".join("?" * len(vals))), vals)
     con.execute("DELETE FROM night_staging WHERE night=?", (row["night"],))
     con.executemany("INSERT INTO night_staging (night, epoch, stage) VALUES (?,?,?)",
                     [(row["night"], i, s) for i, s in enumerate(row["_stages"])])
+    con.execute("DELETE FROM night_series WHERE night=?", (row["night"],))
+    con.executemany("INSERT OR REPLACE INTO night_series (night, t, hr, rmssd, resp, motion, temp)"
+                    " VALUES (?,?,?,?,?,?,?)", [(row["night"], *s) for s in row["_series"]])
 
 
-def update_baselines(con, now):
-    rows = con.execute(
-        "SELECT night, hr_mean, hrv_rmssd, total, efficiency, score, temp_mean"
-        " FROM sleep_scores ORDER BY night").fetchall()
-    if not rows:
-        return
-    now = int(now)
-    for metric, idx in (("hr_mean", 1), ("hrv_rmssd", 2), ("total", 3),
-                        ("efficiency", 4), ("score", 5)):
-        vals = [r[idx] for r in rows[:-1] if r[idx] is not None]
-        if len(vals) >= 2:
-            mean = sum(vals) / len(vals)
-            sd = statistics.pstdev(vals)
-        elif len(vals) == 1:
-            mean, sd = vals[0], 0.0
-        else:
+# ---------------------------------------------------------------- lignes de base
+
+def nights_table(der):
+    der.row_factory = sqlite3.Row
+    out = [dict(x) for x in der.execute("SELECT * FROM sleep_scores ORDER BY night")]
+    der.row_factory = None
+    return out
+
+
+def update_temperature_deviation(der, nights):
+    """Écart de température = nuit − médiane des nuits STRICTEMENT antérieures
+    (≤ 30). Aucune valeur avant 3 nuits ; « provisoire » avant 14."""
+    for i, n in enumerate(nights):
+        prev = [p["temp_mean"] for p in nights[max(0, i - TEMP_BASE_NIGHTS):i]
+                if p["temp_mean"] is not None]
+        dev, status = None, "calibrage"
+        if n["temp_mean"] is not None and len(prev) >= 3:
+            dev = round(n["temp_mean"] - statistics.median(prev), 2)
+            status = "fiable" if len(prev) >= BASE_RELIABLE_N else "provisoire"
+        n["temp_dev"], n["temp_n"], n["temp_status"] = dev, len(prev), status
+        der.execute("UPDATE sleep_scores SET temp_dev=?, temp_n=?, temp_status=? WHERE night=?",
+                    (dev, len(prev), status, n["night"]))
+
+
+BASELINE_METRICS = ("hr_min", "hr_mean", "hrv_rmssd", "resp_rate", "temp_mean", "total",
+                    "efficiency", "score", "deep", "rem", "waso", "recovery_index")
+
+
+def base_stats(vals):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    return {"mean": statistics.fmean(vals), "sd": statistics.pstdev(vals) if len(vals) > 1 else 0.0,
+            "median": statistics.median(vals), "n": len(vals)}
+
+
+def update_baselines(der, nights, now):
+    """Lignes de base affichées : nuits antérieures à la dernière (≤ 60)."""
+    der.execute("DELETE FROM baselines")
+    prev = nights[:-1][-60:]
+    for m in BASELINE_METRICS:
+        b = base_stats([p.get(m) for p in prev])
+        if b:
+            der.execute("INSERT INTO baselines (metric, mean, sd, median, n, updated_unix)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (m, round(b["mean"], 3), round(b["sd"], 3), round(b["median"], 3), b["n"], now))
+
+
+# ---------------------------------------------------------------- récupération
+
+def readiness_for(i, nights, activity):
+    """Contributeurs de type Readiness (Oura) pour le jour de la nuit i.
+    Chaque contributeur 0–100, None si données insuffisantes."""
+    n = nights[i]
+    prev = nights[max(0, i - 60):i]
+    c = {}
+
+    b = base_stats([p["hr_min"] for p in prev])
+    if n["hr_min"] is not None and b and b["n"] >= 3:
+        d = n["hr_min"] - b["mean"]
+        c["rhr"] = {"score": oc.lerp_score(d, [(-15, 50), (-10, 85), (-5, 100), (0, 100), (3, 85),
+                                              (5, 65), (10, 30), (15, 10)]),
+                    "value": n["hr_min"], "baseline": round(b["mean"], 1), "delta": round(d, 1)}
+
+    last14 = [p["hrv_rmssd"] for p in nights[max(0, i - 13):i + 1] if p["hrv_rmssd"] is not None]
+    long_ = [p["hrv_rmssd"] for p in nights[max(0, i - 90):i + 1] if p["hrv_rmssd"] is not None]
+    if len(long_) >= 5 and last14:
+        w = list(range(1, len(last14) + 1))
+        recent = sum(a * b_ for a, b_ in zip(last14, w)) / sum(w)
+        ratio = recent / statistics.fmean(long_)
+        c["hrv_balance"] = {"score": oc.lerp_score(ratio, [(0.6, 15), (0.75, 45), (0.9, 75),
+                                                           (1.0, 95), (1.05, 100)]),
+                            "value": round(recent, 1), "baseline": round(statistics.fmean(long_), 1),
+                            "delta": round((ratio - 1) * 100, 1)}
+
+    if n["temp_dev"] is not None:
+        c["temperature"] = {"score": oc.lerp_score(abs(n["temp_dev"]), [(0.2, 100), (0.5, 85), (1.0, 50),
+                                                                       (1.5, 25), (2.5, 5)]),
+                            "value": n["temp_dev"], "status": n["temp_status"]}
+
+    if n["recovery_index"] is not None:
+        c["recovery_index"] = {"score": oc.lerp_score(n["recovery_index"], [(0, 10), (2, 35), (4, 60), (6, 100)]),
+                               "value": n["recovery_index"]}
+
+    c["sleep"] = {"score": oc.lerp_score(n["total"], [(4, 20), (5, 40), (6, 60), (7, 85), (8, 100)]),
+                  "value": n["total"]}
+
+    win = [p["total"] for p in nights[max(0, i - 13):i + 1] if p["total"] is not None]
+    if len(win) >= 3:
+        w = list(range(1, len(win) + 1))
+        avg = sum(a * b_ for a, b_ in zip(win, w)) / sum(w)
+        deficit = SLEEP_NEED_H - avg
+        c["sleep_balance"] = {"score": oc.lerp_score(deficit, [(0, 100), (0.5, 85), (1, 70), (2, 45), (3, 20)]),
+                              "value": round(avg, 2), "need": SLEEP_NEED_H}
+
+    mids = [p["timing"] for p in nights[max(0, i - 13):i + 1] if p["timing"] is not None]
+    if len(mids) >= 5:
+        adj = [(m - 24 if m >= 12 else m) * 60 for m in mids]
+        sd = statistics.pstdev(adj)
+        c["sleep_regularity"] = {"score": oc.lerp_score(sd, [(30, 100), (60, 75), (90, 50), (120, 25)]),
+                                 "value": round(sd)}
+
+    day_before = (datetime.strptime(n["night"], "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    a = activity.get(day_before)
+    if a and not a["partial"]:
+        s1 = oc.lerp_score(a["inactive_min"] / 60, [(8, 100), (10, 80), (12, 60), (14, 40)])
+        s2 = oc.lerp_score(a["met_min_mh"], [(0, 50), (50, 75), (100, 100), (400, 100), (800, 80)])
+        c["previous_day_activity"] = {"score": (s1 + s2) / 2, "value": a["met_min_mh"],
+                                      "inactive_min": a["inactive_min"]}
+
+    for k in c:
+        c[k]["score"] = r(c[k]["score"], 0)
+        c[k]["rating"] = oc.rating(c[k]["score"])
+    scores = [x["score"] for x in c.values() if x["score"] is not None]
+    score = round(statistics.fmean(scores)) if len(scores) >= 5 else None
+    return score, c, len(prev)
+
+
+def tension_for(i, nights):
+    """Signes de tension (analogue non diagnostique du Symptom Radar Oura) :
+    écarts simultanés de la FC la plus basse, de la FC moyenne, du HRV, de la
+    température et de la respiration par rapport aux nuits antérieures."""
+    n = nights[i]
+    prev = nights[max(0, i - 60):i]
+    sig = []
+
+    def chk(metric, label, unit, cond, strong=None):
+        b = base_stats([p.get(metric) for p in prev])
+        v = n.get(metric)
+        if v is None or not b or b["n"] < 3:
+            return
+        d = v - b["mean"]
+        if cond(d, b):
+            sig.append({"metric": metric, "label": label, "value": v, "baseline": round(b["mean"], 1),
+                        "delta": round(d, 2), "unit": unit,
+                        "strong": bool(strong and strong(d, b))})
+
+    chk("hr_min", "FC la plus basse", "bpm", lambda d, b: d >= max(5, 2 * b["sd"]), lambda d, b: d >= 10)
+    chk("hr_mean", "FC moyenne de nuit", "bpm", lambda d, b: d >= 8, lambda d, b: d >= 15)
+    chk("hrv_rmssd", "HRV moyen", "ms", lambda d, b: d <= -0.25 * b["mean"], lambda d, b: d <= -0.4 * b["mean"])
+    if (n.get("resp_n") or 0) >= 20:
+        chk("resp_rate", "Fréquence respiratoire", "/min", lambda d, b: d >= 2, lambda d, b: d >= 3)
+    if n.get("temp_dev") is not None and n["temp_dev"] >= 0.5:
+        sig.append({"metric": "temp_dev", "label": "Température", "value": n["temp_dev"], "baseline": 0.0,
+                    "delta": n["temp_dev"], "unit": "°C", "strong": n["temp_dev"] >= 1.0})
+    strong = sum(1 for s in sig if s["strong"])
+    level = "aucun" if not sig else ("marqués" if len(sig) >= 2 and (strong or len(sig) >= 3) else "mineurs")
+    return {"level": level, "signals": sig, "n_base": len(prev),
+            "provisional": len(prev) < BASE_RELIABLE_N}
+
+
+def update_readiness(der, nights, activity, now):
+    for i, n in enumerate(nights):
+        score, contrib, nb = readiness_for(i, nights, activity)
+        tension = tension_for(i, nights)
+        der.execute("INSERT OR REPLACE INTO readiness (day, score, contributors, tension, n_base,"
+                    " provisional, ts) VALUES (?,?,?,?,?,?,?)",
+                    (n["night"], score, json.dumps(contrib, ensure_ascii=False),
+                     json.dumps(tension, ensure_ascii=False), nb, int(nb < BASE_RELIABLE_N), now))
+
+
+# ---------------------------------------------------------------- activité
+
+def profile_weight(der, con):
+    row = der.execute("SELECT weight_kg FROM user_profile WHERE id=1").fetchone()
+    if row and row[0]:
+        return float(row[0]), "profil"
+    ui = con.execute("SELECT decoded_json FROM events WHERE tag=? ORDER BY ring_timestamp DESC LIMIT 1",
+                     (oc.T_USER_INFO,)).fetchone()
+    w = (oc.jget(ui[0]) or {}).get("weight_kg") if ui else None
+    return (float(w), "anneau") if w else (70.0, "défaut")
+
+
+def worn_minutes(con, axis, t0, t1, charging):
+    """Minutes où l'anneau est au doigt : température de peau > 30 °C à ±5 min
+    (au repos sur une table, l'anneau est à la température de la pièce)."""
+    s_ds, e_ds = axis.to_ds(t0 - 600), axis.to_ds(t1 + 600)
+    hot = set()
+    for rt, cap, dj in oc.rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                    " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
+                               (oc.T_TEMP, s_ds, e_ds)):
+        if oc.in_intervals(rt, charging):
             continue
-        con.execute("INSERT OR REPLACE INTO baselines (metric, mean, sd, updated_unix)"
-                    " VALUES (?,?,?,?)", (metric, round(mean, 3), round(sd, 3), now))
-    # température : EMA asymétrique ecore replié sur les nuits précédentes.
-    # `sleep_scores.temp_mean` est en degrés ; ema_baseline attend des centièmes
-    # (même convention qu'à l'appel de compute_night).
-    temps = [int(round(r[6] * 100)) for r in rows[:-1] if r[6] is not None]
-    if temps:
-        bmean, bdev = ema_baseline(temps, age_days=max(0, len(temps) - 1))
-        con.execute("INSERT OR REPLACE INTO baselines (metric, mean, sd, updated_unix)"
-                    " VALUES (?,?,?,?)",
-                    ("temp_nightly", round(bmean / 100.0, 2), round(bdev / 100.0, 2), now))
+        v = oc.skin_temp(oc.jget(dj))
+        if v is not None and v > 30.0:
+            t = axis(rt, cap)
+            if t is not None:
+                m = int(t // 60)
+                for k in range(m - 5, m + 6):
+                    hot.add(k * 60)
+    return hot
 
 
-# ---------------------------------------------------------------- briefing
+def compute_activity_day(con, axis, day, sleep_windows, charging, weight):
+    t0 = datetime.strptime(day, "%Y-%m-%d").timestamp()
+    t1 = t0 + 86400
+    mets = oc.met_minutes(con, axis, t0, t1)
+    worn = worn_minutes(con, axis, t0, t1, charging)
+    sleep = {m for m in mets if any(a <= m < b for a, b in sleep_windows)}
+    awake = sorted(m for m in mets if m in worn and m not in sleep)
+    inactive = [m for m in awake if mets[m] < 1.5]
+    low = sum(1 for m in awake if 1.5 <= mets[m] < 3)
+    med = sum(1 for m in awake if 3 <= mets[m] < 6)
+    high = sum(1 for m in awake if mets[m] >= 6)
+    met_mh = sum(mets[m] for m in awake if mets[m] >= 3)
+    kcal = sum((mets[m] - 1) * 3.5 * weight / 200 for m in awake if mets[m] >= 1.5)
+    # périodes sédentaires > 50 min (trous ≤ 2 min tolérés)
+    bouts, run, last = 0, 0, None
+    for m in inactive:
+        if last is not None and m - last <= 180:
+            run += (m - last) // 60
+        else:
+            if run > 50:
+                bouts += 1
+            run = 1
+        last = m
+    if run > 50:
+        bouts += 1
+    return {"day": day, "worn_min": len([m for m in mets if m in worn]), "sleep_min": len(sleep),
+            "inactive_min": len(inactive), "low_min": low, "medium_min": med, "high_min": high,
+            "met_min_mh": round(met_mh, 1), "sedentary_bouts": bouts, "active_kcal": round(kcal),
+            "easy_day": int(high <= 15 and med + high <= 85),
+            "partial": int(len(awake) < 600 or t1 > time.time())}
 
-def briefing_context(con, night, days=30):
-    rows = con.execute(
-        """SELECT night, score, total, deep, rem, light, awake, in_bed, efficiency,
-                  latency, timing, restfulness, hr_min, hr_mean, hrv_rmssd,
-                  temp_mean, temp_dev, movement, staging_source
-             FROM sleep_scores WHERE night<=? ORDER BY night DESC LIMIT ?""",
-        (night, days)).fetchall()
-    keys = ["night", "score", "total", "deep", "rem", "light", "awake", "in_bed",
-            "efficiency", "latency", "timing", "restfulness", "hr_min", "hr_mean",
-            "hrv_rmssd", "temp_mean", "temp_dev", "movement", "staging_source"]
-    out = [dict(zip(keys, r)) for r in rows]
-    for o in out:
-        for k in list(o):
-            if o[k] is None:
-                del o[k]
-    return json.dumps(list(reversed(out)), ensure_ascii=False)
+
+def activity_contributors(day, activity):
+    a = activity[day]
+    c = {"stay_active": {"score": oc.lerp_score(a["inactive_min"] / 60, [(5, 100), (8, 85), (12, 55), (16, 20)]),
+                         "value": a["inactive_min"]},
+         "move_every_hour": {"score": oc.lerp_score(a["sedentary_bouts"], [(0, 100), (1, 90), (3, 65), (6, 30)]),
+                             "value": a["sedentary_bouts"]}}
+    d0 = datetime.strptime(day, "%Y-%m-%d")
+    week = [activity.get((d0 - timedelta(days=k)).strftime("%Y-%m-%d")) for k in range(7)]
+    week = [w for w in week if w and w["worn_min"] >= 600]
+    if len(week) >= 3:
+        freq = sum(1 for w in week if w["met_min_mh"] >= 100)
+        vol = sum(w["met_min_mh"] for w in week) * 7 / len(week)
+        easy = sum(w["easy_day"] for w in week)
+        c["training_frequency"] = {"score": oc.lerp_score(freq, [(0, 20), (1, 45), (2, 70), (3, 95), (4, 100)]),
+                                   "value": freq, "days": len(week)}
+        c["training_volume"] = {"score": oc.lerp_score(vol, [(0, 20), (750, 60), (1500, 85), (2000, 100)]),
+                                "value": round(vol), "days": len(week)}
+        c["recovery_time"] = {"score": oc.lerp_score(easy, [(0, 30), (1, 85), (2, 100)]),
+                              "value": easy, "days": len(week)}
+    for k in c:
+        c[k]["score"] = r(c[k]["score"], 0)
+        c[k]["rating"] = oc.rating(c[k]["score"])
+    sc = [x["score"] for x in c.values()]
+    return (round(statistics.fmean(sc)) if len(sc) >= 5 else None), c
 
 
-def llm_briefing(con, night):
-    """Génère le briefing de la nuit via llama-swap. None si indisponible."""
+def update_activity(con, der, axis, nights_raw, charging, recompute_all, now):
+    known = {x[0]: x[1] for x in der.execute("SELECT day, partial FROM activity_daily")}
+    first = con.execute("SELECT MIN(captured_unix) FROM events WHERE tag=?", (oc.T_ACTIVITY,)).fetchone()[0]
+    if not first:
+        return {}
+    d = datetime.fromtimestamp(first).date()
+    today = datetime.fromtimestamp(now).date()
+    weight, _ = profile_weight(der, con)
+    windows = [(n["start_unix"], n["end_unix"]) for n in nights_raw]
+    windows += oc.short_rest_periods(con, axis)
+    while d <= today:
+        day = d.strftime("%Y-%m-%d")
+        if recompute_all or day not in known or known[day] or (today - d).days <= 1:
+            a = compute_activity_day(con, axis, day, windows, charging, weight)
+            der.execute("INSERT OR REPLACE INTO activity_daily (day, worn_min, sleep_min, inactive_min,"
+                        " low_min, medium_min, high_min, met_min_mh, sedentary_bouts, active_kcal, easy_day,"
+                        " partial, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (day, a["worn_min"], a["sleep_min"], a["inactive_min"], a["low_min"], a["medium_min"],
+                         a["high_min"], a["met_min_mh"], a["sedentary_bouts"], a["active_kcal"],
+                         a["easy_day"], a["partial"], now))
+        d += timedelta(days=1)
+    der.row_factory = sqlite3.Row
+    act = {x["day"]: dict(x) for x in der.execute("SELECT * FROM activity_daily")}
+    der.row_factory = None
+    for day in act:
+        score, contrib = activity_contributors(day, act)
+        der.execute("UPDATE activity_daily SET score=?, contributors=? WHERE day=?",
+                    (score, json.dumps(contrib, ensure_ascii=False), day))
+        act[day]["score"], act[day]["contributors"] = score, contrib
+    return act
+
+
+# ---------------------------------------------------------------- briefing LLM
+
+PLAUSIBLE = {"hr_min": (30, 120), "hr_mean": (30, 140), "hrv_rmssd": (3, 250), "resp_rate": (5, 35),
+             "temp_mean": (25, 40), "temp_dev": (-4, 4), "total": (0, 16), "efficiency": (0, 100)}
+
+
+def briefing_context(der, night, days=14):
+    nights = [n for n in nights_table(der) if n["night"] <= night][-days:]
+    keys = ["night", "score", "total", "deep", "rem", "light", "efficiency", "latency", "waso",
+            "awakenings", "timing", "hr_min", "hr_mean", "hrv_rmssd", "recovery_index", "resp_rate",
+            "temp_mean", "temp_dev", "temp_status"]
+    out = []
+    for n in nights:
+        o = {}
+        for k in keys:
+            v = n.get(k)
+            lo_hi = PLAUSIBLE.get(k)
+            if v is None or (lo_hi and not lo_hi[0] <= v <= lo_hi[1]):
+                continue
+            o[k] = v
+        out.append(o)
+    rd = der.execute("SELECT score, contributors, tension FROM readiness WHERE day=?", (night,)).fetchone()
+    tags = [dict(zip(("day", "kind", "note"), t)) for t in der.execute(
+        "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
+        ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
+    ctx = {"nuits": out,
+           "recuperation": {"score": rd[0], "contributeurs": json.loads(rd[1] or "{}"),
+                            "signes_de_tension": json.loads(rd[2] or "{}")} if rd else None,
+           "journal": tags}
+    return json.dumps(ctx, ensure_ascii=False)
+
+
+BRIEFING_SYSTEM = (
+    "Tu rédiges le résumé matinal des données de sommeil d'un utilisateur d'anneau Oura "
+    "(données locales, sans cloud). Tu reçois en JSON : ses dernières nuits (durées, stades estimés, "
+    "efficacité, latence, WASO, FC la plus basse, FC moyenne, HRV moyen, Recovery Index, fréquence "
+    "respiratoire expérimentale, température et écart à sa ligne de base), les contributeurs de "
+    "récupération, les signes de tension et son journal (tags).\n"
+    "Règles :\n"
+    "- français, 5 à 8 lignes, ton factuel et bienveillant ;\n"
+    "- n'utilise QUE les chiffres du contexte ; si une donnée manque, dis-le ;\n"
+    "- n'affirme aucune cause : propose au plus des facteurs POSSIBLES, et seulement s'ils sont "
+    "cohérents avec les données ou le journal ;\n"
+    "- aucun diagnostic médical ; les stades et scores sont des estimations non validées ;\n"
+    "- si temp_status vaut 'calibrage' ou 'provisoire', précise que l'écart de température est peu fiable ;\n"
+    "- si les signes de tension sont 'marqués', conseille du repos, de noter les symptômes, de mesurer "
+    "sa température avec un thermomètre en cas de malaise, et de consulter un médecin si cela persiste "
+    "ou en cas de symptômes inquiétants (douleur thoracique, essoufflement : 15 ou 112) ;\n"
+    "- termine par une suggestion concrète et raisonnable."
+)
+
+
+def llm_briefing(der, night, ctx, ctx_hash):
     import urllib.request
-    ctx = briefing_context(con, night)
-    system = (
-        "Tu es l'analyste des données de sommeil de sean (anneau Oura, sans cloud). "
-        "Tu reçois en contexte JSON ses dernières nuits : score et sous-scores, durée, "
-        "stades, FC, RMSSD, température et déviance, latence, timing, mouvement. "
-        "Écris en français, 5 à 8 lignes : analyse de la nuit écoulée, détection de "
-        "tendances (latence ↑, profond ↓, température déviante, midpoint glissant…), "
-        "et 1 suggestion actionnable. INTERDICTION d'inventer des chiffres absents du "
-        "contexte : si une donnée manque, dis-le. Précise que les scores sont des "
-        "estimations (staging heuristique, non calibrés)."
-    )
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system + "\nContexte (nuits) :\n" + ctx},
-            {"role": "user", "content": f"Rédige le briefing de la nuit du {night}."},
-        ],
-        "temperature": 0.4,
-        "max_tokens": 800,
+        "messages": [{"role": "system", "content": BRIEFING_SYSTEM + "\nContexte :\n" + ctx},
+                     {"role": "user", "content": f"Rédige le résumé de la nuit du {night}."}],
+        "temperature": 0.3, "max_tokens": 800,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     req = urllib.request.Request(LLM_URL, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            text = (json.load(r)["choices"][0]["message"].get("content") or "").strip()
-        if not text:
-            return None
-        con.execute("INSERT INTO llm_briefings (night, model, text, ts) VALUES (?,?,?,?)",
-                    (night, LLM_MODEL, text, int(time.time())))
-        return text
+        with urllib.request.urlopen(req, timeout=240) as resp:
+            text = (json.load(resp)["choices"][0]["message"].get("content") or "").strip()
     except Exception as e:  # noqa: BLE001
         print(f"nightly: briefing LLM indisponible : {e}", file=sys.stderr)
         return None
+    if not text:
+        return None
+    der.execute("INSERT INTO llm_briefings (night, model, text, ts, input_hash) VALUES (?,?,?,?,?)",
+                (night, LLM_MODEL, text, int(time.time()), ctx_hash))
+    return text
+
+
+def maybe_briefing(der, latest, now, min_age_s=2700):
+    """Régénère le résumé quand ses entrées ont changé, une fois la nuit
+    stabilisée (fin de la fenêtre il y a ≥ 45 min : l'anneau révise son
+    analyse pendant ~1 h après le réveil)."""
+    if now - (latest.get("stop_unix") or now) < min_age_s:
+        return
+    ctx = briefing_context(der, latest["night"])
+    h = hashlib.sha1(ctx.encode()).hexdigest()[:16]
+    last = der.execute("SELECT input_hash FROM llm_briefings WHERE night=? ORDER BY ts DESC LIMIT 1",
+                       (latest["night"],)).fetchone()
+    if last and last[0] == h:
+        return
+    txt = llm_briefing(der, latest["night"], ctx, h)
+    if txt:
+        print(f"nightly: briefing LLM {'régénéré' if last else 'généré'} pour {latest['night']}"
+              f" ({len(txt)} car.)")
 
 
 # ---------------------------------------------------------------- main
+
+def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
+    now = int(now or time.time())
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.execute("PRAGMA busy_timeout=5000")
+    der = sqlite3.connect(derived)
+    der.execute("PRAGMA busy_timeout=5000")
+    ensure_schema(der)
+
+    axis = oc.TimeAxis(con)
+    charging = oc.charging_intervals_ds(con)
+    nights_raw = oc.load_nights(con, axis)
+    stored = {x[0]: (x[1], x[2]) for x in der.execute("SELECT night, input_hash, version FROM sleep_scores")}
+    valid = {n["night"] for n in nights_raw}
+    # nuits disparues (ex. ancienne date erronée) : purge
+    for night in set(stored) - valid:
+        for tab in ("sleep_scores", "night_staging", "night_series", "readiness"):
+            der.execute(f"DELETE FROM {tab} WHERE {'day' if tab == 'readiness' else 'night'}=?", (night,))
+        log(f"nightly: nuit {night} retirée (plus de fenêtre de sommeil correspondante)")
+
+    for n in nights_raw:
+        h = night_input_hash(con, n)
+        if not recompute_all and stored.get(n["night"], (None, None))[0] == h:
+            continue
+        row = compute_night(con, axis, n, charging)
+        write_night(der, row, h)
+        log(f"nightly: nuit {row['night']} — score {row['score']} ({row['total']} h, "
+            f"profond {row['deep']} h, REM {row['rem']} h, eff {row['efficiency']} %, "
+            f"FC basse {row['hr_min']}, HRV {row['hrv_rmssd']}, resp {row['resp_rate']}, axe {row['axis_mode']})")
+    der.commit()
+
+    nights = nights_table(der)
+    update_temperature_deviation(der, nights)
+    update_baselines(der, nights, now)
+    activity = update_activity(con, der, axis, nights_raw, charging, recompute_all, now)
+    update_readiness(der, nights, activity, now)
+    der.commit()
+
+    if briefing and nights:
+        maybe_briefing(der, nights[-1], now)
+        der.commit()
+    if not nights_raw:
+        log("nightly: aucune fenêtre de sommeil (bedtime_period) en base — rien à dériver")
+    con.close()
+    der.close()
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
     ap.add_argument("--derived", required=True)
-    ap.add_argument("--briefing", action="store_true",
-                    help="générer le briefing LLM de la nuit la plus récente nouvelle")
-    args = ap.parse_args()
-
-    con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
-    con.execute("PRAGMA busy_timeout=2000")
-    der = sqlite3.connect(args.derived)
-    der.execute("PRAGMA busy_timeout=5000")
-    ensure_schema(der)
-
-    t_of, mode = time_axis(con)
-    nights = load_nights(con, t_of)
-    known = {r[0] for r in der.execute("SELECT night FROM sleep_scores")}
-    new_nights = [n for n in nights if n["night"] not in known]
-
-    # températures déjà consolidées (nuits précédentes, pour la baseline)
-    prev_temps = []
-    for r in der.execute("SELECT temp_mean FROM sleep_scores ORDER BY night"):
-        if r[0] is not None:
-            prev_temps.append(int(round(r[0] * 100)))
-
-    rows = []
-    for n in nights:
-        row = compute_night(con, n, prev_temps)
-        write_night(der, row)
-        prev_temps.append(int(round(row["temp_mean"] * 100))) if row["temp_mean"] else None
-        rows.append(row)
-        print(f"nightly: nuit {row['night']} — score {row['score']}/100 "
-              f"({row['total']} h, eff {row['efficiency']} %, latence {row['latency']} min, "
-              f"staging {row['staging_source']}, axe horaire: {mode})")
-
-    # Les nuits sont déjà écrites : un incident sur les lignes de base ne doit
-    # pas empêcher leur enregistrement.
-    try:
-        update_baselines(der, time.time())
-    except Exception as e:  # noqa: BLE001
-        print(f"nightly: lignes de base ignorées ({e})", file=sys.stderr)
-    der.commit()
-
-    if args.briefing:
-        latest = max(rows, key=lambda r: r["night"]) if rows else None
-        if latest:
-            have = der.execute("SELECT 1 FROM llm_briefings WHERE night=? LIMIT 1",
-                               (latest["night"],)).fetchone()
-            if not have:
-                txt = llm_briefing(der, latest["night"])
-                if txt:
-                    der.commit()
-                    print(f"nightly: briefing LLM généré pour {latest['night']} ({len(txt)} car.)")
-    con.close()
-    der.close()
-    if not nights:
-        print("nightly: aucune fenêtre de sommeil (bedtime_period) en base — rien à dériver")
+    ap.add_argument("--briefing", action="store_true", help="résumé LLM de la dernière nuit")
+    ap.add_argument("--all", action="store_true", help="recalculer toutes les nuits")
+    a = ap.parse_args()
+    run(a.db, a.derived, briefing=a.briefing, recompute_all=a.all)
 
 
 if __name__ == "__main__":
