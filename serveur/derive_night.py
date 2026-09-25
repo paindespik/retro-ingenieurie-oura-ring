@@ -708,28 +708,40 @@ PLAUSIBLE = {"hr_min": (30, 120), "hr_mean": (30, 140), "hrv_rmssd": (3, 250), "
              "temp_mean": (25, 40), "temp_dev": (-4, 4), "total": (0, 16), "efficiency": (0, 100)}
 
 
+# Noms explicites (unités comprises) : un petit modèle confond sinon score de
+# sommeil et score de récupération, heures et minutes.
+BRIEF_KEYS = {
+    "night": "nuit", "score": "score_sommeil", "total": "sommeil_total_h", "deep": "profond_h",
+    "rem": "rem_h", "light": "leger_h", "efficiency": "efficacite_pct", "latency": "latence_min",
+    "waso": "eveil_apres_endormissement_min", "awakenings": "reveils_de_plus_de_5_min",
+    "timing": "milieu_du_sommeil_heure_decimale", "hr_min": "fc_la_plus_basse_bpm",
+    "hr_mean": "fc_moyenne_sommeil_bpm", "hrv_rmssd": "hrv_moyen_ms",
+    "recovery_index": "indice_de_recuperation_h", "resp_rate": "respiration_par_min_experimental",
+    "temp_mean": "temperature_nuit_c", "temp_dev": "ecart_temperature_c",
+    "temp_status": "fiabilite_reference_temperature",
+}
+
+
 def briefing_context(der, night, days=14):
     nights = [n for n in nights_table(der) if n["night"] <= night][-days:]
-    keys = ["night", "score", "total", "deep", "rem", "light", "efficiency", "latency", "waso",
-            "awakenings", "timing", "hr_min", "hr_mean", "hrv_rmssd", "recovery_index", "resp_rate",
-            "temp_mean", "temp_dev", "temp_status"]
     out = []
     for n in nights:
         o = {}
-        for k in keys:
+        for k, name in BRIEF_KEYS.items():
             v = n.get(k)
             lo_hi = PLAUSIBLE.get(k)
             if v is None or (lo_hi and not lo_hi[0] <= v <= lo_hi[1]):
                 continue
-            o[k] = v
+            o[name] = v
         out.append(o)
     rd = der.execute("SELECT score, contributors, tension FROM readiness WHERE day=?", (night,)).fetchone()
-    tags = [dict(zip(("day", "kind", "note"), t)) for t in der.execute(
+    tags = [dict(zip(("jour", "type", "note"), t)) for t in der.execute(
         "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
         ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
     ctx = {"nuits": out,
-           "recuperation": {"score": rd[0], "contributeurs": json.loads(rd[1] or "{}"),
-                            "signes_de_tension": json.loads(rd[2] or "{}")} if rd else None,
+           "recuperation_du_jour": {"score_recuperation": rd[0],
+                                    "contributeurs": json.loads(rd[1] or "{}"),
+                                    "signes_de_tension": json.loads(rd[2] or "{}")} if rd else None,
            "journal": tags}
     return json.dumps(ctx, ensure_ascii=False)
 
@@ -742,11 +754,14 @@ BRIEFING_SYSTEM = (
     "récupération, les signes de tension et son journal (tags).\n"
     "Règles :\n"
     "- français, 5 à 8 lignes, ton factuel et bienveillant ;\n"
+    "- le score de sommeil (score_sommeil) et le score de récupération (score_recuperation) sont "
+    "deux scores DISTINCTS : ne les confonds jamais ;\n"
     "- n'utilise QUE les chiffres du contexte ; si une donnée manque, dis-le ;\n"
     "- n'affirme aucune cause : propose au plus des facteurs POSSIBLES, et seulement s'ils sont "
     "cohérents avec les données ou le journal ;\n"
     "- aucun diagnostic médical ; les stades et scores sont des estimations non validées ;\n"
-    "- si temp_status vaut 'calibrage' ou 'provisoire', précise que l'écart de température est peu fiable ;\n"
+    "- si fiabilite_reference_temperature vaut 'calibrage' ou 'provisoire', précise que la référence "
+    "de température repose sur peu de nuits ;\n"
     "- si les signes de tension sont 'marqués', conseille du repos, de noter les symptômes, de mesurer "
     "sa température avec un thermomètre en cas de malaise, et de consulter un médecin si cela persiste "
     "ou en cas de symptômes inquiétants (douleur thoracique, essoufflement : 15 ou 112) ;\n"
