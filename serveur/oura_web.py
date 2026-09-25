@@ -126,6 +126,7 @@ def get_profile_row():
 
 
 EPOCH_SLACK_DS = 6 * 3600 * 10   # port de open_oura tools/epoch_time.py
+DRIFT_TOL_S = 900                # écart anneau↔serveur toléré sans correction (15 min)
 
 
 def build_epochs(pairs):
@@ -150,7 +151,14 @@ def time_axis(c):
 
     Priorité : événements time_sync (tag 66, unix_time). À défaut : ancrage par
     epoch de boot (port de open_oura tools/epoch_time.py). À défaut : capture.
-    Renvoie (t_of, mode) avec mode ∈ {"sync", "epoch", "capture"}.
+    Renvoie (t_of, mode) avec mode ∈ {"sync", "epoch", "capture"} ; t_of.drift_s
+    porte l'écran anneau↔serveur appliqué (0 si < DRIFT_TOL_S).
+
+    Le time_sync est écrit par l'hôte BLE (téléphone ou PC) avec sa propre
+    horloge : si cette horloge dérive de celle du serveur (ex. téléphone sans
+    NTP), tout l'axe est décalé et le filtre `since` (base serveur) renvoie
+    l'historique complet quelle que soit la fenêtre. On cale donc l'axe sur
+    l'heure de capture du dernier événement ingéré, qui relie les deux bases.
     """
     anchors = []
     for r in q(c, "SELECT ring_timestamp rt, decoded_json dj FROM events WHERE tag=66 ORDER BY ring_timestamp"):
@@ -158,14 +166,37 @@ def time_axis(c):
         if j and isinstance(j.get("unix_time"), (int, float)):
             anchors.append((r["rt"], int(j["unix_time"])))
     if anchors:
-        def t_of(rt, cap):
-            off = None
+        # ring_timestamp est en DÉCISECONDES : le temps écoulé depuis une ancre
+        # vaut (rt - art) / 10 s — l'additionner comme des secondes (rt + au - art)
+        # étirait l'axe de ×10 entre deux syncs (cf. derive_night.time_axis, même
+        # correction). L'ancre porte l'horloge de l'HÔTE BLE (téléphone/PC) : on
+        # cale l'axe sur la captured_unix du dernier événement ingéré, qui relie
+        # les deux bases, pour que le filtre `since` (base serveur) soit cohérent.
+        last = one(c, "SELECT ring_timestamp rt, captured_unix cap FROM events"
+                       " ORDER BY id DESC LIMIT 1")
+        drift = 0
+        if last:
+            anc = None
             for art, au in anchors:
-                if art <= rt:
-                    off = au - art
+                if art <= last["rt"]:
+                    anc = (art, au)
                 else:
                     break
-            return rt + off if off is not None else cap
+            if anc:
+                drift = (anc[1] + (last["rt"] - anc[0]) / 10.0) - last["cap"]
+        drift = drift if abs(drift) > DRIFT_TOL_S else 0
+
+        def t_of(rt, cap):
+            anchor = None
+            for art, au in anchors:
+                if art <= rt:
+                    anchor = (art, au)
+                else:
+                    break
+            if anchor is None:          # avant la 1re ancre : heure de capture
+                return cap
+            return anchor[1] + (rt - anchor[0]) / 10.0 - drift
+        t_of.drift_s = drift
         return t_of, "sync"
     pairs = [(r["rt"], r["cap"]) for r in q(c, "SELECT ring_timestamp rt, captured_unix cap FROM events")]
     epochs = build_epochs(pairs)
@@ -179,9 +210,11 @@ def time_axis(c):
                         best = (span, e)
             e = best[1] if best else epochs[-1]
             return e[2] - (e[1] - rt) / 10.0
+        t_of.drift_s = 0
         return t_of, "epoch"
     def t_of(rt, cap):
         return cap
+    t_of.drift_s = 0
     return t_of, "capture"
 
 
@@ -373,7 +406,8 @@ def telemetry(hours: int = Query(6, ge=1, le=168)):
                      " ORDER BY captured_unix", (since,))
     ]
     out = {
-        "since": since, "anchored": anchored,
+        "since": since, "now": now, "anchored": anchored,
+        "drift_s": getattr(t_of, "drift_s", 0),
         "temp": series([70], pick_temp),
         "met": series([80], pick_met),
         "motion": series([71], pick_motion),
@@ -401,7 +435,7 @@ def events(limit: int = Query(80, ge=1, le=500), type: str | None = None):
     types = q(c, "SELECT name, COUNT(*) n FROM events GROUP BY name ORDER BY n DESC")
     c.close()
     return {
-        "anchored": anchored,
+        "anchored": anchored, "drift_s": getattr(t_of, "drift_s", 0),
         "events": [{"t": t_of(r["rt"], r["cap"]), "ring_ts": r["rt"], "tag": r["tag"],
                     "name": r["name"], "decoded": jget(r["dj"])} for r in rows],
         "types": types,
@@ -910,19 +944,46 @@ function profileForm(u,i){
   <div class="sub" style="margin-top:.4rem">${u.updated_unix?"profil enregistré · mis à jour "+ago(u.updated_unix):"aucun profil enregistré — les valeurs ci-dessus sont celles inférées par l'anneau"}</div>
   <div class="sub">selon l'anneau (user_information${i._status==="inferred"?", inféré":""}) : ${i.age_years??"—"} ans · ${i.height_cm??"—"} cm · ${i.weight_kg??"—"} kg · ${i.sex&&i.sex!=="unspecified"?i.sex:"—"}</div>`}
 
+function fmtTick(t,win){const d=new Date(t*1000);
+ const hm=String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+ if(win>=48*3600)return d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"})+" "+hm;
+ if(win>=20*3600)return d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"})+" "+String(d.getHours()).padStart(2,"0")+"h";
+ return hm}
+
 function svgLines(series,opt={}){
- const W=opt.W||860,H=opt.H||180,pts=series.flatMap(s=>s.points);
+ const W=opt.W||860,H=opt.H||180;
+ const has=opt.x0!=null&&opt.x1!=null&&opt.x1>opt.x0;
+ const pts=series.flatMap(s=>s.points).filter(p=>!has||(p[0]>=opt.x0-60&&p[0]<=opt.x1+60));
  if(!pts.length)return `<div class="sub">pas encore de données</div>`;
  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
- let xmin=Math.min(...xs),xmax=Math.max(...xs);
+ const xmin=has?opt.x0:Math.min(...xs),xmax=has?opt.x1:Math.max(...xs);
  let ymin=opt.ymin??Math.min(...ys),ymax=opt.ymax??Math.max(...ys);
  if(xmax-xmin<1)xmax=xmin+1; if(ymax-ymin<1e-6){ymax+=1;ymin=Math.max(0,ymin-1)}
  const x=v=>(v-xmin)/(xmax-xmin)*(W-10)+5, y=v=>H-25-(v-ymin)/(ymax-ymin)*(H-45);
  let g=`<svg viewBox="0 0 ${W} ${H}" style="width:100%">`;
  for(let i=0;i<=4;i++){const yy=10+i*(H-45)/4,vv=ymax-i*(ymax-ymin)/4;
   g+=`<line x1="5" x2="${W-5}" y1="${yy}" y2="${yy}" stroke="var(--muted)" stroke-opacity=".25"/><text x="${W-8}" y="${yy+3}" text-anchor="end">${vv.toFixed(opt.dec??1)}</text>`}
- series.forEach(s=>{if(s.points.length<2)return;
-  g+=`<polyline fill=none stroke="${s.color}" stroke-width=2 points="${s.points.map(p=>x(p[0])+","+y(p[1])).join(" ")}"/>`});
+ // axe X : graduations seulement si les abscisses sont des secondes unix
+ // (Tendances passe des ms : xmin ~1.7e12) ; segments coupés sur les trous de
+ // données pour éviter les fausses diagonales
+ const win=xmax-xmin;
+ if(xmin<1e11){const n=6;
+  for(let i=0;i<=n;i++){const t=xmin+i*win/n,xx=5+i*(W-10)/n;
+   g+=`<line x1="${xx}" x2="${xx}" y1="10" y2="${H-25}" stroke="var(--muted)" stroke-opacity=".12"/>`
+     +`<text x="${xx}" y="${H-14}" text-anchor="${i===0?"start":i===n?"end":"middle"}">${fmtTick(t,win)}</text>`}}
+ // seuil de coupure : au-dessus de 4× l'écart médian entre points de la série
+ // (et jamais sous 4× le pas d'échantillonnage) → pas de fausses diagonales,
+ // mais les points régulièrement espacés restent reliés
+ const med=s=>{const d=[];for(let i=1;i<s.points.length;i++)d.push(s.points[i][0]-s.points[i-1][0]);
+  return d.length?(d.sort((a,b)=>a-b)[Math.floor(d.length/2)]):0};
+ const gap=Math.max(win/40,...series.map(s=>4*med(s)));
+ series.forEach(s=>{const st=Math.max(1,Math.ceil(s.points.length/1800));
+  const pp=s.points.filter((p,i)=>i%st===0||i===s.points.length-1);
+  if(pp.length<2)return;
+  let seg=[];
+  const flush=()=>{if(seg.length>1)g+=`<polyline fill=none stroke="${s.color}" stroke-width=2 points="${seg.map(p=>x(p[0])+","+y(p[1])).join(" ")}"/>`;seg=[]};
+  pp.forEach((p,i)=>{if(i&&p[0]-pp[i-1][0]>gap)flush();seg.push(p)});
+  flush()});
  g+=`<text x=5 y=${H-4}>${dt(xmin)}</text><text x=${W-5} text-anchor=end y=${H-4}>${dt(xmax)}</text></svg>`;
  return g}
 
@@ -947,14 +1008,19 @@ function svgBars(items,opt={}){
 function stackedBars(items,opt={}){
  const W=opt.W||860,H=opt.H||170;
  if(!items.length)return `<div class="sub">pas encore de données</div>`;
- const xs=items.map(i=>i.x),xmax=Math.max(...xs),xmin=Math.min(...xs);
+ const has=opt.x0!=null&&opt.x1!=null&&opt.x1>opt.x0;
+ const xmax=has?opt.x1:Math.max(...items.map(i=>i.x)),xmin=has?opt.x0:Math.min(...items.map(i=>i.x));
  const ymax=Math.max(...items.map(i=>i.act+i.hi),1);
  const x=v=>(v-xmin)/(xmax-xmin||1)*(W-10)+5;
- const w=Math.max(6,(W-10)/Math.max(1,items.length*2.5));
- const lbl=t=>new Date(t*1000).toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"});
+ const w=Math.max(2,(W-10)/Math.max(1,(xmax-xmin)/3600*2.5));
+ const lbl=t=>fmtTick(t,xmax-xmin);
  let g=`<svg viewBox="0 0 ${W} ${H}" style="width:100%">`;
  for(let i=0;i<=4;i++){const yy=10+i*(H-45)/4,vv=ymax-i*(ymax/4);
   g+=`<line x1="5" x2="${W-5}" y1="${yy}" y2="${yy}" stroke="var(--muted)" stroke-opacity=".25"/><text x="${W-8}" y="${yy+3}" text-anchor="end">${Math.round(vv)}</text>`}
+ {const win=xmax-xmin,n=6;
+  for(let i=0;i<=n;i++){const t=xmin+i*win/n,xx=5+i*(W-10)/n;
+   g+=`<line x1="${xx}" x2="${xx}" y1="10" y2="${H-25}" stroke="var(--muted)" stroke-opacity=".12"/>`
+     +`<text x="${xx}" y="${H-14}" text-anchor="${i===0?"start":i===n?"end":"middle"}">${lbl(t)}</text>`}}
  items.forEach(i=>{const hA=(H-45)*(i.act/ymax),hH=(H-45)*(i.hi/ymax);
   g+=`<rect x="${x(i.x)-w/2}" y="${H-25-hA}" width="${w}" height="${hA}" fill="var(--accent)" rx="1"/>`;
   g+=`<rect x="${x(i.x)-w/2}" y="${H-25-hA-hH}" width="${w}" height="${hH}" fill="var(--bad)" rx="1"/>`});
@@ -1008,7 +1074,10 @@ function subscoreBar(label,v){
  const pct=v==null?0:Math.max(0,Math.min(100,v));
  return `<div class="rowline"><span class="lbl">${label}</span><div class="bar"><i style="width:${pct}%"></i></div><b style="width:2.5rem;text-align:right">${fmt(v,0)}</b></div>`}
 function fmtHM(h){if(h==null)return"—";h=h%24;return String(Math.floor(h)).padStart(2,"0")+":"+String(Math.round((h%1)*60)).padStart(2,"0")}
-function axisLbl(m){return m==="sync"?"horloge ancrée (time_sync)":m==="epoch"?"horloge estimée (epoch de boot — pas de time_sync sur ce firmware)":"axe = heure de capture"}
+function axisLbl(m,drift){let s=m==="sync"?"horloge ancrée (time_sync)":m==="epoch"?"horloge estimée (epoch de boot — pas de time_sync sur ce firmware)":"axe = heure de capture";
+ if(drift&&Math.abs(drift)>900){const j=Math.floor(Math.abs(drift)/86400),h=Math.round(Math.abs(drift)%86400/3600);
+  s+=` · horloge de l'hôte BLE en ${drift>0?"avance":"retard"} de ${j?j+" j ":""}${h} h sur le serveur — axe ramené à l'heure du serveur`}
+ return s}
 function jget(s){try{return s?JSON.parse(s):null}catch(e){return null}}
 
 function hypnogram(st){
@@ -1097,31 +1166,34 @@ async function render(){
    const t=await api("telemetry?hours="+range);
    html+=`<div class="card" style="display:flex;gap:.4rem;align-items:center">`
     +H.map(h=>`<button class="range ${h===range?"on":""}" onclick="setRange(${h})">${LBL[h]}</button>`).join("")
-    +`<span class="sub" style="margin-left:auto">${axisLbl(t.anchored)}</span></div>`;
+    +`<span class="sub" style="margin-left:auto">${axisLbl(t.anchored,t.drift_s)}</span></div>`;
    if(t.temp.length){
     html+=card("Température de peau (min / médiane / max)",
      svgLines([{color:"var(--bad)",points:t.temp.map(p=>[p.t,p.min])},
                {color:"var(--accent)",points:t.temp.map(p=>[p.t,p.mid])},
-               {color:"var(--blue)",points:t.temp.map(p=>[p.t,p.max])}],{dec:2}));
+               {color:"var(--blue)",points:t.temp.map(p=>[p.t,p.max])}],{dec:2,x0:t.since,x1:t.now}));
    } else html+=card("Température de peau","<div class='sub'>pas encore de temp_event sur la période</div>");
-   if(t.met.length)html+=card("Activité (MET)",svgLines([{color:"var(--accent)",points:t.met.map(p=>[p.t,p.met])}],{dec:2,ymin:0}));
+   if(t.met.length)html+=card("Activité (MET)",svgLines([{color:"var(--accent)",points:t.met.map(p=>[p.t,p.met])}],{dec:2,ymin:0,x0:t.since,x1:t.now}));
    if(t.motion.length){
     const hh={};
     t.motion.forEach(p=>{const h=Math.floor(p.t/3600)*3600;const d=hh[h]??={s:0,hi:0};
      d.s+=p.seconds||0;d.hi+=p.high||0});
     html+=card("Mouvement par heure (s actives, rouge = s haute intensité)",
-     stackedBars(Object.entries(hh).map(([h,d])=>({x:+h,act:d.s,hi:d.hi})))
+     stackedBars(Object.entries(hh).map(([h,d])=>({x:+h,act:d.s,hi:d.hi})),{x0:t.since,x1:t.now})
      +`<div class="sub">chaque barre = 1 heure · vert = secondes actives (fenêtres de 30 s) · rouge = secondes haute intensité (balancier du bras : vélo, marche rapide…)</div>`);
    }
-   if(t.states.length)html+=card("États (wear / charge / orientation)",
-    t.states.map(s=>`<div class="kv"><span class="sub">${dt(s.t)}</span><span>${evText(s.kind==="wear"?"wear_event":"state_change",{text:s.text,state:s.state})}</span></div>`).join(""));
+   if(t.states.length)html+=card(`États (wear / charge / orientation) — ${t.states.length} événements`,
+    `<div style="max-height:14rem;overflow-y:auto;border:1px solid var(--muted);border-radius:8px;padding:.2rem .6rem">`
+    +t.states.map(s=>`<div class="kv"><span class="sub">${dt(s.t)}</span><span>${evText(s.kind==="wear"?"wear_event":"state_change",{text:s.text,state:s.state})}</span></div>`).join("")
+    +`</div>`);
    if(t.hr.length)html+=card("Fréquence cardiaque / HRV",
     svgLines([{color:"var(--bad)",points:t.hr.map(p=>[p.t,p.hr])},
-              {color:"var(--violet)",points:t.hr.filter(p=>p.rmssd!=null).map(p=>[p.t,p.rmssd])}],{dec:0})
+              {color:"var(--violet)",points:t.hr.filter(p=>p.rmssd!=null).map(p=>[p.t,p.rmssd])}],{dec:0,x0:t.since,x1:t.now})
     +`<div class="sub">rouge = FC (bpm) · violet = RMSSD (ms, bins 5 min)</div>`);
    else html+=card("Fréquence cardiaque / HRV","<div class='sub'>pas encore d'événements hrv — les features daytime_hr / SpO2 sont actives, les données arriveront aux syncs suivants</div>");
-   if(t.spo2.length)html+=card("SpO2 (R-ratio / perfusion index)",
-    svgLines([{color:"var(--blue)",points:t.spo2.map(p=>[p.t,p.r])}]));
+   if(t.spo2.length)html+=card("SpO2 — R-ratio (mesures 1 Hz pendant les scans SpO2)",
+    svgLines([{color:"var(--blue)",points:t.spo2.map(p=>[p.t,p.r])}],{x0:t.since,x1:t.now})
+    +`<div class='sub'>R = (AC/DC)<sub>rouge</sub> / (AC/DC)<sub>IR</sub> · scans burst par périodes, pas en continu — SpO₂ ≈ 110 − 25·R (méd. tes mesures ≈ 93 %)</div>`);
    if(t.readings.length)html+=card("Mesures scalaires (readings)",
     "<table>"+t.readings.map(r=>`<tr><td class="sub">${dt(r.t)}</td><td>${r.kind}</td><td class="num">${fmt(r.v)} ${r.unit||""}</td></tr>`).join("")+"</table>");
    else html+=card("Mesures scalaires (readings)","<div class='sub'>aucune mesure scalaire stockée pour l'instant (batterie, FC live, SpO2…)</div>");
@@ -1181,7 +1253,7 @@ async function render(){
     ${D.map(d=>`<button class="range ${d===window.tdays?"on":""}" onclick="setTrends(${d})">${d} nuits</button>`).join("")}
     <span class="sub" style="margin-left:auto">${t.nights.length} nuits disponibles</span></div>`;
     if(t.nights.length){
-     html+=card("Score de sommeil",svgLines([{color:"var(--accent)",points:t.nights.map(n=>[Date.parse(n.night),n.score])}],{ymin:0,ymax:100,dec:0}));
+     html+=card("Score de sommeil",svgLines([{color:"var(--accent)",points:t.nights.map(n=>[Date.parse(n.night)/1000,n.score])}],{ymin:0,ymax:100,dec:0}));
      html+=card("Toutes les nuits",`<table><tr><th>Nuit</th><th class=num>Score</th><th class=num>Durée</th><th class=num>Profond</th><th class=num>REM</th>
      <th class=num>Effic.</th><th class=num>FC moy</th><th class=num>RMSSD</th><th class=num>Temp δ</th></tr>`
      +t.nights.map(n=>`<tr><td>${n.night}</td><td class=num>${fmt(n.score,0)}</td><td class=num>${fmt(n.total,1)}</td><td class=num>${fmt(n.deep,1)}</td><td class=num>${fmt(n.rem,1)}</td><td class=num>${fmt(n.efficiency,0)}</td><td class=num>${fmt(n.hr_mean,0)}</td><td class=num>${fmt(n.hrv_rmssd,0)}</td><td class=num>${fmt(n.temp_dev,2)}</td></tr>`).join("")+"</table>");
@@ -1212,7 +1284,7 @@ async function render(){
    sel.onchange=()=>{evType=sel.value;render()};
    $("#evl").onchange=e2=>{evLimit=+e2.target.value;render()};
    m.innerHTML+=card("Événements bruts décodés (derniers "+e.events.length+")",
-    `<div class="sub" style="margin-bottom:.4rem">${axisLbl(e.anchored)}</div>
+    `<div class="sub" style="margin-bottom:.4rem">${axisLbl(e.anchored,e.drift_s)}</div>
      <table><tr><th>Heure</th><th>Type</th><th>Contenu</th></tr>`
     +e.events.map(ev=>`<tr><td class="sub" style="white-space:nowrap">${dt(ev.t)}</td><td>${ev.name}</td><td>${evText(ev.name,ev.decoded)}${ev.decoded?`<details><summary>JSON brut</summary><pre>${JSON.stringify(ev.decoded,null,1)}</pre></details>`:""}</td></tr>`).join("")+"</table>");
   }
@@ -1249,6 +1321,9 @@ async function send(deep){const inp=$("#chatin"),t=inp.value.trim();if(!t)return
  log.insertAdjacentHTML("beforeend","<div class=a>…</div>");
  try{const r=await api("chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:t,deep})});
   log.lastChild.textContent=r.reply+"\\n\\n["+r.model+"]"}catch(e){log.lastChild.textContent="⚠ "+e.message}}
+// deep-link : #page=N&range=H préselectionne l'onglet et la plage (Activité)
+{const m=location.hash.match(/page=(\\d+)/);if(m)page=Math.min(+m[1],PAGES.length-1);
+ const r=location.hash.match(/range=(\\d+)/);if([1,3,6,24,168].includes(+r?.[1]))range=+r[1]}
 nav();render();
 </script></body></html>"""
 

@@ -101,6 +101,26 @@ def time_axis(con):
         if j and isinstance(j.get("unix_time"), (int, float)):
             anchors.append((rt, int(j["unix_time"])))
     if anchors:
+        # L'ancre time_sync porte l'horloge de l'HÔTE BLE (téléphone/PC), pas
+        # celle du serveur : si cette horloge dérive, les nuits sont datées sur
+        # la mauvaise journée. Calage sur la captured_unix du dernier événement
+        # (même correction que oura_web.time_axis, tolérance 15 min).
+        last = con.execute(
+            "SELECT ring_timestamp, captured_unix FROM events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        drift = 0.0
+        if last:
+            anc = None
+            for art, au in anchors:
+                if art <= last[0]:
+                    anc = (art, au)
+                else:
+                    break
+            if anc:
+                drift = (anc[1] + (last[0] - anc[0]) / 10.0) - last[1]
+        if abs(drift) <= 900:
+            drift = 0.0
+
         def t_of(rt):
             # `ring_timestamp` est en DECISECONDES (cf. docstring) : l'ancre
             # donne l'instant unix d'un tick, le temps ecoule depuis cette
@@ -115,7 +135,7 @@ def time_axis(con):
             if anchor is None:
                 return None
             art, au = anchor
-            return au + (rt - art) / 10.0
+            return au + (rt - art) / 10.0 - drift
         return t_of, "sync"
     pairs = [(r[0], r[1]) for r in con.execute("SELECT ring_timestamp, captured_unix FROM events")]
     epochs = build_epochs(pairs)
