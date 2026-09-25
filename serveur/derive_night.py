@@ -400,7 +400,8 @@ def ensure_schema(con):
             id INTEGER PRIMARY KEY CHECK (id=1), age_years INTEGER, height_cm INTEGER,
             weight_kg REAL, sex TEXT, updated_unix INTEGER);
     """)
-    for tab, col, typ in (("llm_briefings", "input_hash", "TEXT"), ("baselines", "median", "REAL"),
+    for tab, col, typ in (("llm_briefings", "input_hash", "TEXT"), ("llm_briefings", "checked", "INTEGER"),
+                          ("baselines", "median", "REAL"),
                           ("baselines", "n", "INTEGER")):
         if col not in {x[1] for x in con.execute(f"PRAGMA table_info({tab})")}:
             con.execute(f"ALTER TABLE {tab} ADD COLUMN {col} {typ}")
@@ -722,28 +723,83 @@ BRIEF_KEYS = {
 }
 
 
+def _brief_night(n):
+    o = {}
+    for k, name in BRIEF_KEYS.items():
+        v = n.get(k)
+        lo_hi = PLAUSIBLE.get(k)
+        if v is None or (lo_hi and not lo_hi[0] <= v <= lo_hi[1]):
+            continue
+        o[name] = v
+    return o
+
+
 def briefing_context(der, night, days=14):
+    """Contexte du résumé : la nuit à résumer À PART des nuits de comparaison,
+    contributeurs réduits à « nom → score » (un modèle de 4 milliards de
+    paramètres se perd sinon dans le JSON imbriqué)."""
     nights = [n for n in nights_table(der) if n["night"] <= night][-days:]
-    out = []
-    for n in nights:
-        o = {}
-        for k, name in BRIEF_KEYS.items():
-            v = n.get(k)
-            lo_hi = PLAUSIBLE.get(k)
-            if v is None or (lo_hi and not lo_hi[0] <= v <= lo_hi[1]):
-                continue
-            o[name] = v
-        out.append(o)
+    if not nights:
+        return json.dumps({})
     rd = der.execute("SELECT score, contributors, tension FROM readiness WHERE day=?", (night,)).fetchone()
+    rec = None
+    if rd:
+        contrib = json.loads(rd[1] or "{}")
+        tension = json.loads(rd[2] or "{}")
+        rec = {"score_recuperation": rd[0],
+               "contributeurs_sur_100": {k: v.get("score") for k, v in contrib.items()},
+               "signes_de_tension": {
+                   "niveau": tension.get("level"),
+                   "reference_provisoire": tension.get("provisional"),
+                   "ecarts": [{"mesure": x["label"], "valeur": x["value"], "ecart": x["delta"], "unite": x["unit"]}
+                              for x in tension.get("signals", [])]}}
     tags = [dict(zip(("jour", "type", "note"), t)) for t in der.execute(
         "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
         ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
-    ctx = {"nuits": out,
-           "recuperation_du_jour": {"score_recuperation": rd[0],
-                                    "contributeurs": json.loads(rd[1] or "{}"),
-                                    "signes_de_tension": json.loads(rd[2] or "{}")} if rd else None,
+    ctx = {"nuit_a_resumer": _brief_night(nights[-1]),
+           "recuperation_du_jour": rec,
+           "nuits_precedentes_pour_comparaison": [_brief_night(n) for n in nights[:-1]],
            "journal": tags}
     return json.dumps(ctx, ensure_ascii=False)
+
+
+# nombres légitimes issus de la consigne (seuils, numéros d'urgence…)
+PROMPT_NUMBERS = {1, 2, 3, 5, 6, 7, 8, 9, 14, 15, 20, 30, 85, 100, 112}
+
+
+def unverified_numbers(text, ctx_json):
+    """Nombres du texte absents du contexte (tolérance d'arrondi). Garde-fou
+    contre les chiffres inventés ou pris sur la mauvaise nuit."""
+    import re
+    allowed = set(PROMPT_NUMBERS)
+
+    def walk(v, key=""):
+        if isinstance(v, bool):
+            return
+        if isinstance(v, (int, float)):
+            for x in (v, abs(v)):
+                allowed.update({round(x), round(x, 1), round(x, 2)})
+                if key.endswith("_h"):               # durées en heures : « 7 h 13 », « 433 min »
+                    allowed.update({round(x * 60), round(x * 60) // 60, round(x * 60) % 60})
+        elif isinstance(v, str):
+            for m in re.findall(r"\d+", v):
+                allowed.add(int(m))
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, k)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, key)
+    walk(json.loads(ctx_json))
+    bad = []
+    for m in re.findall(r"(?<![\w.,])\d+(?:[.,]\d+)?", text):
+        x = float(m.replace(",", "."))
+        if x in allowed or round(x) in allowed and x == round(x) or round(x, 1) in allowed:
+            continue
+        if any(abs(x - a) <= 0.051 for a in allowed if isinstance(a, float)):
+            continue
+        bad.append(m)
+    return bad
 
 
 BRIEFING_SYSTEM = (
@@ -769,27 +825,39 @@ BRIEFING_SYSTEM = (
 )
 
 
-def llm_briefing(der, night, ctx, ctx_hash):
+def _llm(messages, temperature):
     import urllib.request
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [{"role": "system", "content": BRIEFING_SYSTEM + "\nContexte :\n" + ctx},
-                     {"role": "user", "content": f"Rédige le résumé de la nuit du {night}."}],
-        "temperature": 0.3, "max_tokens": 800,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
+    payload = {"model": LLM_MODEL, "messages": messages, "temperature": temperature,
+               "max_tokens": 800, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(LLM_URL, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=240) as resp:
-            text = (json.load(resp)["choices"][0]["message"].get("content") or "").strip()
-    except Exception as e:  # noqa: BLE001
-        print(f"nightly: briefing LLM indisponible : {e}", file=sys.stderr)
-        return None
-    if not text:
-        return None
-    der.execute("INSERT INTO llm_briefings (night, model, text, ts, input_hash) VALUES (?,?,?,?,?)",
-                (night, LLM_MODEL, text, int(time.time()), ctx_hash))
+    with urllib.request.urlopen(req, timeout=240) as resp:
+        return (json.load(resp)["choices"][0]["message"].get("content") or "").strip()
+
+
+def llm_briefing(der, night, ctx, ctx_hash, tries=3):
+    messages = [{"role": "system", "content": BRIEFING_SYSTEM + "\nContexte :\n" + ctx},
+                {"role": "user", "content": f"Rédige le résumé de la nuit du {night} (champ nuit_a_resumer)."}]
+    text, bad = None, []
+    for k in range(tries):
+        try:
+            text = _llm(messages, 0.3 if k == 0 else 0.1)
+        except Exception as e:  # noqa: BLE001
+            print(f"nightly: briefing LLM indisponible : {e}", file=sys.stderr)
+            return None
+        if not text:
+            return None
+        bad = unverified_numbers(text, ctx)
+        if not bad:
+            break
+        messages += [{"role": "assistant", "content": text},
+                     {"role": "user", "content": "Ces nombres n'existent pas dans le contexte ou ne concernent "
+                      f"pas la nuit à résumer : {', '.join(bad)}. Réécris le résumé en n'utilisant que les "
+                      "valeurs exactes du contexte (score_sommeil et score_recuperation sont distincts)."}]
+    der.execute("INSERT INTO llm_briefings (night, model, text, ts, input_hash, checked) VALUES (?,?,?,?,?,?)",
+                (night, LLM_MODEL, text, int(time.time()), ctx_hash, 0 if bad else 1))
+    if bad:
+        print(f"nightly: résumé conservé NON vérifié (chiffres introuvables : {', '.join(bad)})", file=sys.stderr)
     return text
 
 

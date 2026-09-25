@@ -471,7 +471,8 @@ async function pageToday(m) {
       <div id="mini-hyp"></div>
       ${n ? `<div class="small muted">${n.bedtime} → ${n.wake_time} · ${dur(n.total)} de sommeil · efficacité ${num(n.efficiency)} %</div>` : ""}</div>
     <div class="card"><h2>Résumé du matin ${b ? `<span class="badge">${esc(b.model)}</span>` : ""}
-      ${b && b.stale ? `<span class="badge warn">données modifiées depuis</span>` : ""}</h2>
+      ${b && b.stale ? `<span class="badge warn">données modifiées depuis</span>` : ""}
+      ${b && b.checked === 0 ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
       ${b ? `<div class="brief">${esc(b.text)}</div><div class="tiny muted" style="margin-top:.4rem">nuit du ${dayLabel(b.night)} · rédigé ${ago(b.ts)} par un modèle local${b.stale ? " — régénéré automatiquement au prochain passage" : ""}</div>`
       : `<div class="muted small">Aucun résumé pour l'instant (rédigé chaque matin par le LLM local).</div>`}</div></div>`;
   const r = o.ring, live = o.live || {};
@@ -533,7 +534,8 @@ async function pageSleep(m, date) {
   html += journalCard(shiftDay(date, -1), d.tags || []);
   if (d.briefing) {
     html += `<div class="card"><h2>Résumé du matin <span class="badge">${esc(d.briefing.model)}</span>
-      ${d.briefing.ts < (n.ts || 0) ? `<span class="badge warn">rédigé avant le dernier calcul — régénération au prochain passage</span>` : ""}</h2>
+      ${d.briefing.ts < (n.ts || 0) ? `<span class="badge warn">rédigé avant le dernier calcul — régénération au prochain passage</span>` : ""}
+      ${d.briefing.checked === 0 ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
       <div class="brief">${esc(d.briefing.text)}</div><div class="tiny muted">rédigé ${dtShort(d.briefing.ts)}</div></div>`;
   }
   html += `<div class="card"><details><summary>Méthode et limites</summary><div class="small">

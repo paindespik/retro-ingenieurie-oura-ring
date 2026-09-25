@@ -160,6 +160,15 @@ class RecoveryTest(Base):
             for k, c in json.loads(r["contributors"]).items():
                 self.assertTrue(0 <= c["score"] <= 100, (k, c))
 
+    def test_briefing_number_guard(self):
+        night = self.rows[-1]["night"]
+        ctx = dn.briefing_context(self.derived, night)
+        rec = json.loads(ctx)["recuperation_du_jour"]["score_recuperation"]
+        sleep = json.loads(ctx)["nuit_a_resumer"]["score_sommeil"]
+        good = f"Score de sommeil {sleep:.0f}, récupération {rec:.0f}. En cas d'urgence : 15 ou 112."
+        self.assertEqual(dn.unverified_numbers(good, ctx), [])
+        self.assertIn("987", dn.unverified_numbers("récupération 987", ctx))
+
     def test_lerp_score(self):
         pts = [(0, 10), (2, 35), (6, 100)]
         self.assertEqual(oc.lerp_score(-1, pts), 10)
