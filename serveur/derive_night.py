@@ -724,6 +724,10 @@ BRIEF_KEYS = {
 
 
 HOUR_FIELDS = ("total", "deep", "rem", "light", "recovery_index")
+READY_NAMES = {"rhr": "fc_de_repos", "hrv_balance": "equilibre_hrv", "temperature": "temperature",
+               "recovery_index": "indice_de_recuperation", "sleep": "sommeil_de_la_nuit",
+               "sleep_balance": "equilibre_du_sommeil_14j", "sleep_regularity": "regularite_du_sommeil",
+               "previous_day_activity": "activite_de_la_veille", "activity_balance": "equilibre_activite"}
 
 
 def _hmin(h):
@@ -762,7 +766,7 @@ def briefing_context(der, night, days=14):
         contrib = json.loads(rd[1] or "{}")
         tension = json.loads(rd[2] or "{}")
         rec = {"score_recuperation": rd[0],
-               "contributeurs_sur_100": {k: v.get("score") for k, v in contrib.items()},
+               "contributeurs_sur_100": {READY_NAMES.get(k, k): v.get("score") for k, v in contrib.items()},
                "signes_de_tension": {
                    "niveau": tension.get("level"),
                    "reference_provisoire": tension.get("provisional"),
@@ -827,6 +831,8 @@ BRIEFING_SYSTEM = (
     "- français, 5 à 8 lignes, ton factuel et bienveillant ;\n"
     "- le score de sommeil (score_sommeil) et le score de récupération (score_recuperation) sont "
     "deux scores DISTINCTS : ne les confonds jamais ;\n"
+    "- pour expliquer le score de récupération, cite ses contributeurs les plus bas "
+    "(contributeurs_sur_100), pas les stades de sommeil ;\n"
     "- n'utilise QUE les chiffres du contexte ; si une donnée manque, dis-le ;\n"
     "- n'affirme aucune cause : propose au plus des facteurs POSSIBLES, et seulement s'ils sont "
     "cohérents avec les données ou le journal ;\n"
