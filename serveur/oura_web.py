@@ -35,8 +35,8 @@ DERIVED_DB = Path(os.environ.get("OURA_DERIVED_DB", "/srv/oura/derived.db"))
 INBOX_DIR = Path(os.environ.get("OURA_INBOX", "/srv/oura/inbox"))
 STATIC_DIR = Path(__file__).with_name("static")
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
-LLM_MODEL = os.environ.get("OURA_LLM_MODEL_FAST", "qwen3.5-4b")          # P40, toujours chargé
-LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")          # 3090, modèle résident
+LLM_MODEL = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")      # petit modèle, toujours chargé
+LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")               # gros modèle résident
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
 # Nom d'événement de repli à l'ingestion (colonne `name` NOT NULL) quand la
