@@ -169,6 +169,30 @@ class RecoveryTest(Base):
         self.assertEqual(dn.unverified_numbers(good, ctx), [])
         self.assertIn("987", dn.unverified_numbers("récupération 987", ctx))
 
+    def test_model_choice_never_evicts(self):
+        cases = {("qwen3.8-27b", "qwen3.5-4b"): "qwen3.8-27b",      # résident → 27B
+                 ("qwen3.5-4b",): "qwen3.8-27b",                    # 3090 libre → 27B (défaut)
+                 ("gemma4-31b", "qwen3.5-4b"): "qwen3.5-4b",        # 3090 occupée → 4B
+                 None: "qwen3.5-4b"}                                # llama-swap illisible → 4B
+        orig = dn.running_models
+        try:
+            for run, want in cases.items():
+                dn.running_models = lambda r=run: list(r) if r else r
+                self.assertEqual(dn.choose_model(), want, run)
+        finally:
+            dn.running_models = orig
+
+    def test_briefing_hash_ignores_contributor_noise(self):
+        night = self.rows[-1]["night"]
+        ctx = json.loads(dn.briefing_context(self.derived, night))
+        h = dn.briefing_hash(json.dumps(ctx))
+        for k in (ctx["recuperation_du_jour"] or {}).get("contributeurs_sur_100", {}):
+            ctx["recuperation_du_jour"]["contributeurs_sur_100"][k] = 1
+        self.assertEqual(dn.briefing_hash(json.dumps(ctx)), h)
+        ctx["journal"] = [{"jour": night, "type": "maladie", "note": None}]
+        self.assertNotEqual(dn.briefing_hash(json.dumps(ctx)), h)
+        self.assertIn("comparaison_a_vos_references", ctx)
+
     def test_lerp_score(self):
         pts = [(0, 10), (2, 35), (6, 100)]
         self.assertEqual(oc.lerp_score(-1, pts), 10)

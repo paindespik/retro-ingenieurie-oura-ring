@@ -44,7 +44,15 @@ import staging
 
 VERSION = 2                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
-LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.5-4b")
+# Résumé du matin : le 27B résident de la RTX 3090 (préchargé par llama-swap,
+# jamais déchargé) quand il est disponible, sinon le 4B de la P40. On ne
+# demande JAMAIS le 27B si un autre modèle occupe la 3090 : llama-swap le
+# déchargerait (un seul modèle à la fois sur cette carte).
+LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")
+LLM_MODEL_FALLBACK = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")
+# « medium » : ~80 s par résumé, nettement plus précis que « low » (~40 s) sur
+# les nuits réelles (valeurs et sous-scores cités, causalité prudente).
+LLM_REASONING = os.environ.get("OURA_LLM_REASONING", "medium")   # low | medium | xhigh
 SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo) + "
                 "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
 SLEEP_NEED_H = 8.0               # milieu de la plage NSF 7–9 h (adultes)
@@ -753,6 +761,26 @@ def _brief_night(n):
     return o
 
 
+REF_METRICS = (("fc_la_plus_basse_bpm", "hr_min", 1), ("fc_moyenne_sommeil_bpm", "hr_mean", 1),
+               ("hrv_moyen_ms", "hrv_rmssd", 0), ("respiration_par_min_experimental", "resp_rate", 1),
+               ("sommeil_total_h", "total", 2), ("efficacite_pct", "efficiency", 1))
+
+
+def reference_comparison(nights):
+    """Valeur de la nuit vs moyenne des nuits précédentes (≤ 60), calculée ici :
+    un petit modèle se trompe dans les soustractions et les sens de variation."""
+    last, prev = nights[-1], nights[:-1][-60:]
+    out = {}
+    for name, key, nd in REF_METRICS:
+        v = last.get(key)
+        b = base_stats([p.get(key) for p in prev])
+        if v is None or not b or b["n"] < 3:
+            continue
+        out[name] = {"nuit": round(v, nd), "reference": round(b["mean"], nd),
+                     "ecart": round(v - b["mean"], nd), "nuits_de_reference": b["n"]}
+    return out
+
+
 def briefing_context(der, night, days=14):
     """Contexte du résumé : la nuit à résumer À PART des nuits de comparaison,
     contributeurs réduits à « nom → score » (un modèle de 4 milliards de
@@ -776,6 +804,7 @@ def briefing_context(der, night, days=14):
         "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
         ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
     ctx = {"nuit_a_resumer": _brief_night(nights[-1]),
+           "comparaison_a_vos_references": reference_comparison(nights),
            "recuperation_du_jour": rec,
            "nuits_precedentes_pour_comparaison": [_brief_night(n) for n in nights[:-1]],
            "journal": tags}
@@ -822,47 +851,78 @@ def unverified_numbers(text, ctx_json):
 
 
 BRIEFING_SYSTEM = (
-    "Tu rédiges le résumé matinal des données de sommeil d'un utilisateur d'anneau Oura "
-    "(données locales, sans cloud). Tu reçois en JSON : ses dernières nuits (durées, stades estimés, "
-    "efficacité, latence, WASO, FC la plus basse, FC moyenne, HRV moyen, Recovery Index, fréquence "
-    "respiratoire expérimentale, température et écart à sa ligne de base), les contributeurs de "
-    "récupération, les signes de tension et son journal (tags).\n"
+    "Vous rédigez le résumé matinal des données de sommeil d'une personne qui porte un anneau Oura "
+    "(données calculées localement, sans cloud). Vous recevez en JSON : la nuit à résumer, sa "
+    "comparaison aux références personnelles (déjà calculée), la récupération du jour (score, "
+    "contributeurs sur 100, signes de tension), les nuits précédentes et le journal (tags saisis "
+    "par la personne).\n"
+    "Forme : français, VOUVOIEMENT, 5 à 8 phrases en trois temps — (1) la nuit : durée, efficacité, "
+    "continuité, et ce qui s'écarte des références ; (2) la récupération : son score et les 2 ou 3 "
+    "contributeurs les plus bas, les signes de tension ; (3) une suggestion concrète pour la journée "
+    "ou la nuit suivante. Pas de titres ni de listes, 6 à 8 chiffres au maximum.\n"
     "Règles :\n"
-    "- français, 5 à 8 lignes, ton factuel et bienveillant ;\n"
-    "- le score de sommeil (score_sommeil) et le score de récupération (score_recuperation) sont "
-    "deux scores DISTINCTS : ne les confonds jamais ;\n"
-    "- pour expliquer le score de récupération, cite ses contributeurs les plus bas "
-    "(contributeurs_sur_100), pas les stades de sommeil ;\n"
-    "- n'utilise QUE les chiffres du contexte ; si une donnée manque, dis-le ;\n"
-    "- n'affirme aucune cause : propose au plus des facteurs POSSIBLES, et seulement s'ils sont "
-    "cohérents avec les données ou le journal ;\n"
-    "- aucun diagnostic médical ; les stades et scores sont des estimations non validées ;\n"
-    "- si fiabilite_reference_temperature vaut 'calibrage' ou 'provisoire', précise que la référence "
-    "de température repose sur peu de nuits ;\n"
-    "- si les signes de tension sont 'marqués', conseille du repos, de noter les symptômes, de mesurer "
-    "sa température avec un thermomètre en cas de malaise, et de consulter un médecin si cela persiste "
-    "ou en cas de symptômes inquiétants (douleur thoracique, essoufflement : 15 ou 112) ;\n"
-    "- termine par une suggestion concrète et raisonnable."
+    "- n'utilisez QUE les chiffres du contexte, recopiés tels quels ; si une donnée manque, dites-le ;\n"
+    "- score_sommeil et score_recuperation sont deux scores DISTINCTS ;\n"
+    "- les stades (profond, REM, léger) sont des estimations peu fiables : ne les commentez que "
+    "s'ils sont très atypiques, en le précisant ; ne les utilisez jamais pour expliquer la récupération ;\n"
+    "- n'affirmez aucune cause : au plus des facteurs POSSIBLES cohérents avec les données ou le "
+    "journal (si le journal mentionne une maladie, faites le lien avec prudence) ;\n"
+    "- aucun diagnostic médical ;\n"
+    "- si une référence repose sur moins de 14 nuits (nuits_de_reference, ou "
+    "fiabilite_reference_temperature 'calibrage'/'provisoire'), dites que la comparaison est "
+    "encore peu fiable ;\n"
+    "- si les signes de tension sont 'marqués', conseillez du repos, de noter les symptômes et de "
+    "mesurer sa température avec un thermomètre en cas de malaise ; consulter un médecin si cela "
+    "persiste ou en cas de symptômes inquiétants (douleur thoracique, essoufflement : 15 ou 112) ;\n"
+    "- ton factuel et bienveillant, sans dramatiser ni rassurer à l'excès."
 )
 
 
-def _llm(messages, temperature):
+def _swap_base():
+    return LLM_URL.split("/v1/")[0]
+
+
+def running_models():
+    """Modèles chargés par llama-swap (None si l'état est illisible)."""
     import urllib.request
-    payload = {"model": LLM_MODEL, "messages": messages, "temperature": temperature,
-               "max_tokens": 800, "chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        with urllib.request.urlopen(_swap_base() + "/running", timeout=10) as r:
+            return [m.get("model") for m in json.load(r).get("running", []) if m.get("state") == "ready"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def choose_model():
+    """Le 27B s'il est déjà chargé ou si la 3090 est libre (seul le 4B tourne) ;
+    sinon le 4B, pour ne jamais décharger un modèle utilisé ailleurs."""
+    run = running_models()
+    if run is None:
+        return LLM_MODEL_FALLBACK
+    others = [m for m in run if m not in (LLM_MODEL, LLM_MODEL_FALLBACK)]
+    return LLM_MODEL if (LLM_MODEL in run or not others) else LLM_MODEL_FALLBACK
+
+
+def _llm(model, messages, temperature):
+    import urllib.request
+    big = model != LLM_MODEL_FALLBACK
+    payload = {"model": model, "messages": messages, "temperature": temperature,
+               "max_tokens": 6000 if big else 800,
+               "chat_template_kwargs": {"reasoning_effort": LLM_REASONING} if big
+               else {"enable_thinking": False}}
     req = urllib.request.Request(LLM_URL, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=240) as resp:
+    with urllib.request.urlopen(req, timeout=900 if big else 240) as resp:
         return (json.load(resp)["choices"][0]["message"].get("content") or "").strip()
 
 
-def llm_briefing(der, night, ctx, ctx_hash, tries=3):
+def llm_briefing(der, night, ctx, ctx_hash, tries=3, model=None):
+    model = model or choose_model()
     messages = [{"role": "system", "content": BRIEFING_SYSTEM + "\nContexte :\n" + ctx},
                 {"role": "user", "content": f"Rédige le résumé de la nuit du {night} (champ nuit_a_resumer)."}]
     text, bad = None, []
     for k in range(tries):
         try:
-            text = _llm(messages, 0.3 if k == 0 else 0.1)
+            text = _llm(model, messages, 0.3 if k == 0 else 0.1)
         except Exception as e:  # noqa: BLE001
             print(f"nightly: briefing LLM indisponible : {e}", file=sys.stderr)
             return None
@@ -876,28 +936,47 @@ def llm_briefing(der, night, ctx, ctx_hash, tries=3):
                       f"pas la nuit à résumer : {', '.join(bad)}. Réécris le résumé en n'utilisant que les "
                       "valeurs exactes du contexte (score_sommeil et score_recuperation sont distincts)."}]
     der.execute("INSERT INTO llm_briefings (night, model, text, ts, input_hash, checked) VALUES (?,?,?,?,?,?)",
-                (night, LLM_MODEL, text, int(time.time()), ctx_hash, 0 if bad else 1))
+                (night, model, text, int(time.time()), ctx_hash, 0 if bad else 1))
     if bad:
         print(f"nightly: résumé conservé NON vérifié (chiffres introuvables : {', '.join(bad)})", file=sys.stderr)
     return text
 
 
-def maybe_briefing(der, latest, now, min_age_s=2700):
-    """Régénère le résumé quand ses entrées ont changé, une fois la nuit
-    stabilisée (fin de la fenêtre il y a ≥ 45 min : l'anneau révise son
-    analyse pendant ~1 h après le réveil)."""
-    if now - (latest.get("stop_unix") or now) < min_age_s:
+def briefing_hash(ctx):
+    """Empreinte des éléments qui justifient une réécriture : la nuit, les
+    comparaisons, le score et les signes de tension, le journal. Les petites
+    variations des contributeurs (activité de la veille recalculée) n'en font
+    pas partie : chaque réécriture coûte un appel au 27B."""
+    c = json.loads(ctx)
+    rec = c.get("recuperation_du_jour") or {}
+    key = {"n": c.get("nuit_a_resumer"), "cmp": c.get("comparaison_a_vos_references"),
+           "s": rec.get("score_recuperation"), "t": (rec.get("signes_de_tension") or {}).get("niveau"),
+           "j": c.get("journal")}
+    return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def maybe_briefing(der, latest, now, min_age_s=2700, upgrade_window_s=18 * 3600, log=print):
+    """(Ré)écrit le résumé de la dernière nuit, une fois la nuit stabilisée
+    (fin de fenêtre il y a ≥ 45 min : l'anneau révise son analyse pendant ~1 h) :
+    - entrées modifiées → réécriture ;
+    - résumé écrit par le 4B faute de 3090 libre → réécrit par le 27B dès qu'il
+      redevient disponible (pendant 18 h après le réveil)."""
+    stop = latest.get("stop_unix") or now
+    if now - stop < min_age_s:
         return
     ctx = briefing_context(der, latest["night"])
-    h = hashlib.sha1(ctx.encode()).hexdigest()[:16]
-    last = der.execute("SELECT input_hash FROM llm_briefings WHERE night=? ORDER BY ts DESC LIMIT 1",
+    h = briefing_hash(ctx)
+    last = der.execute("SELECT input_hash, model FROM llm_briefings WHERE night=? ORDER BY ts DESC LIMIT 1",
                        (latest["night"],)).fetchone()
+    model = choose_model()
     if last and last[0] == h:
-        return
-    txt = llm_briefing(der, latest["night"], ctx, h)
+        upgrade = (last[1] != LLM_MODEL and model == LLM_MODEL and now - stop < upgrade_window_s)
+        if not upgrade:
+            return
+    txt = llm_briefing(der, latest["night"], ctx, h, model=model)
     if txt:
-        print(f"nightly: briefing LLM {'régénéré' if last else 'généré'} pour {latest['night']}"
-              f" ({len(txt)} car.)")
+        verb = "généré" if not last else ("réécrit par " + model if last[0] == h else "régénéré")
+        log(f"nightly: briefing LLM {verb} pour {latest['night']} ({model}, {len(txt)} car.)")
 
 
 # ---------------------------------------------------------------- main
@@ -940,7 +1019,7 @@ def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
     der.commit()
 
     if briefing and nights:
-        maybe_briefing(der, nights[-1], now)
+        maybe_briefing(der, nights[-1], now, log=log)
         der.commit()
     if not nights_raw:
         log("nightly: aucune fenêtre de sommeil (bedtime_period) en base — rien à dériver")

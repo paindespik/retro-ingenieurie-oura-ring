@@ -128,6 +128,14 @@ modèle propriétaire. Les valeurs sont des **estimations** :
 Aucune saturation en oxygène (%) n'est calculée : le rapport R brut de
 l'oxymètre exige un étalonnage propre au capteur.
 
+Le **résumé du matin** est rédigé par un modèle local servi par llama-swap
+(`OURA_LLM_MODEL`, repli `OURA_LLM_MODEL_FALLBACK`) : le gros modèle s'il est
+déjà chargé ou si son GPU est libre, sinon le petit — le job ne décharge jamais
+un modèle utilisé ailleurs, et réécrit le résumé avec le gros modèle dès qu'il
+redevient disponible. Les comparaisons aux références personnelles sont
+calculées en Python ; chaque nombre du texte généré est vérifié contre le
+contexte (nouvelle tentative sinon, puis mention « chiffres non vérifiés »).
+
 Tests (base synthétique, sans donnée réelle) :
 
 ```sh

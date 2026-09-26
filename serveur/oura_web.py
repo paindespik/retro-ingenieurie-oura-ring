@@ -35,8 +35,8 @@ DERIVED_DB = Path(os.environ.get("OURA_DERIVED_DB", "/srv/oura/derived.db"))
 INBOX_DIR = Path(os.environ.get("OURA_INBOX", "/srv/oura/inbox"))
 STATIC_DIR = Path(__file__).with_name("static")
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
-LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.5-4b")
-LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL_DEEP", "qwen3.8-27b-gsq")
+LLM_MODEL = os.environ.get("OURA_LLM_MODEL_FAST", "qwen3.5-4b")          # P40, toujours chargé
+LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")          # 3090, modèle résident
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
 # Nom d'événement de repli à l'ingestion (colonne `name` NOT NULL) quand la
@@ -672,10 +672,11 @@ CHAT_SYSTEM = (
     "ESTIMÉS, FC la plus basse, FC moyenne, HRV moyen, Recovery Index, respiration expérimentale, "
     "température et écart à sa ligne de base), sa récupération (contributeurs, signes de tension), "
     "son activité récente, son journal (tags) et les signaux des dernières 24 h.\n"
-    "Règles : réponds en français, concis et factuel ; n'utilise QUE les chiffres du contexte "
-    "(si une donnée manque, dis-le) ; n'affirme aucune cause sans appui dans les données ou le "
-    "journal ; aucun diagnostic médical — ces mesures sont des estimations non validées "
-    "cliniquement ; en cas de symptômes inquiétants, oriente vers un médecin (urgence : 15 ou 112)."
+    "Règles : réponds en français en vouvoyant, concis et factuel ; n'utilise QUE les chiffres du "
+    "contexte (si une donnée manque, dis-le) ; n'affirme aucune cause sans appui dans les données ou "
+    "le journal ; les stades de sommeil sont des estimations peu fiables ; aucun diagnostic médical "
+    "— ces mesures sont des estimations non validées cliniquement ; en cas de symptômes inquiétants, "
+    "oriente vers un médecin (urgence : 15 ou 112)."
 )
 
 
@@ -705,25 +706,41 @@ def chat_context():
     return json.dumps(ctx, ensure_ascii=False, default=str)
 
 
+async def swap_running():
+    try:
+        async with httpx.AsyncClient(timeout=5) as cli:
+            r = await cli.get(LLM_URL.split("/v1/")[0] + "/running")
+            return [m.get("model") for m in r.json().get("running", []) if m.get("state") == "ready"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @app.post("/api/chat")
 async def chat(body: dict):
     msg = (body.get("message") or "").strip()
     deep = bool(body.get("deep"))
     if not msg:
         raise HTTPException(400, "message vide")
+    if deep:
+        # la 3090 ne porte qu'un modèle à la fois : ne jamais décharger un
+        # modèle utilisé ailleurs pour une question du portail
+        run = await swap_running()
+        busy = [m for m in (run or []) if m not in (LLM_MODEL_DEEP, LLM_MODEL)]
+        if busy:
+            raise HTTPException(409, f"la RTX 3090 est occupée par {busy[0]} : réessayez plus tard "
+                                     "ou utilisez « Envoyer » (modèle rapide)")
     payload = {
         "model": LLM_MODEL_DEEP if deep else LLM_MODEL,
         "messages": [{"role": "system", "content": CHAT_SYSTEM + "\nContexte :\n" + chat_context()},
                      {"role": "user", "content": msg}],
         "temperature": 0.4,
-        # qwen « thinking » : coupé pour le modèle rapide (sinon il consomme tout
-        # le budget), conservé pour l'analyse approfondie avec un budget allongé
-        "max_tokens": 2500 if deep else 800,
+        # réflexion coupée pour le modèle rapide (sinon elle consomme tout le
+        # budget) ; effort « medium » pour l'analyse approfondie (~1 min)
+        "max_tokens": 6000 if deep else 800,
+        "chat_template_kwargs": {"reasoning_effort": "medium"} if deep else {"enable_thinking": False},
     }
-    if not deep:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
     try:
-        async with httpx.AsyncClient(timeout=180) as cli:
+        async with httpx.AsyncClient(timeout=280) as cli:
             r = await cli.post(LLM_URL, json=payload)
             r.raise_for_status()
             content = (r.json()["choices"][0]["message"].get("content") or "").strip()
