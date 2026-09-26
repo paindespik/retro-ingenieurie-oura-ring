@@ -170,7 +170,7 @@ class OuraGatt(
 
     private fun onNotify(v: ByteArray) {
         if (finished) return
-        Log.i(TAG, "← notif ${v.size} o : ${v.take(12).joinToString("") { "%02x".format(it) }}")
+        if (Config.TRACE_PACKETS) Log.d(TAG, "← notif ${v.size} o : ${v.take(12).joinToString("") { "%02x".format(it) }}")
         Core.feed(v)
         idleSince = SystemClock.elapsedRealtime()
         pump()
@@ -239,7 +239,7 @@ class OuraGatt(
                     @Suppress("DEPRECATION")
                     if (gatt!!.writeCharacteristic(w)) 0 else -1
                 }
-                Log.i(TAG, "→ write ${pkt.size} o rc=$rc : ${pkt.take(12).joinToString("") { "%02x".format(it) }}")
+                if (Config.TRACE_PACKETS) Log.d(TAG, "→ write ${pkt.size} o rc=$rc : ${pkt.take(12).joinToString("") { "%02x".format(it) }}")
                 if (rc != 0) {
                     inFlight = false
                     finish("error", "writeCharacteristic rc=$rc")

@@ -22,8 +22,8 @@ android {
         applicationId = "io.github.paindespik.ourascan"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
 
         buildConfigField("String", "OURA_SERVER", "\"${secret("OURA_SERVER", "https://oura.example.com")}\"")
         buildConfigField("String", "WEB_USER", "\"${secret("WEB_USER")}\"")

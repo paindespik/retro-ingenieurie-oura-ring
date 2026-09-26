@@ -17,9 +17,6 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -29,7 +26,8 @@ import java.util.concurrent.TimeUnit
  * UI minimale : état de la dernière sync + boutons.
  *
  * - « Sync maintenant » : enfile un work one-shot.
- * - « Periodic 15 min » : enregistre le PeriodicWorkRequest unique.
+ * - « Periodic 15 min » : (ré)enregistre le PeriodicWorkRequest unique — il est
+ *   aussi armé automatiquement à l'ouverture de l'app.
  * - La clé 16 o (hex) doit être posée dans filesDir/ring.key.hex
  *   (adb install puis : run-as io.github.paindespik.ourascan sh -c 'cat > files/ring.key.hex').
  */
@@ -38,7 +36,6 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var detailView: TextView
     private val fmt = SimpleDateFormat("dd/MM HH:mm:ss", Locale.FRANCE)
-    private val scope = CoroutineScope(Dispatchers.Main)
     private val logBuf = StringBuilder()
 
     private fun appendLog(msg: String) {
@@ -66,18 +63,6 @@ class MainActivity : Activity() {
                     )
                 refreshStatus()
             }
-            setOnLongClickListener {
-                // test du pipeline push (HTTPS + Basic + token) sans sync :
-                // pousse un event factice (tag 97, nettoyable côté serveur)
-                val now = System.currentTimeMillis() / 1000
-                val ev = "[{\"tag\":97,\"name\":\"debug_data\",\"ring_timestamp\":999999,\"body_hex\":\"7b7d\",\"decoded_json\":{\"push_test\":true},\"captured_unix\":" + now + "}]"
-                scope.launch {
-                    val r = Pusher.push(applicationContext, ev, 999)
-                    appendLog("push test : $r")
-                    refreshStatus()
-                }
-                true
-            }
         }
         val btnStop = Button(this).apply {
             text = "Stop (annuler tous les cycles)"
@@ -100,20 +85,8 @@ class MainActivity : Activity() {
         val btnPeriodic = Button(this).apply {
             text = "Enregistrer le periodic 15 min"
             setOnClickListener {
-                val req = PeriodicWorkRequestBuilder<OuraWorker>(Config.WORK_PERIOD_MIN, TimeUnit.MINUTES)
-                    // backoff borné : sans ça, des échecs répétés poussent le
-                    // prochain essai jusqu'à 5 h (exponentiel par défaut)
-                    .setBackoffCriteria(BackoffPolicy.LINEAR, 2, TimeUnit.MINUTES)
-                    .build()
-                WorkManager.getInstance(this@MainActivity)
-                    .enqueueUniquePeriodicWork(Config.WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, req)
-                Heartbeat.schedule(this@MainActivity)
+                armPeriodic(ExistingPeriodicWorkPolicy.UPDATE)
                 appendLog("cycle 15 min + battement anti-Doze armés")
-            }
-            setOnLongClickListener { // test : battement dans 60 s (vérif Doze)
-                Heartbeat.schedule(this@MainActivity, 60_000)
-                appendLog("battement de test dans 60 s")
-                true
             }
         }
         val root = LinearLayout(this).apply {
@@ -129,10 +102,22 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
 
         ensurePermissions()
-        // le battement se réarme tout seul à chaque déclenchement ; on le
-        // (re)pose à l'ouverture de l'app par sécurité
-        Heartbeat.schedule(this)
+        // Cycle périodique armé dès l'ouverture (KEEP : ne replanifie pas un
+        // cycle existant) — une réinstallation n'exige plus de toucher le bouton.
+        // Le battement se réarme tout seul à chaque déclenchement ; on le
+        // (re)pose aussi par sécurité.
+        armPeriodic(ExistingPeriodicWorkPolicy.KEEP)
         refreshStatus()
+    }
+
+    private fun armPeriodic(policy: ExistingPeriodicWorkPolicy) {
+        val req = PeriodicWorkRequestBuilder<OuraWorker>(Config.WORK_PERIOD_MIN, TimeUnit.MINUTES)
+            // backoff borné : sans ça, des échecs répétés poussent le
+            // prochain essai jusqu'à 5 h (exponentiel par défaut)
+            .setBackoffCriteria(BackoffPolicy.LINEAR, 2, TimeUnit.MINUTES)
+            .build()
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork(Config.WORK_NAME, policy, req)
+        Heartbeat.schedule(this)
     }
 
     override fun onResume() {

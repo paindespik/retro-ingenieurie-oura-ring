@@ -31,5 +31,9 @@ object Config {
 
     /** Fichier (hex de la clé 16 o) posé via adb run-as dans le dossier privé. */
     const val KEY_FILE = "ring.key.hex"
+
+    /** Journal de chaque paquet BLE (← notif / → write) : diagnostic uniquement,
+     *  des milliers de lignes par cycle sinon. */
+    const val TRACE_PACKETS = false
     const val DB_FILE = "oura.db"
 }
