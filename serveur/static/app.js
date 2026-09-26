@@ -748,6 +748,35 @@ async function pageJournal(m) {
   });
 }
 
+// Markdown minimal et sûr pour les réponses du modèle : le texte est échappé
+// AVANT toute mise en forme (titres, listes, tableaux, gras, code en ligne).
+function mdInline(t) {
+  return t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+function md(src) {
+  const lines = esc(src).split("\n"), out = [];
+  let list = null, table = null;
+  const flush = () => {
+    if (list) { out.push(`<ul>${list.map((x) => `<li>${mdInline(x)}</li>`).join("")}</ul>`); list = null; }
+    if (table) {
+      const rows = table.filter((r) => !/^\|?\s*:?-{2,}/.test(r)).map((r) => r.replace(/^\||\|$/g, "").split("|").map((c) => mdInline(c.trim())));
+      out.push(`<div class="scroll"><table class="tbl">${rows.map((r, i) => `<tr>${r.map((c) => i ? `<td>${c}</td>` : `<th>${c}</th>`).join("")}</tr>`).join("")}</table></div>`);
+      table = null;
+    }
+  };
+  for (const l of lines) {
+    const t = l.trim();
+    if (t.startsWith("|")) { if (list) flush(); (table ??= []).push(t); continue; }
+    if (/^[-*] /.test(t)) { if (table) flush(); (list ??= []).push(t.slice(2)); continue; }
+    flush();
+    const h = t.match(/^(#{1,4}) (.*)$/);
+    if (h) out.push(`<div class="md-h">${mdInline(h[2])}</div>`);
+    else if (t) out.push(`<p>${mdInline(t)}</p>`);
+  }
+  flush();
+  return out.join("");
+}
+
 const chatLog = [];
 async function pageAssistant(m) {
   const b = await api("briefing").catch(() => null);
@@ -760,7 +789,8 @@ async function pageAssistant(m) {
     ${b ? `<div class="card"><h2>Dernier résumé du matin <span class="badge">${esc(b.model)}</span></h2><div class="brief">${esc(b.text)}</div>
       <div class="tiny muted">nuit du ${dayLabel(b.night)} · ${dtShort(b.ts)}</div></div>` : ""}`;
   const log = $("#log", m);
-  const draw = () => { log.innerHTML = chatLog.map((x) => `<div class="msg ${x.u ? "u" : "a"}">${esc(x.text)}</div>`).join(""); };
+  const draw = () => { log.innerHTML = chatLog.map((x) => x.u ? `<div class="msg u">${esc(x.text)}</div>`
+    : `<div class="msg a md">${md(x.text)}${x.model ? `<div class="tiny muted">${esc(x.model)}</div>` : ""}</div>`).join(""); };
   draw();
   const send = async (deep) => {
     const inp = $("#chat-in"), text = inp.value.trim();
@@ -770,7 +800,7 @@ async function pageAssistant(m) {
     draw();
     try {
       const r = await post("chat", { message: text, deep });
-      chatLog[chatLog.length - 1].text = `${r.reply}\n\n[${r.model}]`;
+      Object.assign(chatLog[chatLog.length - 1], { text: r.reply, model: r.model });
     } catch (e) { chatLog[chatLog.length - 1].text = "⚠ " + e.message; }
     draw();
   };

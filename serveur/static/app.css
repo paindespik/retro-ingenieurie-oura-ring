@@ -178,6 +178,12 @@ pre { font-size: .72rem; background: var(--panel2); padding: .5rem; border-radiu
 .msg.u { align-self: flex-end; background: var(--accent); color: #fff; }
 .msg.a { align-self: flex-start; background: var(--panel2); }
 .brief { white-space: pre-wrap; }
+.msg.md { white-space: normal; }
+.msg.md p { margin: .35rem 0; }
+.msg.md ul { margin: .3rem 0; padding-left: 1.2rem; }
+.msg.md .md-h { font-weight: 700; margin: .6rem 0 .25rem; }
+.msg.md .tbl { margin: .3rem 0; background: var(--panel); border-radius: 6px; }
+.msg.md code { font-size: .85em; background: var(--panel); padding: 0 .25rem; border-radius: 4px; }
 
 .foot { max-width: 1080px; margin: 0 auto; padding: 0 1rem 2rem; font-size: .74rem; color: var(--muted); }
 .skel { color: var(--muted); }
