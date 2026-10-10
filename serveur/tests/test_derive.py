@@ -426,12 +426,14 @@ class LotBDayTest(Base):
     def test_steps_are_event_header_counts(self):
         ax = oc.TimeAxis(self.con)
         day = "2026-09-03"
-        t0 = datetime_ts(day)
+        t0, t1 = oc.activity_day_bounds(day)                     # 04:00 → 04:00
+        self.assertEqual(t1 - t0, 86400)
+        self.assertEqual(t0 - datetime_ts(day), 4 * 3600)
         n = 0
         for rt, cap, dj in self.con.execute("SELECT ring_timestamp, captured_unix, decoded_json FROM events WHERE tag=80"):
             end = ax(rt, cap)
             k = len(json.loads(dj)["met"])
-            if t0 <= end - k * 60 and end <= t0 + 86400:
+            if t0 <= end - k * 60 and end <= t1:
                 n += json.loads(dj)["state"]
         self.assertGreater(n, 0)
         self.assertAlmostEqual(self.act[day]["steps"], n, delta=1)
@@ -454,6 +456,61 @@ class LotBDayTest(Base):
         self.assertEqual(self.readiness[4]["sleep_debt_h"], dn.sleep_debt(4, rows)[0])
         self.assertGreater(self.readiness[4]["sleep_debt_h"], 0)            # sommeil < 7 h 30 au lit
         self.assertEqual(self.readiness[4]["sleep_need_h"], dn.SLEEP_NEED_H)
+
+
+
+class ActivityGridTest(unittest.TestCase):
+    """Grille minute par minute : port aux doigts froids, retraits, périodes assises."""
+
+    def test_activity_day(self):
+        from datetime import datetime
+        self.assertEqual(oc.activity_day(datetime(2026, 9, 3, 3, 59).timestamp()), "2026-09-02")
+        self.assertEqual(oc.activity_day(datetime(2026, 9, 3, 4, 0).timestamp()), "2026-09-03")
+
+    def test_sedentary_bouts_tolerate_brief_movement(self):
+        def grid(mets):
+            return {i * 60: {"state": "éveil", "met": v, "motion": 0, "steps": 0} for i, v in enumerate(mets)}
+        self.assertEqual(dn.sedentary_bouts(grid([1.2] * 59)), 0)
+        self.assertEqual(dn.sedentary_bouts(grid([1.2] * 60)), 1)
+        self.assertEqual(dn.sedentary_bouts(grid([1.2] * 40 + [1.8] * 2 + [1.2] * 30)), 1)   # s'agiter
+        self.assertEqual(dn.sedentary_bouts(grid([1.2] * 40 + [2.5] * 3 + [1.2] * 30)), 0)   # se lever
+        g = grid([1.2] * 130)
+        for i in range(60, 63):
+            g[i * 60]["state"] = "charge"
+        self.assertEqual(dn.sedentary_bouts(g), 2)
+
+
+class ColdFingersTest(Base):
+    """Peau < 30 °C mais mouvement et activité : la minute est portée."""
+    nights = 4
+    sick_last = False
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.raw = os.path.join(cls.tmp.name, "oura.db")
+        cls.der = os.path.join(cls.tmp.name, "derived.db")
+        cls.ring = synth.build(cls.raw, nights=cls.nights)
+        con = sqlite3.connect(cls.raw)
+        con.execute("UPDATE events SET decoded_json=? WHERE tag=70", (json.dumps({"temps_c": [26.0, 26.0, 28.0]}),))
+        con.commit()
+        con.close()
+        cls.con = sqlite3.connect(f"file:{cls.raw}?mode=ro", uri=True)
+        cls.derived = sqlite3.connect(":memory:")
+
+    def test_active_minutes_count_as_worn(self):
+        ax = oc.TimeAxis(self.con)
+        t0, t1 = oc.activity_day_bounds("2026-09-03")
+        g = oc.activity_grid(self.con, ax, t0, t1)
+        active = [x for x in g.values() if x["met"] is not None and x["met"] >= oc.MET_LIGHT]
+        self.assertTrue(active)
+        self.assertTrue(all(x["state"] == "éveil" for x in active))
+        calm = [x for x in g.values() if x["met"] is not None and x["met"] < oc.MET_LIGHT]
+        self.assertTrue(all(x["state"] == "non porté" for x in calm))   # ni chaleur, ni mouvement
+        # retrait signalé : prioritaire sur l'activité
+        m0 = min(m for m, x in g.items() if x in active)
+        g2 = oc.activity_grid(self.con, ax, t0, t1, removals=[(m0, m0 + 60)])
+        self.assertEqual(g2[m0]["state"], "retiré")
 
 
 def datetime_ts(day):

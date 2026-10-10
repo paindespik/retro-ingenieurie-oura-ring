@@ -13,7 +13,7 @@ Lit oura.db (brut open_oura, lecture seule) et écrit derived.db :
   baselines       lignes de base personnelles (nuits SAINES antérieures à la
                   dernière ; chaque nuit garde aussi les siennes : ref_json)
   readiness       contributeurs de récupération + signes de tension, par jour
-  activity_daily  activité par jour civil (MET, inactivité, pas estimés NON validés,
+  activity_daily  activité par journée de 04:00 à 03:59 (MET, inactivité, pas estimés NON validés,
                   dépense totale estimée, FC de jour, couverture des données)
   rests           repos détectés par l'anneau hors des nuits (sieste probable / repos)
   llm_briefings   résumé LLM de la dernière nuit (régénéré si ses entrées changent)
@@ -762,7 +762,9 @@ def update_readiness(der, nights, activity, now):
 
 # Colonnes ajoutées à activity_daily (lot B) : pas (estimation non validée),
 # dépense, FC de jour, qualité des données du jour.
-ACTIVITY_EXTRA_COLS = (("steps", "INTEGER"), ("bmr_kcal", "REAL"), ("total_kcal", "REAL"),
+ACTIVITY_EXTRA_COLS = (("awake_min", "INTEGER"), ("in_bed_min", "INTEGER"), ("nonworn_min", "INTEGER"),
+                       ("rest_awake_min", "INTEGER"),
+                       ("steps", "INTEGER"), ("bmr_kcal", "REAL"), ("total_kcal", "REAL"),
                        ("hr_day_n", "INTEGER"), ("hr_day_rest", "REAL"), ("hr_day_mean", "REAL"),
                        ("hr_day_max", "REAL"), ("met_cover_pct", "REAL"), ("charge_min", "INTEGER"),
                        ("rest_min", "INTEGER"))
@@ -787,26 +789,6 @@ def profile_bmr(der):
     return oc.bmr_kcal(*row) if row else None
 
 
-def worn_minutes(con, axis, t0, t1, charging):
-    """Minutes où l'anneau est au doigt : température de peau > 30 °C à ±5 min
-    (au repos sur une table, l'anneau est à la température de la pièce)."""
-    s_ds, e_ds = axis.to_ds(t0 - 600), axis.to_ds(t1 + 600)
-    hot = set()
-    for rt, cap, dj in oc.rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
-                                    " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
-                               (oc.T_TEMP, s_ds, e_ds)):
-        if oc.in_intervals(rt, charging):
-            continue
-        v = oc.skin_temp(oc.jget(dj))
-        if v is not None and v > 30.0:
-            t = axis(rt, cap)
-            if t is not None:
-                m = int(t // 60)
-                for k in range(m - 5, m + 6):
-                    hot.add(k * 60)
-    return hot
-
-
 def pctl(vals, p):
     """Percentile p (0–100) par interpolation linéaire ; vals triées."""
     if not vals:
@@ -820,84 +802,114 @@ def overlap_min(windows, t0, t1):
     return sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in windows) / 60.0
 
 
-def compute_activity_day(con, axis, day, sleep_windows, charging, weight, now=None, bmr=None,
-                         rest_windows=(), charge_windows=()):
-    now = time.time() if now is None else now
-    t0 = datetime.strptime(day, "%Y-%m-%d").timestamp()
-    t1 = t0 + 86400
-    am = oc.activity_minutes(con, axis, t0, t1)
-    mets = {m: d["met"] for m, d in am.items()}
-    steps = sum(d["steps"] for d in am.values())
-    worn = worn_minutes(con, axis, t0, t1, charging)
+SEDENTARY_BOUT_MIN = 60          # Oura (doc 2021) : périodes inactives ≥ 60 min
+SEDENTARY_GAP_MIN = 2            # mouvement bref toléré (s'agiter sur sa chaise)
 
-    def in_sleep(m):
-        return any(a <= m < b for a, b in sleep_windows)
-    sleep = {m for m in mets if in_sleep(m)}
-    awake = sorted(m for m in mets if m in worn and m not in sleep)
-    inactive = [m for m in awake if mets[m] < 1.5]
-    low = sum(1 for m in awake if 1.5 <= mets[m] < 3)
-    med = sum(1 for m in awake if 3 <= mets[m] < 6)
-    high = sum(1 for m in awake if mets[m] >= 6)
-    met_mh = sum(mets[m] for m in awake if mets[m] >= 3)
-    kcal = sum((mets[m] - 1) * 3.5 * weight / 200 for m in awake if mets[m] >= 1.5)
-    # périodes sédentaires > 50 min (trous ≤ 2 min tolérés)
-    bouts, run, last = 0, 0, None
-    for m in inactive:
-        if last is not None and m - last <= 180:
-            run += (m - last) // 60
+
+def sedentary_bouts(grid):
+    """Périodes assises ≥ 60 min : minutes d'éveil à < 1,5 MET (ou sans mesure
+    d'intensité ni mouvement). Jusqu'à 2 minutes d'éveil plus actives ne coupent
+    pas la période (sans cette tolérance, une seule minute à 1,5 MET la coupait :
+    0 période sur 13 jours sur 18) ; tout autre état (lit, repos, charge, retrait,
+    non porté) ou 3 minutes actives la terminent."""
+    bouts, run, gap = 0, 0, 0
+    for m in sorted(grid):
+        g = grid[m]
+        awake = g["state"] == "éveil"
+        sed = awake and ((g["met"] is not None and g["met"] < oc.MET_LIGHT)
+                         or (g["met"] is None and not g["motion"]))
+        if sed:
+            run, gap = run + gap + 1 if run else 1, 0
+        elif awake and run and gap < SEDENTARY_GAP_MIN:
+            gap += 1
         else:
-            if run > 50:
-                bouts += 1
-            run = 1
-        last = m
-    if run > 50:
-        bouts += 1
+            bouts += run >= SEDENTARY_BOUT_MIN
+            run, gap = 0, 0
+    return bouts + (run >= SEDENTARY_BOUT_MIN)
 
-    # FC de jour (tag 128) hors sommeil et repos : moyenne, « FC de repos de
+
+def compute_activity_day(con, axis, day, nights, rests, charging_ds, weight, now=None, bmr=None,
+                         removals=()):
+    """Journée d'activité de 04:00 à 03:59 (cf. oc.activity_grid pour les états
+    de chaque minute). nights : [(début, fin, sommeil_h)] ; rests : [(début, fin)]."""
+    now = time.time() if now is None else now
+    t0, t1 = oc.activity_day_bounds(day)
+    end = min(t1, now)
+    charges = [(axis(a), axis(b)) for a, b in charging_ds]
+    grid = oc.activity_grid(con, axis, t0, end, [(a, b) for a, b, _ in nights], rests, charges,
+                            removals, charging_ds) if end > t0 else {}
+    awake = [g for g in grid.values() if g["state"] == "éveil"]
+    measured = [g["met"] for g in awake if g["met"] is not None]
+    rest_awake = sum(1 for v in measured if v < oc.MET_REST)
+    inactive = sum(1 for v in measured if oc.MET_REST <= v < oc.MET_LIGHT)
+    low = sum(1 for v in measured if oc.MET_LIGHT <= v < oc.MET_MODERATE)
+    med = sum(1 for v in measured if oc.MET_MODERATE <= v < oc.MET_VIGOROUS)
+    high = sum(1 for v in measured if v >= oc.MET_VIGOROUS)
+    met_mh = sum(v for v in measured if v >= oc.MET_MODERATE)
+    kcal = sum((v - 1) * 3.5 * weight / 200 for v in measured if v >= oc.MET_LIGHT)
+    states = {}
+    for g in grid.values():
+        states[g["state"]] = states.get(g["state"], 0) + 1
+    # sommeil mesuré au prorata de la part de chaque nuit tombant dans la journée
+    sleep_min = sum(h * 60 * overlap_min([(a, b)], t0, end) * 60 / (b - a)
+                    for a, b, h in nights if h and b > a)
+
+    # FC de jour (tag 128) sur les minutes d'éveil : moyenne, « FC de repos de
     # jour » = 10e percentile des minutes calmes (MET connu < 1,5), maximum =
     # 99e percentile (une minute isolée peut être un artefact)
-    hr = {m: v for m, v in oc.day_hr_minutes(con, axis, t0, t1).items() if not in_sleep(m)}
+    hr = {m: v for m, v in oc.day_hr_minutes(con, axis, t0, end).items()
+          if grid.get(m, {}).get("state") == "éveil"} if grid else {}
     vals = sorted(hr.values())
-    calm = sorted(v for m, v in hr.items() if mets.get(m) is not None and mets[m] < 1.5)
+    calm = sorted(v for m, v in hr.items() if grid[m]["met"] is not None and grid[m]["met"] < oc.MET_LIGHT)
 
-    # couverture : part des minutes portées et éveillées qui ont une mesure d'intensité
-    worn_awake = sum(1 for m in worn if t0 <= m < t1 and not in_sleep(m))
-    end = min(t1, now)
     frac = max(0.0, min(1.0, (end - t0) / 86400))
     bmr_day = bmr * frac if bmr else None
-    return {"day": day, "worn_min": len([m for m in mets if m in worn]), "sleep_min": len(sleep),
-            "inactive_min": len(inactive), "low_min": low, "medium_min": med, "high_min": high,
-            "met_min_mh": round(met_mh, 1), "sedentary_bouts": bouts, "active_kcal": round(kcal),
-            "easy_day": int(high <= 15 and med + high <= 85),
-            "partial": int(len(awake) < 600 or t1 > now),
-            "steps": int(round(steps)),
+    return {"day": day,
+            "worn_min": sum(n for s, n in states.items() if s in ("éveil", "lit", "repos")),
+            "awake_min": len(awake), "in_bed_min": states.get("lit", 0), "sleep_min": round(sleep_min),
+            "rest_min": states.get("repos", 0), "nonworn_min": states.get("non porté", 0) + states.get("retiré", 0),
+            "charge_min": states.get("charge", 0),
+            "rest_awake_min": rest_awake, "inactive_min": inactive, "low_min": low, "medium_min": med,
+            "high_min": high, "met_min_mh": round(met_mh, 1), "sedentary_bouts": sedentary_bouts(grid),
+            "active_kcal": round(kcal), "easy_day": int(high <= 15 and med + high <= 85),
+            "partial": int(len(measured) < 600 or t1 > now),
+            "steps": int(round(sum(g["steps"] for g in grid.values()))),
             "bmr_kcal": round(bmr_day) if bmr_day else None,
-            "total_kcal": round(bmr_day + kcal) if bmr_day else None,
+            "total_kcal": round(bmr_day) + round(kcal) if bmr_day else None,
             "hr_day_n": len(vals),
             "hr_day_mean": r(statistics.fmean(vals), 1) if len(vals) >= 30 else None,
             "hr_day_rest": r(pctl(calm, 10), 1) if len(calm) >= 20 else None,
             "hr_day_max": r(pctl(vals, 99), 1) if len(vals) >= 30 else None,
-            "met_cover_pct": r(100.0 * len(awake) / worn_awake, 1) if worn_awake else None,
-            "charge_min": round(overlap_min(charge_windows, t0, end)),
-            "rest_min": round(overlap_min(rest_windows, t0, end))}
+            "met_cover_pct": r(100.0 * len(measured) / len(awake), 1) if awake else None}
+
+
+# Barèmes sourcés (Oura, « Activity Contributors » et doc API 2021) :
+# rester actif : 5–8 h favorables, > 95 sous 7 h, « attention » au-delà de 12 h ;
+# bouger chaque heure : périodes assises ≥ 60 min, > 95 avec une seule ;
+# volume : 95 dès 750 MET-min par semaine, 100 à 2 000.
+STAY_ACTIVE_PTS = [(5, 100), (7, 95), (8, 85), (12, 55), (16, 20)]
+MOVE_HOURLY_PTS = [(0, 100), (1, 95), (3, 65), (6, 30)]
+TRAINING_VOLUME_PTS = [(0, 20), (750, 95), (2000, 100)]
 
 
 def activity_contributors(day, activity):
+    """Contributeurs du score d'activité ; score = MOYENNE SIMPLE (pondération
+    locale : Oura ne publie plus ses poids), à partir de 5 contributeurs."""
     a = activity[day]
-    c = {"stay_active": {"score": oc.lerp_score(a["inactive_min"] / 60, [(5, 100), (8, 85), (12, 55), (16, 20)]),
+    c = {"stay_active": {"score": oc.lerp_score(a["inactive_min"] / 60, STAY_ACTIVE_PTS),
                          "value": a["inactive_min"]},
-         "move_every_hour": {"score": oc.lerp_score(a["sedentary_bouts"], [(0, 100), (1, 90), (3, 65), (6, 30)]),
+         "move_every_hour": {"score": oc.lerp_score(a["sedentary_bouts"], MOVE_HOURLY_PTS),
                              "value": a["sedentary_bouts"]}}
     d0 = datetime.strptime(day, "%Y-%m-%d")
     week = [activity.get((d0 - timedelta(days=k)).strftime("%Y-%m-%d")) for k in range(7)]
-    week = [w for w in week if w and w["worn_min"] >= 600]
+    week = [w for w in week if w and (w.get("awake_min") or w["worn_min"]) >= 600]
     if len(week) >= 3:
         freq = sum(1 for w in week if w["met_min_mh"] >= 100)
         vol = sum(w["met_min_mh"] for w in week) * 7 / len(week)
         easy = sum(w["easy_day"] for w in week)
         c["training_frequency"] = {"score": oc.lerp_score(freq, [(0, 20), (1, 45), (2, 70), (3, 95), (4, 100)]),
                                    "value": freq, "days": len(week)}
-        c["training_volume"] = {"score": oc.lerp_score(vol, [(0, 20), (750, 60), (1500, 85), (2000, 100)]),
+        c["training_volume"] = {"score": oc.lerp_score(vol, TRAINING_VOLUME_PTS),
                                 "value": round(vol), "days": len(week)}
         c["recovery_time"] = {"score": oc.lerp_score(easy, [(0, 30), (1, 85), (2, 100)]),
                               "value": easy, "days": len(week)}
@@ -908,25 +920,24 @@ def activity_contributors(day, activity):
     return (round(statistics.fmean(sc)) if len(sc) >= 5 else None), c
 
 
-def update_activity(con, der, axis, nights_raw, charging, recompute_all, now, rests=()):
+def update_activity(con, der, axis, nights, charging, recompute_all, now, rests=()):
+    """nights : lignes de sleep_scores (fenêtres et sommeil mesuré)."""
     known = {x[0]: x[1] for x in der.execute("SELECT day, partial FROM activity_daily")}
     first = con.execute("SELECT MIN(captured_unix) FROM events WHERE tag=?", (oc.T_ACTIVITY,)).fetchone()[0]
     if not first:
         return {}
-    d = datetime.fromtimestamp(first).date()
-    today = datetime.fromtimestamp(now).date()
+    d = datetime.strptime(oc.activity_day(first), "%Y-%m-%d").date()
+    today = datetime.strptime(oc.activity_day(now), "%Y-%m-%d").date()
     weight, _ = profile_weight(der, con)
     bmr = profile_bmr(der)
-    windows = [(n["start_unix"], n["end_unix"]) for n in nights_raw]
-    windows += oc.short_rest_periods(con, axis)
+    night_w = [(n["start_unix"], n["stop_unix"], n.get("total")) for n in nights if n.get("start_unix")]
     rest_w = [(p["start_unix"], p["end_unix"]) for p in rests]
-    charge_w = [(axis(a), axis(b)) for a, b in charging]
-    charge_w = [(a, b) for a, b in charge_w if a is not None and b is not None]
+    removals = oc.wear_removals(con, axis)
     cols = ("day", *ACTIVITY_COLS, "ts")
     while d <= today:
         day = d.strftime("%Y-%m-%d")
         if recompute_all or day not in known or known[day] or (today - d).days <= 1:
-            a = compute_activity_day(con, axis, day, windows, charging, weight, now, bmr, rest_w, charge_w)
+            a = compute_activity_day(con, axis, day, night_w, rest_w, charging, weight, now, bmr, removals)
             a["ts"] = now
             der.execute("INSERT OR REPLACE INTO activity_daily (%s) VALUES (%s)"
                         % (", ".join(cols), ", ".join("?" * len(cols))), [a.get(c) for c in cols])
@@ -1317,7 +1328,7 @@ def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
     update_references(der, nights)
     update_baselines(der, nights, now)
     rests = oc.rest_periods(con, axis, nights_raw)
-    activity = update_activity(con, der, axis, nights_raw, charging, recompute_all, now, rests)
+    activity = update_activity(con, der, axis, nights, charging, recompute_all, now, rests)
     update_readiness(der, nights, activity, now)
     update_rests(con, der, nights_raw, nights, rests, now)
     der.commit()

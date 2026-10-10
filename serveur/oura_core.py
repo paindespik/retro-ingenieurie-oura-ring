@@ -411,20 +411,6 @@ def load_nights(con, axis, min_h=3.0, max_h=16.0):
     return [best[k] for k in sorted(best)]
 
 
-def short_rest_periods(con, axis, max_h=3.0):
-    """bedtime_period de moins de 3 h : repos ou siestes (non comptés)."""
-    out = []
-    for rt, dj in rows(con, "SELECT ring_timestamp, decoded_json FROM events"
-                            " WHERE tag=? ORDER BY ring_timestamp", (T_BEDTIME,)):
-        j = jget(dj) or {}
-        s, e = j.get("bedtime_start_ds"), j.get("bedtime_end_ds")
-        if s and e and 0 < e - s < max_h * 36000:
-            su, eu = axis(s), axis(e)
-            if su and eu:
-                out.append((su, eu))
-    return sorted(set(out))
-
-
 # ---------------------------------------------------------------- séries cardiaques
 
 def hrv_bins(con, s_ds, e_ds):
@@ -667,6 +653,127 @@ def rest_periods(con, axis, nights, max_h=3.0):
         if su and eu and eu > su:
             out.append({"start_ds": s, "end_ds": e, "start_unix": su, "end_unix": eu})
     return out
+
+
+# ---------------------------------------------------------------- journée d'activité
+
+# Journée d'activité de 04:00 à 03:59 (Oura : « activity period is from 4 AM to
+# 3:59 AM ») : une soirée tardive reste sur la bonne journée.
+ACT_DAY_START_H = 4
+# Classes d'intensité (aide Oura actuelle, « How Oura Measures Steps & Activity ») :
+# repos < 1,05 MET (allongé, immobile : ni actif ni sédentaire), sédentaire
+# 1,05–1,5, léger 1,5–3, modéré 3–6, intense ≥ 6 ; calories actives ≥ 1,5 MET.
+MET_REST, MET_LIGHT, MET_MODERATE, MET_VIGOROUS = 1.05, 1.5, 3.0, 6.0
+
+
+def activity_day_bounds(day):
+    """'AAAA-MM-JJ' → (unix 04:00 du jour, unix 04:00 du lendemain), heure locale."""
+    from datetime import datetime, timedelta
+    d = datetime.strptime(day, "%Y-%m-%d")
+    return ((d + timedelta(hours=ACT_DAY_START_H)).timestamp(),
+            (d + timedelta(days=1, hours=ACT_DAY_START_H)).timestamp())
+
+
+def activity_day(unix):
+    """Journée d'activité contenant l'instant unix (avant 04:00 → la veille)."""
+    from datetime import datetime, timedelta
+    return (datetime.fromtimestamp(unix) - timedelta(hours=ACT_DAY_START_H)).strftime("%Y-%m-%d")
+
+
+def wear_removals(con, axis):
+    """Retraits signalés par l'anneau : wear_event (tag 83) état 1 → événement
+    83 suivant (état 3 « porté » ou 8 « charge ») ; [(t0, t1)] unix."""
+    ev = [(axis(rt, cap), (jget(dj) or {}).get("state"))
+          for rt, cap, dj in rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                       " WHERE tag=? ORDER BY ring_timestamp", (T_WEAR,))]
+    ev = [(t, st) for t, st in ev if t is not None]
+    return [(a, b) for (a, s), (b, _) in zip(ev, ev[1:]) if s == 1 and b > a]
+
+
+def skin_hot_minutes(con, axis, t0, t1, charging_ds=()):
+    """Minutes où la peau dépasse 30 °C à ±5 min (capteur cutané, hors charge)."""
+    s_ds, e_ds = axis.to_ds(t0 - 600), axis.to_ds(t1 + 600)
+    hot = set()
+    for rt, cap, dj in rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                 " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
+                            (T_TEMP, s_ds or 0, e_ds or 1 << 62)):
+        if in_intervals(rt, charging_ds):
+            continue
+        v = skin_temp(jget(dj))
+        if v is not None and v > 30.0:
+            t = axis(rt, cap)
+            if t is not None:
+                m = int(t // 60)
+                hot.update(k * 60 for k in range(m - 5, m + 6))
+    return hot
+
+
+def motion_minutes(con, axis, t0, t1):
+    """Secondes en mouvement par minute (motion_event, tag 71) : {minute: s}."""
+    s_ds, e_ds = axis.to_ds(t0 - 600), axis.to_ds(t1 + 600)
+    out = {}
+    for rt, cap, dj in rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                 " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
+                            (T_MOTION, s_ds or 0, e_ds or 1 << 62)):
+        t = axis(rt, cap)
+        if t is not None and t0 <= t < t1:
+            m = int(t // 60) * 60
+            out[m] = out.get(m, 0) + ((jget(dj) or {}).get("motion_seconds") or 0)
+    return out
+
+
+def _within(m, windows):
+    return any(a <= m < b for a, b in windows)
+
+
+def activity_grid(con, axis, t0, t1, nights=(), rests=(), charges=(), removals=(), charging_ds=()):
+    """Grille minute par minute de [t0, t1) : {minute: {"state", "met", "steps"}}.
+
+    États, par priorité : « charge », « retiré » (wear_event), « lit » (fenêtre
+    de nuit), « repos » (repos de jour détecté par l'anneau), « non porté »,
+    « éveil ». Une minute hors de ces fenêtres est portée si la peau dépasse
+    30 °C à ±5 min, OU si l'anneau mesure un mouvement (tag 71), OU une
+    intensité ≥ 1,5 MET : la seule règle de température classait « non porté »
+    des minutes actives aux doigts froids (171 min sur la période auditée).
+    met / steps : bins d'activity_information (None si la minute n'en a pas)."""
+    def clip(ws):
+        return [(a, b) for a, b in ws if a is not None and b is not None and b > t0 and a < t1]
+    nights, rests, charges, removals = clip(nights), clip(rests), clip(charges), clip(removals)
+    am = activity_minutes(con, axis, t0, t1)
+    hot = skin_hot_minutes(con, axis, t0, t1, charging_ds)
+    mov = motion_minutes(con, axis, t0, t1)
+    grid = {}
+    m = int(t0 // 60) * 60
+    while m < t1:
+        a = am.get(m)
+        met = a["met"] if a else None
+        if _within(m, charges):
+            st = "charge"
+        elif _within(m, removals):
+            st = "retiré"
+        elif _within(m, nights):
+            st = "lit"
+        elif _within(m, rests):
+            st = "repos"
+        elif m in hot or mov.get(m, 0) > 0 or (met is not None and met >= MET_LIGHT):
+            st = "éveil"
+        else:
+            st = "non porté"
+        grid[m] = {"state": st, "met": met, "steps": a["steps"] if a else 0.0, "motion": mov.get(m, 0)}
+        m += 60
+    return grid
+
+
+def grid_runs(grid, states):
+    """Intervalles contigus [(début, fin)] des minutes dans `states`."""
+    out = []
+    for m in sorted(grid):
+        if grid[m]["state"] in states:
+            if out and out[-1][1] == m:
+                out[-1][1] = m + 60
+            else:
+                out.append([m, m + 60])
+    return [tuple(x) for x in out]
 
 
 # ---------------------------------------------------------------- batterie

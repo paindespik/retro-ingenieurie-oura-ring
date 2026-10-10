@@ -327,9 +327,9 @@ def overview():
         if n:
             out["staging"] = staging_payload(d, n)
             out["readiness"] = readiness_row(safe_one(d, "SELECT * FROM readiness WHERE day=?", (n["night"],)))
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = oc.activity_day(time.time())          # journée d'activité : 04:00 → 03:59
         out["activity"] = activity_row(safe_one(d, "SELECT * FROM activity_daily WHERE day=?", (today,)))
-        yday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yday = oc.activity_day(time.time() - 86400)
         out["activity_yesterday"] = activity_row(safe_one(d, "SELECT * FROM activity_daily WHERE day=?", (yday,)))
         b = safe_one(d, "SELECT * FROM llm_briefings ORDER BY ts DESC LIMIT 1")
         if b:
@@ -456,14 +456,12 @@ def briefing(date: str | None = Query(None, pattern=DATE_RE)):
 
 @app.get("/api/activity")
 def activity(date: str | None = Query(None, pattern=DATE_RE)):
-    """Journée civile : bins MET 1 min, FC, tranches d'effort, sommeil, charge."""
+    """Journée d'activité (04:00 → 03:59, comme Oura) : bins MET 1 min, pas, FC,
+    tranches d'effort, sommeil, repos, charge, minutes non portées."""
     c = raw()
     ax = axis_for(c)
-    d0 = datetime.strptime(date, "%Y-%m-%d") if date else datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    t0 = d0.timestamp()
-    t1 = t0 + 86400
-    day = d0.strftime("%Y-%m-%d")
+    day = date or oc.activity_day(time.time())
+    t0, t1 = oc.activity_day_bounds(day)
     am = oc.activity_minutes(c, ax, t0, t1)
     met_list = [{"t": t, "met": v["met"], "steps": round(v["steps"], 1)} for t, v in sorted(am.items())]
     steps_h = {}
@@ -505,13 +503,18 @@ def activity(date: str | None = Query(None, pattern=DATE_RE)):
     nights_raw = oc.load_nights(c, ax)
     sleep = [(n["start_unix"], n["end_unix"]) for n in nights_raw
              if n["end_unix"] > t0 and n["start_unix"] < t1]
-    rests = [(a, b) for a, b in oc.short_rest_periods(c, ax)
-             if b > t0 and a < t1 and not any(a < y and b > x for x, y in sleep)]
+    rest_p = oc.rest_periods(c, ax, nights_raw)
+    rests = [(p["start_unix"], p["end_unix"]) for p in rest_p if p["end_unix"] > t0 and p["start_unix"] < t1]
+    charging_ds = oc.charging_intervals_ds(c)
     charging = []
-    for a, b in oc.charging_intervals_ds(c):
+    for a, b in charging_ds:
         ta, tb = ax(a), ax(b)
         if ta and tb and tb > t0 and ta < t1:
             charging.append((ta, tb))
+    # minutes non portées (ni chaleur cutanée, ni mouvement, ni activité) et retraits
+    grid = oc.activity_grid(c, ax, t0, min(t1, time.time()), sleep, rests, charging,
+                            oc.wear_removals(c, ax), charging_ds)
+    nonworn = oc.grid_runs(grid, ("non porté", "retiré"))
     c.close()
     dd = derived()
     summary = activity_row(safe_one(dd, "SELECT * FROM activity_daily WHERE day=?", (day,))) if dd else None
@@ -522,6 +525,7 @@ def activity(date: str | None = Query(None, pattern=DATE_RE)):
         dd.close()
     return {"date": day, "mode": ax.mode, "met": met_list, "hr": hr, "segments": segs,
             "steps_hourly": [{"t": k, "steps": round(v)} for k, v in sorted(steps_h.items())],
+            "t0": t0, "t1": t1, "nonworn": nonworn,
             "sleep": sleep, "rests": rests, "rest_list": rest_list, "charging": charging, "summary": summary,
             "weight_kg": prof["weight_kg"] if prof else None,
             "profile_complete": bool(prof and prof["age_years"] and prof["height_cm"] and prof["weight_kg"])}
@@ -546,7 +550,7 @@ def quality(days: int = Query(30, ge=7, le=365)):
     nights_q = safe_q(d, "SELECT night, provisional, axis_mode, hr_source, staging_source, ref_excluded,"
                          " beats_kept_pct, lead_min, hr_bins_pct, resp_n, in_bed FROM sleep_scores"
                          " ORDER BY night DESC LIMIT ?", (days,))
-    days_q = safe_q(d, "SELECT day, partial, worn_min, met_cover_pct, hr_day_n, charge_min, rest_min"
+    days_q = safe_q(d, "SELECT day, partial, worn_min, awake_min, nonworn_min, met_cover_pct, hr_day_n, charge_min, rest_min"
                        " FROM activity_daily ORDER BY day DESC LIMIT ?", (days,))
     d.close()
     return {"nights": nights_q, "days": days_q}

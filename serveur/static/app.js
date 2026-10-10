@@ -66,6 +66,8 @@ function isoDay(d) {
   return z.toISOString().slice(0, 10);
 }
 const today = () => isoDay(new Date());
+// journée d'activité (04:00 → 03:59, comme Oura) : avant 4 h, c'est encore la veille
+const actToday = () => isoDay(new Date(Date.now() - 4 * 3600 * 1000));
 function shiftDay(d, k) { const x = new Date(d + "T12:00:00"); x.setDate(x.getDate() + k); return isoDay(x); }
 const dayNoon = (d) => new Date(d + "T12:00:00").getTime() / 1000;
 
@@ -457,7 +459,7 @@ const READY_CONTRIB = {
   activity_balance: "Équilibre de l'activité",
 };
 const ACT_CONTRIB = {
-  stay_active: "Rester actif", move_every_hour: "Bouger chaque heure", training_frequency: "Fréquence d'entraînement",
+  stay_active: "Rester actif", move_every_hour: "Bouger chaque heure", training_frequency: "Fréquence d'activité",
   training_volume: "Volume d'entraînement", recovery_time: "Jours de récupération",
 };
 
@@ -492,10 +494,10 @@ function readyContribValue(k, c) {
 
 function actContribValue(k, c) {
   switch (k) {
-    case "stay_active": return `${dur(c.value / 60)} inactif (bien : ≤ 8 h ; attention > 12 h)`;
-    case "move_every_hour": return `${pl(c.value, "période")} sédentaire${c.value > 1 ? "s" : ""} > 50 min`;
-    case "training_frequency": return `${pl(c.value, "jour")} ≥ 100 MET-min sur ${c.days} j`;
-    case "training_volume": return `${num(c.value)} MET-min / semaine (cible 2 000, sur ${c.days} j)`;
+    case "stay_active": return `${dur(c.value / 60)} sédentaire (95 jusqu'à 7 h ; attention au-delà de 12 h)`;
+    case "move_every_hour": return `${pl(c.value, "période")} assise${c.value > 1 ? "s" : ""} d'au moins 1 h`;
+    case "training_frequency": return `${pl(c.value, "jour")} actif${c.value > 1 ? "s" : ""} (≥ 100 MET-min modérés ou intenses, ~30 min de marche rapide) sur ${c.days} j`;
+    case "training_volume": return `${num(c.value)} MET-min / semaine (95 dès 750, 100 à 2 000 ; sur ${c.days} j)`;
     case "recovery_time": return `${pl(c.value, "journée")} légère${c.value > 1 ? "s" : ""} sur ${c.days} j`;
     default: return "";
   }
@@ -517,7 +519,7 @@ async function pageToday(m) {
   html += `<div class="card"><div class="rings">
       ${ring(n ? n.score : null, "Sommeil", n ? (open ? "nuit en cours" : dayLabel(n.night)) : "aucune nuit", n ? "#/sommeil/" + n.night : null)}
       ${ring(rd ? rd.score : null, "Récupération", rSub, n ? "#/recuperation/" + n.night : null)}
-      ${ring(a ? a.score : null, "Activité", aSub, "#/activite/" + today())}</div></div>`;
+      ${ring(a ? a.score : null, "Activité", aSub, "#/activite/" + actToday())}</div></div>`;
   if (open) {
     html += `<div class="card small muted">${openBadge} L'anneau prolonge encore la fenêtre de sommeil (dernière mise à jour
       ${hm(n.stop_unix)}) : les chiffres de la nuit sont provisoires et le résumé du matin sera rédigé une fois le réveil
@@ -695,16 +697,17 @@ async function pageRecovery(m, date) {
 }
 
 async function pageActivity(m, date) {
-  date = date || today();
+  date = date || actToday();
   const a = await api("activity?date=" + date);
   const s = a.summary;
   const c = (s && s.contributors) || {};
-  const t0 = new Date(date + "T00:00:00").getTime() / 1000, t1 = t0 + 86400;
+  const t0 = a.t0, t1 = a.t1;
   let html = `<div class="card"><div class="row" style="justify-content:space-between">
-      ${dayNav("#/activite", date, shiftDay(date, -1), date < today() ? shiftDay(date, 1) : null)}
+      ${dayNav("#/activite", date, shiftDay(date, -1), date < actToday() ? shiftDay(date, 1) : null,
+        (d) => `${dayLong(d)} <span class="small muted">· 04:00 → 03:59</span>`)}
       ${s && s.partial ? `<span class="badge">journée en cours ou incomplète</span>` : ""}</div>
     <div class="row" style="margin-top:.6rem;align-items:flex-start">
-      <div>${ring(s ? s.score : null, "Activité", s ? (s.partial ? (date < today() ? "journée incomplète" : "journée en cours")
+      <div>${ring(s ? s.score : null, "Activité", s ? (s.partial ? (date < actToday() ? "journée incomplète" : "journée en cours")
         : s.score == null ? "calibrage" : undefined) : "pas de données")}</div>
       <div style="flex:1 1 320px">${Object.keys(ACT_CONTRIB).map((k) => c[k] ? contribRow(ACT_CONTRIB[k], c[k], actContribValue(k, c[k])) : "").join("") || `<div class="muted small">pas de contributeurs pour ce jour</div>`}</div></div></div>`;
   if (s) {
@@ -712,20 +715,21 @@ async function pageActivity(m, date) {
       ${tile(`Pas ${STEPS_BADGE}`, s.steps == null ? "—" : num(s.steps), "", "compteur de l'anneau, à valider par une marche comptée")}
       ${tile("Dépense totale", s.total_kcal == null ? "—" : num(s.total_kcal), s.total_kcal == null ? "" : "kcal",
         s.total_kcal == null ? `profil incomplet (âge, taille, poids : page Données)` :
-          `${s.partial ? "depuis minuit · " : ""}repos ${num(s.bmr_kcal)} + activité ${num(s.active_kcal)} (estimation)`)}
+          `${s.partial ? "depuis 04:00 · " : ""}repos ${num(s.bmr_kcal)} + activité ${num(s.active_kcal)} (estimation)`)}
       ${tile("FC de jour", s.hr_day_mean == null ? "—" : num(s.hr_day_mean), s.hr_day_mean == null ? "" : "bpm",
         s.hr_day_mean == null ? "pas assez de mesures" : `repos ${num(s.hr_day_rest)} · max ${num(s.hr_day_max)} · ${dur(s.hr_day_n / 60)} mesurées`)}
       ${tile("Effort modéré + intense", num(s.met_min_mh), "MET-min", "repère Oura : 100 / jour")}
       ${tile("Minutes actives", num(s.low_min + s.medium_min + s.high_min), "min", `léger ${s.low_min} · modéré ${s.medium_min} · intense ${s.high_min}`)}
-      ${tile("Temps inactif", dur(s.inactive_min / 60), "", `${pl(s.sedentary_bouts, "période")} > 50 min`, s.inactive_min > 720 ? "up-bad" : "")}
+      ${tile("Temps sédentaire", dur(s.inactive_min / 60), "", `1,05–1,5 MET · ${pl(s.sedentary_bouts, "période")} assise${s.sedentary_bouts > 1 ? "s" : ""} ≥ 1 h${s.rest_awake_min ? ` · repos éveillé ${dur(s.rest_awake_min / 60)} (non compté)` : ""}`, s.inactive_min > 720 ? "up-bad" : "")}
       ${tile("Calories actives", num(s.active_kcal), "kcal", `estimation MET × ${a.weight_kg ? num(a.weight_kg, 0) + " kg (profil)" : "poids par défaut"}`)}
-      ${tile("Anneau porté", dur(s.worn_min / 60), "", `dont ${dur(s.sleep_min / 60)} de sommeil`)}
+      ${tile("Anneau porté", dur(s.worn_min / 60), "", s.awake_min == null ? "" : `éveil ${dur(s.awake_min / 60)} · au lit ${dur(s.in_bed_min / 60)} (sommeil ${dur(s.sleep_min / 60)})${s.rest_min ? ` · repos ${dur(s.rest_min / 60)}` : ""}${s.nonworn_min ? ` · non porté ${dur(s.nonworn_min / 60)}` : ""}`)}
     </div></div>`;
   }
   html += `<div class="card"><h2>Intensité (MET, par minute)</h2><div id="c-met"></div>
-      <div class="legend"><span style="--c:var(--met)"><i></i>< 3 léger</span><span style="--c:var(--fair)"><i></i>3–6 modéré</span>
+      <div class="legend"><span style="--c:var(--line)"><i></i>< 1,05 repos</span><span style="--c:var(--motion)"><i></i>1,05–1,5 sédentaire</span>
+      <span style="--c:var(--met)"><i></i>1,5–3 léger</span><span style="--c:var(--fair)"><i></i>3–6 modéré</span>
       <span style="--c:var(--bad)"><i></i>≥ 6 intense</span><span style="--c:var(--st-deep)"><i style="opacity:.4"></i>sommeil</span>
-      <span style="--c:var(--fair)"><i style="opacity:.4"></i>charge</span></div></div>
+      <span style="--c:var(--fair)"><i style="opacity:.4"></i>charge</span><span style="--c:var(--bad)"><i style="opacity:.25"></i>non porté</span></div></div>
     <div class="card"><h2>Pas par heure ${STEPS_BADGE}</h2><div id="c-steps"></div></div>
     <div class="card"><h2>Fréquence cardiaque</h2><div id="c-dhr"></div></div>`;
   if ((a.rest_list || []).length) {
@@ -745,25 +749,31 @@ async function pageActivity(m, date) {
         <td class="n">${g.hr_mean ?? "—"} / ${g.hr_max ?? "—"}</td></tr>`).join("")}</table></div></div>`;
   }
   html += `<div class="card"><details><summary>Méthode et limites</summary><div class="small">
-    <p>Intensité : MET par minute calculés par l'anneau (accéléromètre). Temps inactif = minutes d'éveil, anneau au doigt
-    (température cutanée > 30 °C), MET < 1,5. Effort modéré ≥ 3 MET, intense ≥ 6 MET ; « MET-min » = somme des MET de ces
-    minutes. Calories actives = (MET − 1) × 3,5 × poids / 200 par minute d'activité ; dépense totale = métabolisme de base
+    <p><b>Journée</b> de 04:00 à 03:59 (comme Oura) : une soirée tardive reste sur la bonne journée.
+    <b>Intensité</b> : MET par minute calculés par l'anneau (accéléromètre), classes de l'aide Oura : repos &lt; 1,05 (allongé,
+    immobile, ni actif ni sédentaire), sédentaire 1,05–1,5, léger 1,5–3, modéré 3–6, intense ≥ 6 ; « MET-min » = somme des MET
+    des minutes modérées et intenses. Une minute est comptée <b>au doigt</b> si la peau dépasse 30 °C, ou si l'anneau mesure
+    un mouvement ou une intensité ≥ 1,5 MET (doigts froids), hors charge et hors retrait signalé. <b>Période assise</b> : au
+    moins 1 h sous 1,5 MET, 2 min de mouvement bref tolérées. Calories actives = (MET − 1) × 3,5 × poids / 200 par minute d'activité ; dépense totale = métabolisme de base
     (formule de Mifflin-St Jeor, profil de la page Données) + calories actives : ordres de grandeur seulement.</p>
     <p><b>Pas</b> : chaque mesure d'activité de l'anneau commence par un octet qui suit l'intensité minute par minute
     (corrélation 0,96 avec le MET, nul au repos) : c'est très probablement le nombre de pas de la fenêtre, mais ce n'est pas
     encore vérifié. Pour le valider : marcher 1 000 pas comptés en notant l'heure de début et de fin, puis rester 10 min assis.</p>
     <p><b>FC de jour</b> : mesures de l'anneau à la LED verte (médiane par minute), hors sommeil et repos ; « repos » =
     10<sup>e</sup> percentile des minutes calmes (MET &lt; 1,5), « max » = 99<sup>e</sup> percentile.</p>
-    <p>Contributeurs inspirés de l'Activity Score d'Oura (seuils publiés : 5–8 h d'inactivité au plus, rappel après 50 min,
-    3–4 jours d'entraînement, 2 000 MET-min/semaine, 1–2 jours légers). L'objectif quotidien personnalisé n'est pas calculé.</p>
+    <p>Contributeurs de l'Activity Score d'Oura, barèmes de son aide et de sa documentation 2021 : rester actif (95 jusqu'à
+    7 h sédentaires), bouger chaque heure (95 avec une seule période assise), fréquence (3–4 jours ≥ 100 MET-min par semaine),
+    volume (95 dès 750 MET-min par semaine, 100 à 2 000), 1–2 journées légères. Score = <b>moyenne simple</b> (pondération
+    locale : Oura ne publie plus la sienne). L'objectif quotidien personnalisé n'est pas calculé (formule non publiée).</p>
     </div></details></div>`;
   m.innerHTML = html;
   const shades = [...a.sleep.map(([f, t]) => ({ from: f, to: t, color: "var(--shade-sleep)" })),
     ...(a.rests || []).map(([f, t]) => ({ from: f, to: t, color: "var(--shade-sleep)" })),
-    ...a.charging.map(([f, t]) => ({ from: f, to: t, color: "var(--shade-charge)" }))];
+    ...a.charging.map(([f, t]) => ({ from: f, to: t, color: "var(--shade-charge)" })),
+    ...(a.nonworn || []).map(([f, t]) => ({ from: f, to: t, color: "var(--shade-off)" }))];
   $("#c-met", m).append(timeChart({ x0: t0, x1: t1, y0: 0, height: 170, shades, legend: false,
     series: [{ name: "MET", type: "bar", binW: 60, dec: 1, points: a.met.map((p) => [p.t, p.met]),
-      colorOf: (v) => v >= 6 ? "var(--bad)" : v >= 3 ? "var(--fair)" : "var(--met)" }],
+      colorOf: (v) => v >= 6 ? "var(--bad)" : v >= 3 ? "var(--fair)" : v >= 1.5 ? "var(--met)" : v >= 1.05 ? "var(--motion)" : "var(--line)" }],
     empty: "aucune donnée d'intensité ce jour-là" }));
   $("#c-steps", m).append(timeChart({ x0: t0, x1: t1, y0: 0, height: 130, shades, legend: false,
     series: [{ name: "Pas", type: "bar", binW: 3600, color: "var(--met)", points: (a.steps_hourly || []).map((p) => [p.t, p.steps]) }],
@@ -1051,10 +1061,12 @@ async function pageData(m, tab) {
         <td class="n">${n.resp_n ?? "—"}</td><td>${esc(n.hr_source || "—")}</td><td>${esc(n.axis_mode || "—")}</td>
         <td>${n.provisional ? `<span class="badge warn">en cours</span> ` : ""}${n.ref_excluded ? `<span class="badge">hors réf. : ${esc(n.ref_excluded)}</span>` : ""}</td></tr>`).join("")}
       </table></div></div>
-      <div class="card"><h2>Journées</h2><div class="scroll"><table class="tbl"><tr><th>Jour</th><th class="n">Anneau porté</th>
+      <div class="card"><h2>Journées <span class="right small muted">04:00 → 03:59</span></h2><div class="scroll"><table class="tbl"><tr><th>Jour</th><th class="n">Anneau porté</th>
+      <th class="n" title="ni chaleur cutanée, ni mouvement, ni activité ; ou retrait signalé par l'anneau">Non porté</th>
       <th class="n" title="minutes portées et éveillées qui ont une mesure d'intensité">Couverture activité</th>
       <th class="n">FC de jour mesurée</th><th class="n">Sur le chargeur</th><th class="n">Repos</th><th>Statut</th></tr>
       ${qd.days.map((x) => `<tr><td><a href="#/activite/${x.day}">${dayLabel(x.day)}</a></td><td class="n">${dur(x.worn_min / 60)}</td>
+        <td class="n">${x.nonworn_min ? dur(x.nonworn_min / 60) : "—"}</td>
         <td class="n"${cls(x.met_cover_pct, 90)}>${x.met_cover_pct == null ? "—" : num(x.met_cover_pct, 1) + " %"}</td>
         <td class="n">${x.hr_day_n == null ? "—" : dur(x.hr_day_n / 60)}</td><td class="n">${x.charge_min ? x.charge_min + " min" : "—"}</td>
         <td class="n">${x.rest_min ? x.rest_min + " min" : "—"}</td><td>${x.partial ? `<span class="badge">incomplète</span>` : ""}</td></tr>`).join("")}
