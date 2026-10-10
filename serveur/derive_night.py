@@ -13,7 +13,9 @@ Lit oura.db (brut open_oura, lecture seule) et écrit derived.db :
   baselines       lignes de base personnelles (nuits SAINES antérieures à la
                   dernière ; chaque nuit garde aussi les siennes : ref_json)
   readiness       contributeurs de récupération + signes de tension, par jour
-  activity_daily  activité par jour civil (MET, inactivité, calories estimées)
+  activity_daily  activité par jour civil (MET, inactivité, pas estimés NON validés,
+                  dépense totale estimée, FC de jour, couverture des données)
+  rests           repos détectés par l'anneau hors des nuits (sieste probable / repos)
   llm_briefings   résumé LLM de la dernière nuit (régénéré si ses entrées changent)
 
 Définitions alignées sur la documentation Oura quand elle existe :
@@ -50,7 +52,7 @@ from datetime import datetime, timedelta
 import oura_core as oc
 import staging
 
-VERSION = 3                      # incrémenter → recalcul de toutes les nuits
+VERSION = 4                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 # Résumé du matin : le 27B résident de la RTX 3090 (préchargé par llama-swap,
 # jamais déchargé) quand il est disponible, sinon le 4B de la P40. On ne
@@ -63,7 +65,15 @@ LLM_MODEL_FALLBACK = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")
 LLM_REASONING = os.environ.get("OURA_LLM_REASONING", "medium")   # low | medium | xhigh
 SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo) + "
                 "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
-SLEEP_NEED_H = 8.0               # milieu de la plage NSF 7–9 h (adultes)
+# Besoin de sommeil NON personnalisé : 7 h 30, choisi par l'utilisateur le 10/10/2026
+# en attendant une estimation personnelle (Oura : 90 jours d'historique, nuits
+# atypiques filtrées), prévue à la passe de conformité à ~30 nuits.
+SLEEP_NEED_H = 7.5
+# Dette de sommeil (Oura, support « Sleep Debt ») : 14 derniers jours, nuits
+# récentes pondérées davantage, au moins 5 nuits ; aucune / faible < 2 h /
+# modérée 2–5 h / élevée > 5 h.
+SLEEP_DEBT_DAYS = 14
+SLEEP_DEBT_MIN_NIGHTS = 5
 TEMP_BASE_NIGHTS = 30
 REF_NIGHTS = 60
 BASE_RELIABLE_N = 14
@@ -224,7 +234,8 @@ def compute_night(con, axis, night, charging):
         vals = (oc.jget(dj) or {}).get("acm_mad") or []
         if vals:
             mev.append((rt, max(vals)))
-    beats = oc.clean_beats(oc.load_beats(con, S, E))
+    raw_beats = oc.load_beats(con, S, E)
+    beats = oc.clean_beats(raw_beats)
     stages, feats, capped = staging.stage_night(n, S, mev, beats)
     sm = staging.summarize(stages, feats["motion"])
 
@@ -238,6 +249,7 @@ def compute_night(con, axis, night, charging):
     sleep_bins = [b for b in bins if onset_ds <= b[0] < end_ds]
     hrs = [(c, h) for c, h, _ in sleep_bins if h is not None]
     rms = [x for _, _, x in sleep_bins if x is not None]
+    bins_ok = 100.0 * len(hrs) / len(sleep_bins) if sleep_bins else None
     hr_source = "anneau (hrv_event)"
     if len(hrs) < 6:               # repli : FC 5 min depuis les battements
         hr_source = "battements (tag 96)"
@@ -357,6 +369,9 @@ def compute_night(con, axis, night, charging):
         "recovery_index": r(recovery_h, 2),
         "resp_rate": r(resp_rate, 1),
         "resp_n": len(resp),
+        "beats_kept_pct": r(100.0 * len(beats) / len(raw_beats), 1) if raw_beats else None,
+        "lead_min": feats["lead"] * staging.EPOCH_DS / 600,
+        "hr_bins_pct": r(bins_ok, 1),
         "temp_mean": r(temp_mean, 2),
         "temp_dev": None, "temp_n": 0, "temp_status": None,
         "movement": round(sm["restless"] / 60, 1),
@@ -425,6 +440,7 @@ SLEEP_COLS = [
     ("end_unix", "INTEGER"), ("staging_source", "TEXT"), ("subscores", "TEXT"),
     ("score_source", "TEXT"), ("axis_mode", "TEXT"), ("version", "INTEGER"),
     ("provisional", "INTEGER"), ("ref_json", "TEXT"), ("ref_excluded", "TEXT"),
+    ("beats_kept_pct", "REAL"), ("lead_min", "REAL"), ("hr_bins_pct", "REAL"),
     ("input_hash", "TEXT"), ("ts", "INTEGER"),
 ]
 
@@ -457,13 +473,19 @@ def ensure_schema(con):
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, kind TEXT NOT NULL,
             note TEXT, created_unix INTEGER);
+        CREATE TABLE IF NOT EXISTS rests (
+            start_unix INTEGER PRIMARY KEY, end_unix INTEGER, day TEXT, minutes REAL,
+            kind TEXT, hr_median REAL, move_pct REAL, ts INTEGER);
         CREATE TABLE IF NOT EXISTS user_profile (
             id INTEGER PRIMARY KEY CHECK (id=1), age_years INTEGER, height_cm INTEGER,
             weight_kg REAL, sex TEXT, updated_unix INTEGER);
     """)
     for tab, col, typ in (("llm_briefings", "input_hash", "TEXT"), ("llm_briefings", "checked", "INTEGER"),
                           ("baselines", "median", "REAL"),
-                          ("baselines", "n", "INTEGER")):
+                          ("baselines", "n", "INTEGER"),
+                          ("readiness", "sleep_debt_h", "REAL"), ("readiness", "sleep_debt_n", "INTEGER"),
+                          ("readiness", "sleep_need_h", "REAL"),
+                          *(("activity_daily", c, t) for c, t in ACTIVITY_EXTRA_COLS)):
         if col not in {x[1] for x in con.execute(f"PRAGMA table_info({tab})")}:
             con.execute(f"ALTER TABLE {tab} ADD COLUMN {col} {typ}")
 
@@ -579,6 +601,24 @@ def update_baselines(der, nights, now):
 
 # ---------------------------------------------------------------- récupération
 
+def sleep_debt(i, nights):
+    """Dette de sommeil (Oura, « Sleep Debt ») : manque de sommeil des 14 derniers
+    jours par rapport au besoin, les nuits récentes pesant davantage (poids 1,5
+    pour la nuit du jour à 0,5 il y a 13 jours) ; un surplus rembourse la dette,
+    qui ne descend pas sous 0. Nuits non enregistrées ignorées. → (heures | None,
+    nombre de nuits) ; None avant 5 nuits sur la fenêtre."""
+    d_i = datetime.strptime(nights[i]["night"], "%Y-%m-%d")
+    acc, k = 0.0, 0
+    for p in nights[max(0, i - 3 * SLEEP_DEBT_DAYS):i + 1]:
+        age = (d_i - datetime.strptime(p["night"], "%Y-%m-%d")).days
+        if 0 <= age < SLEEP_DEBT_DAYS and p.get("total") is not None:
+            acc += (1.5 - age / (SLEEP_DEBT_DAYS - 1)) * (SLEEP_NEED_H - p["total"])
+            k += 1
+    if k < SLEEP_DEBT_MIN_NIGHTS:
+        return None, k
+    return round(max(0.0, acc), 2), k
+
+
 def readiness_for(i, nights, activity, ref=None):
     """Contributeurs de type Readiness (Oura) pour le jour de la nuit i.
     Chaque contributeur 0–100, None si données insuffisantes."""
@@ -684,13 +724,26 @@ def update_readiness(der, nights, activity, now):
     for i, n in enumerate(nights):
         score, contrib, nb = readiness_for(i, nights, activity, n.get("_ref"))
         tension = n.get("_tension") or tension_for(i, nights, n.get("_ref"))
+        debt, debt_n = sleep_debt(i, nights)
         der.execute("INSERT OR REPLACE INTO readiness (day, score, contributors, tension, n_base,"
-                    " provisional, ts) VALUES (?,?,?,?,?,?,?)",
+                    " provisional, ts, sleep_debt_h, sleep_debt_n, sleep_need_h) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (n["night"], score, json.dumps(contrib, ensure_ascii=False),
-                     json.dumps(tension, ensure_ascii=False), nb, int(nb < BASE_RELIABLE_N), now))
+                     json.dumps(tension, ensure_ascii=False), nb, int(nb < BASE_RELIABLE_N), now,
+                     debt, debt_n, SLEEP_NEED_H))
 
 
 # ---------------------------------------------------------------- activité
+
+# Colonnes ajoutées à activity_daily (lot B) : pas (estimation non validée),
+# dépense, FC de jour, qualité des données du jour.
+ACTIVITY_EXTRA_COLS = (("steps", "INTEGER"), ("bmr_kcal", "REAL"), ("total_kcal", "REAL"),
+                       ("hr_day_n", "INTEGER"), ("hr_day_rest", "REAL"), ("hr_day_mean", "REAL"),
+                       ("hr_day_max", "REAL"), ("met_cover_pct", "REAL"), ("charge_min", "INTEGER"),
+                       ("rest_min", "INTEGER"))
+ACTIVITY_COLS = ("worn_min", "sleep_min", "inactive_min", "low_min", "medium_min", "high_min",
+                 "met_min_mh", "sedentary_bouts", "active_kcal", "easy_day", "partial",
+                 *(c for c, _ in ACTIVITY_EXTRA_COLS))
+
 
 def profile_weight(der, con):
     row = der.execute("SELECT weight_kg FROM user_profile WHERE id=1").fetchone()
@@ -700,6 +753,12 @@ def profile_weight(der, con):
                      (oc.T_USER_INFO,)).fetchone()
     w = (oc.jget(ui[0]) or {}).get("weight_kg") if ui else None
     return (float(w), "anneau") if w else (70.0, "défaut")
+
+
+def profile_bmr(der):
+    """Métabolisme de base du profil saisi dans le portail (None s'il est incomplet)."""
+    row = der.execute("SELECT age_years, height_cm, weight_kg, sex FROM user_profile WHERE id=1").fetchone()
+    return oc.bmr_kcal(*row) if row else None
 
 
 def worn_minutes(con, axis, t0, t1, charging):
@@ -722,13 +781,32 @@ def worn_minutes(con, axis, t0, t1, charging):
     return hot
 
 
-def compute_activity_day(con, axis, day, sleep_windows, charging, weight, now=None):
+def pctl(vals, p):
+    """Percentile p (0–100) par interpolation linéaire ; vals triées."""
+    if not vals:
+        return None
+    k = (len(vals) - 1) * p / 100.0
+    i = int(k)
+    return vals[i] + (vals[min(i + 1, len(vals) - 1)] - vals[i]) * (k - i)
+
+
+def overlap_min(windows, t0, t1):
+    return sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in windows) / 60.0
+
+
+def compute_activity_day(con, axis, day, sleep_windows, charging, weight, now=None, bmr=None,
+                         rest_windows=(), charge_windows=()):
     now = time.time() if now is None else now
     t0 = datetime.strptime(day, "%Y-%m-%d").timestamp()
     t1 = t0 + 86400
-    mets = oc.met_minutes(con, axis, t0, t1)
+    am = oc.activity_minutes(con, axis, t0, t1)
+    mets = {m: d["met"] for m, d in am.items()}
+    steps = sum(d["steps"] for d in am.values())
     worn = worn_minutes(con, axis, t0, t1, charging)
-    sleep = {m for m in mets if any(a <= m < b for a, b in sleep_windows)}
+
+    def in_sleep(m):
+        return any(a <= m < b for a, b in sleep_windows)
+    sleep = {m for m in mets if in_sleep(m)}
     awake = sorted(m for m in mets if m in worn and m not in sleep)
     inactive = [m for m in awake if mets[m] < 1.5]
     low = sum(1 for m in awake if 1.5 <= mets[m] < 3)
@@ -748,11 +826,34 @@ def compute_activity_day(con, axis, day, sleep_windows, charging, weight, now=No
         last = m
     if run > 50:
         bouts += 1
+
+    # FC de jour (tag 128) hors sommeil et repos : moyenne, « FC de repos de
+    # jour » = 10e percentile des minutes calmes (MET connu < 1,5), maximum =
+    # 99e percentile (une minute isolée peut être un artefact)
+    hr = {m: v for m, v in oc.day_hr_minutes(con, axis, t0, t1).items() if not in_sleep(m)}
+    vals = sorted(hr.values())
+    calm = sorted(v for m, v in hr.items() if mets.get(m) is not None and mets[m] < 1.5)
+
+    # couverture : part des minutes portées et éveillées qui ont une mesure d'intensité
+    worn_awake = sum(1 for m in worn if t0 <= m < t1 and not in_sleep(m))
+    end = min(t1, now)
+    frac = max(0.0, min(1.0, (end - t0) / 86400))
+    bmr_day = bmr * frac if bmr else None
     return {"day": day, "worn_min": len([m for m in mets if m in worn]), "sleep_min": len(sleep),
             "inactive_min": len(inactive), "low_min": low, "medium_min": med, "high_min": high,
             "met_min_mh": round(met_mh, 1), "sedentary_bouts": bouts, "active_kcal": round(kcal),
             "easy_day": int(high <= 15 and med + high <= 85),
-            "partial": int(len(awake) < 600 or t1 > now)}
+            "partial": int(len(awake) < 600 or t1 > now),
+            "steps": int(round(steps)),
+            "bmr_kcal": round(bmr_day) if bmr_day else None,
+            "total_kcal": round(bmr_day + kcal) if bmr_day else None,
+            "hr_day_n": len(vals),
+            "hr_day_mean": r(statistics.fmean(vals), 1) if len(vals) >= 30 else None,
+            "hr_day_rest": r(pctl(calm, 10), 1) if len(calm) >= 20 else None,
+            "hr_day_max": r(pctl(vals, 99), 1) if len(vals) >= 30 else None,
+            "met_cover_pct": r(100.0 * len(awake) / worn_awake, 1) if worn_awake else None,
+            "charge_min": round(overlap_min(charge_windows, t0, end)),
+            "rest_min": round(overlap_min(rest_windows, t0, end))}
 
 
 def activity_contributors(day, activity):
@@ -781,7 +882,7 @@ def activity_contributors(day, activity):
     return (round(statistics.fmean(sc)) if len(sc) >= 5 else None), c
 
 
-def update_activity(con, der, axis, nights_raw, charging, recompute_all, now):
+def update_activity(con, der, axis, nights_raw, charging, recompute_all, now, rests=()):
     known = {x[0]: x[1] for x in der.execute("SELECT day, partial FROM activity_daily")}
     first = con.execute("SELECT MIN(captured_unix) FROM events WHERE tag=?", (oc.T_ACTIVITY,)).fetchone()[0]
     if not first:
@@ -789,18 +890,20 @@ def update_activity(con, der, axis, nights_raw, charging, recompute_all, now):
     d = datetime.fromtimestamp(first).date()
     today = datetime.fromtimestamp(now).date()
     weight, _ = profile_weight(der, con)
+    bmr = profile_bmr(der)
     windows = [(n["start_unix"], n["end_unix"]) for n in nights_raw]
     windows += oc.short_rest_periods(con, axis)
+    rest_w = [(p["start_unix"], p["end_unix"]) for p in rests]
+    charge_w = [(axis(a), axis(b)) for a, b in charging]
+    charge_w = [(a, b) for a, b in charge_w if a is not None and b is not None]
+    cols = ("day", *ACTIVITY_COLS, "ts")
     while d <= today:
         day = d.strftime("%Y-%m-%d")
         if recompute_all or day not in known or known[day] or (today - d).days <= 1:
-            a = compute_activity_day(con, axis, day, windows, charging, weight, now)
-            der.execute("INSERT OR REPLACE INTO activity_daily (day, worn_min, sleep_min, inactive_min,"
-                        " low_min, medium_min, high_min, met_min_mh, sedentary_bouts, active_kcal, easy_day,"
-                        " partial, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (day, a["worn_min"], a["sleep_min"], a["inactive_min"], a["low_min"], a["medium_min"],
-                         a["high_min"], a["met_min_mh"], a["sedentary_bouts"], a["active_kcal"],
-                         a["easy_day"], a["partial"], now))
+            a = compute_activity_day(con, axis, day, windows, charging, weight, now, bmr, rest_w, charge_w)
+            a["ts"] = now
+            der.execute("INSERT OR REPLACE INTO activity_daily (%s) VALUES (%s)"
+                        % (", ".join(cols), ", ".join("?" * len(cols))), [a.get(c) for c in cols])
         d += timedelta(days=1)
     der.row_factory = sqlite3.Row
     act = {x["day"]: dict(x) for x in der.execute("SELECT * FROM activity_daily")}
@@ -816,6 +919,45 @@ def update_activity(con, der, axis, nights_raw, charging, recompute_all, now):
                     (score, json.dumps(contrib, ensure_ascii=False), day))
         act[day]["score"], act[day]["contributors"] = score, contrib
     return act
+
+
+# ---------------------------------------------------------------- repos et siestes
+
+NAP_MIN_MIN = 15                 # Oura : siestes de 15 min à 3 h
+NAP_MAX_MOVE_PCT = 20            # part maximale d'epochs à mouvement franc
+NAP_HR_MARGIN = 5                # FC médiane ≤ FC moyenne de sommeil habituelle + 5 bpm
+
+
+def update_rests(con, der, nights_raw, nights, rests, now):
+    """Repos détectés par l'anneau hors des nuits (bedtime_period < 3 h).
+    « sieste probable » si ≥ 15 min, peu de mouvement et une FC proche de celle
+    du sommeil (référence : FC moyenne des nuits saines) ; « début de nuit » si
+    la période se termine moins de 30 min avant une nuit ; sinon « repos »
+    (allongé, éveillé : FC diurne). Estimation : pas de staging sur ces périodes,
+    trop courtes pour normaliser les caractéristiques."""
+    der.execute("DELETE FROM rests")
+    ref = json.loads((nights[-1].get("ref_json") if nights else None) or "{}").get("hr_mean")
+    for p in rests:
+        s, e = p["start_ds"], p["end_ds"]
+        hr = [60000.0 / x for _, x in oc.clean_beats(oc.load_beats(con, s, e))]
+        mot = [max((oc.jget(dj) or {}).get("acm_mad") or [0.0])
+               for dj, in con.execute("SELECT decoded_json FROM events WHERE tag=? AND ring_timestamp>=?"
+                                      " AND ring_timestamp<?", (oc.T_ACM, s, e))]
+        move = 100.0 * sum(1 for m in mot if m > staging.MOTION_AWAKE) / len(mot) if mot else None
+        hr_med = statistics.median(hr) if len(hr) >= 60 else None
+        minutes = (p["end_unix"] - p["start_unix"]) / 60
+        if any(0 <= n["start_unix"] - p["end_unix"] <= 1800 for n in nights_raw):
+            kind = "début de nuit"
+        elif (minutes >= NAP_MIN_MIN and hr_med is not None and ref and move is not None
+              and move <= NAP_MAX_MOVE_PCT and hr_med <= ref["mean"] + NAP_HR_MARGIN):
+            kind = "sieste probable"
+        else:
+            kind = "repos"
+        der.execute("INSERT OR REPLACE INTO rests (start_unix, end_unix, day, minutes, kind, hr_median,"
+                    " move_pct, ts) VALUES (?,?,?,?,?,?,?,?)",
+                    (int(p["start_unix"]), int(p["end_unix"]),
+                     datetime.fromtimestamp(p["start_unix"]).strftime("%Y-%m-%d"), round(minutes, 1),
+                     kind, r(hr_med, 1), r(move, 1), now))
 
 
 # ---------------------------------------------------------------- briefing LLM
@@ -897,7 +1039,8 @@ def briefing_context(der, night, days=14):
     nights = upto[-days:]
     if not nights:
         return json.dumps({})
-    rd = der.execute("SELECT score, contributors, tension FROM readiness WHERE day=?", (night,)).fetchone()
+    rd = der.execute("SELECT score, contributors, tension, sleep_debt_h, sleep_need_h FROM readiness"
+                     " WHERE day=?", (night,)).fetchone()
     rec = None
     if rd:
         contrib = json.loads(rd[1] or "{}")
@@ -909,6 +1052,9 @@ def briefing_context(der, night, days=14):
                    "reference_provisoire": tension.get("provisional"),
                    "ecarts": [{"mesure": x["label"], "valeur": x["value"], "ecart": x["delta"], "unite": x["unit"]}
                               for x in tension.get("signals", [])]}}
+        if rd[3] is not None:
+            rec["dette_de_sommeil_14j"] = _hmin(rd[3])
+            rec["besoin_de_sommeil_retenu"] = _hmin(rd[4] or SLEEP_NEED_H) + " (non personnalisé)"
     tags = [dict(zip(("jour", "type", "note"), t)) for t in der.execute(
         "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
         ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
@@ -1133,8 +1279,10 @@ def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
     nights = nights_table(der)
     update_references(der, nights)
     update_baselines(der, nights, now)
-    activity = update_activity(con, der, axis, nights_raw, charging, recompute_all, now)
+    rests = oc.rest_periods(con, axis, nights_raw)
+    activity = update_activity(con, der, axis, nights_raw, charging, recompute_all, now, rests)
     update_readiness(der, nights, activity, now)
+    update_rests(con, der, nights_raw, nights, rests, now)
     der.commit()
 
     if briefing and nights:

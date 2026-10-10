@@ -574,9 +574,17 @@ def resp_rate_windows(clean, s_ds, e_ds, win_s=300, min_cover=0.8):
 
 # ---------------------------------------------------------------- activité
 
-def met_minutes(con, axis, t0, t1):
-    """Bins MET d'une minute entre t0 et t1 (unix), alignés sur la fin de
-    l'événement : {minute_unix: met}."""
+def activity_minutes(con, axis, t0, t1):
+    """Bins d'une minute d'activity_information (tag 80) entre t0 et t1 (unix),
+    alignés sur la FIN de l'événement : {minute_unix: {"met": float, "steps": float}}.
+
+    Pas : l'octet d'en-tête de l'événement (décodé « state » par open_oura) suit
+    l'intensité minute par minute (r = 0,955 avec le MET moyen, 192 valeurs
+    distinctes, 0 au repos ; open_oura data-recovery-map : « MET-level bins +
+    step counts »). C'est très probablement le nombre de pas de la fenêtre :
+    HYPOTHÈSE non validée par une marche comptée, affichée comme telle. Il est
+    réparti sur les minutes de l'événement au prorata de (MET − 1)+, ou
+    uniformément si toutes sont au repos."""
     out = {}
     s_ds = axis.to_ds(t0 - 3600)
     e_ds = axis.to_ds(t1 + 3600)
@@ -588,10 +596,132 @@ def met_minutes(con, axis, t0, t1):
         met = j.get("met") or []
         n = len(met)
         end = axis(rt, cap)
-        if end is None:
+        if end is None or not n:
             continue
+        steps = j.get("state")
+        steps = float(steps) if isinstance(steps, (int, float)) and 0 <= steps <= 255 else 0.0
+        w = [max(0.0, (v or 0.0) - 1.0) for v in met]
+        tot = sum(w)
         for i, v in enumerate(met):
             t = end - (n - i) * MET_BIN_S
             if t0 <= t < t1 and v is not None:
-                out[int(t // 60) * 60] = float(v)
+                share = steps * (w[i] / tot if tot > 0 else 1.0 / n)
+                out[int(t // 60) * 60] = {"met": float(v), "steps": share}
     return out
+
+
+def met_minutes(con, axis, t0, t1):
+    """Bins MET d'une minute entre t0 et t1 (unix), alignés sur la fin de
+    l'événement : {minute_unix: met}."""
+    return {t: d["met"] for t, d in activity_minutes(con, axis, t0, t1).items()}
+
+
+def bmr_kcal(age, height_cm, weight_kg, sex):
+    """Métabolisme de base (Mifflin-St Jeor, 1990), kcal par jour ; None si le
+    profil est incomplet. Sexe non précisé : moyenne des deux constantes."""
+    if not (age and height_cm and weight_kg):
+        return None
+    base = 10 * float(weight_kg) + 6.25 * float(height_cm) - 5 * float(age)
+    return base + {"male": 5.0, "female": -161.0}.get(sex, -78.0)
+
+
+def day_hr_minutes(con, axis, t0, t1, min_beats=5):
+    """FC de jour : mesures de l'anneau à la LED verte (tag 128, suspendues
+    pendant le sommeil). Médiane par minute des FC de bonne qualité (l'anneau ne
+    renseigne hr_bpm que pour les battements de qualité 1), si la minute en
+    compte au moins min_beats : {minute_unix: bpm}."""
+    s_ds, e_ds = axis.to_ds(t0 - 600), axis.to_ds(t1 + 600)
+    acc = {}
+    for rt, cap, dj in rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                 " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?",
+                            (T_GREEN_IBI, s_ds or 0, e_ds or 1 << 62)):
+        t = axis(rt, cap)
+        if t is None or not t0 <= t < t1:
+            continue
+        hrs = [b for b in ((jget(dj) or {}).get("hr_bpm") or []) if HR_MIN_BPM <= b <= HR_MAX_BPM]
+        if hrs:
+            acc.setdefault(int(t // 60) * 60, []).extend(hrs)
+    return {m: statistics.median(v) for m, v in sorted(acc.items()) if len(v) >= min_beats}
+
+
+def rest_periods(con, axis, nights, max_h=3.0):
+    """Périodes de repos détectées par l'anneau hors des nuits : bedtime_period
+    de moins de 3 h, révisions dédoublonnées (même début à 2 min près → la plus
+    récente), périodes chevauchant une nuit retirées (ce sont des révisions
+    précoces de la nuit). → [{"start_ds", "end_ds", "start_unix", "end_unix"}]."""
+    ded = {}
+    for rt, dj in rows(con, "SELECT ring_timestamp, decoded_json FROM events"
+                            " WHERE tag=? ORDER BY ring_timestamp", (T_BEDTIME,)):
+        j = jget(dj) or {}
+        s, e = j.get("bedtime_start_ds"), j.get("bedtime_end_ds")
+        if not (s and e and 0 < e - s < max_h * 36000):
+            continue
+        k = next((k for k in ded if abs(k - s) <= 1200), s)
+        if k not in ded or rt >= ded[k][2]:
+            ded[k] = (s, e, rt)
+    out = []
+    for s, e, _ in sorted(ded.values()):
+        if any(s < n["end_ds"] and e > n["start_ds"] for n in nights):
+            continue
+        su, eu = axis(s), axis(e)
+        if su and eu and eu > su:
+            out.append({"start_ds": s, "end_ds": e, "start_unix": su, "end_unix": eu})
+    return out
+
+
+# ---------------------------------------------------------------- batterie
+
+def battery_points(con, axis, since_unix=None):
+    """Historique du niveau de batterie : [(t, pct, mv | None)] trié.
+    Sources : debug_data « battery_level_changed » (0x24 : % et mV) et traces
+    firmware « batt: N » (debug_event, plus denses, % seulement)."""
+    pts = []
+    s_ds = (axis.to_ds(since_unix - 3600) or 0) if since_unix is not None else 0
+    for rt, cap, dj in rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                 " WHERE tag=? AND ring_timestamp>=? AND decoded_json LIKE '%battery_level_changed%'",
+                            (T_DEBUG_DATA, s_ds)):
+        j = jget(dj) or {}
+        t, p = axis(rt, cap), j.get("battery_pct")
+        if t is not None and isinstance(p, (int, float)) and 0 <= p <= 100:
+            pts.append((t, int(p), j.get("voltage_mv")))
+    for rt, cap, dj in rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                 " WHERE tag=? AND ring_timestamp>=? AND decoded_json LIKE '%batt:%'",
+                            (T_DEBUG_EVENT, s_ds)):
+        a = (jget(dj) or {}).get("ascii") or ""
+        try:
+            p = int(a.split("batt:")[1].split()[0])
+        except (IndexError, ValueError):
+            continue
+        t = axis(rt, cap)
+        if t is not None and 0 <= p <= 100:
+            pts.append((t, p, None))
+    pts.sort(key=lambda x: x[0])
+    if since_unix is not None:
+        pts = [x for x in pts if x[0] >= since_unix]
+    return pts
+
+
+def discharge_rate(points, charges, min_span_s=6 * 3600):
+    """Pente de décharge (%/h, positive) par régression linéaire sur chaque
+    segment entre deux charges (30 min après la fin de charge, le temps que la
+    mesure se stabilise). → (pente du segment en cours ou None, pente typique
+    = moyenne des segments pondérée par leur durée, ou None)."""
+    if not points:
+        return None, None
+    edges = [points[0][0]] + [x for c in charges for x in c] + [points[-1][0] + 1]
+    rates = []
+    for a, b in zip(edges[0::2], edges[1::2]):
+        seg = [(t, p) for t, p, _ in points if a + 1800 <= t <= b]
+        if len(seg) < 5 or seg[-1][0] - seg[0][0] < min_span_s:
+            rates.append(None)
+            continue
+        n = len(seg)
+        mt = sum(t for t, _ in seg) / n
+        mp = sum(p for _, p in seg) / n
+        den = sum((t - mt) ** 2 for t, _ in seg)
+        slope = sum((t - mt) * (p - mp) for t, p in seg) / den if den else 0.0
+        rates.append((-slope * 3600, seg[-1][0] - seg[0][0]))
+    ok = [r for r in rates if r and r[0] > 0]
+    typical = sum(r * w for r, w in ok) / sum(w for _, w in ok) if ok else None
+    current = rates[-1][0] if rates and rates[-1] and rates[-1][0] > 0 else None
+    return current, typical

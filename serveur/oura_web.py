@@ -192,7 +192,9 @@ def readiness_row(r):
         return None
     return {"day": r["day"], "score": r["score"], "rating": oc.rating(r["score"]),
             "contributors": jparse(r["contributors"], {}), "tension": jparse(r["tension"], {}),
-            "n_base": r["n_base"], "provisional": bool(r["provisional"])}
+            "n_base": r["n_base"], "provisional": bool(r["provisional"]),
+            "sleep_debt_h": r.get("sleep_debt_h"), "sleep_debt_n": r.get("sleep_debt_n"),
+            "sleep_need_h": r.get("sleep_need_h")}
 
 
 def activity_row(r):
@@ -227,11 +229,40 @@ def latest_battery(c):
     return {"pct": j.get("battery_pct"), "mv": j.get("voltage_mv"), "rt": r["rt"], "cap": r["cap"]}
 
 
+def battery_summary(c, ax, days=30, charging=None):
+    """Historique (%), charges et autonomie : pente de décharge du segment en cours
+    (régression, ≥ 6 h depuis la dernière charge) ou, à défaut, pente typique des
+    segments précédents ; heures restantes jusqu'à 0 % et jusqu'à 20 %."""
+    now = time.time()
+    since = now - days * 86400
+    pts = oc.battery_points(c, ax, since)
+    charging = oc.charging_intervals_ds(c) if charging is None else charging
+    ch = [(ax(a), ax(b)) for a, b in charging]
+    ch = [(a, b) for a, b in ch if a and b and b >= since - 86400]
+    cur, typ = oc.discharge_rate(pts, ch)
+    rate = cur or typ
+    last = pts[-1] if pts else None
+    out = {"points": [{"t": t, "pct": p, "mv": mv} for t, p, mv in pts], "charges": ch,
+           "rate_pct_h": round(rate, 3) if rate else None, "rate_source": "en cours" if cur else "typique",
+           "typical_rate_pct_h": round(typ, 3) if typ else None,
+           "full_days": round(100 / rate / 24, 1) if rate else None,
+           "pct": last[1] if last else None, "t": last[0] if last else None,
+           "remaining_h": None, "to_20_h": None}
+    if last and rate:
+        elapsed = max(0.0, now - last[0]) / 3600
+        pct_now = max(0.0, last[1] - rate * elapsed)
+        out["remaining_h"] = round(pct_now / rate, 1)
+        out["to_20_h"] = round(max(0.0, pct_now - 20) / rate, 1)
+    return out
+
+
 def ring_status(c, ax):
     dev = one(c, "SELECT serial, firmware, api_version FROM device ORDER BY updated_unix DESC LIMIT 1")
     bat = latest_battery(c)
     if bat:
         bat["t"] = ax(bat.pop("rt"), bat.pop("cap"))
+        bs = battery_summary(c, ax, days=12)
+        bat.update({k: bs[k] for k in ("rate_pct_h", "rate_source", "remaining_h", "to_20_h", "full_days")})
     st = latest_event(c, [oc.T_STATE, oc.T_WEAR])
     state = None
     if st:
@@ -376,13 +407,20 @@ def trends(days: int = Query(90, ge=7, le=365)):
         raise HTTPException(503, "derived.db absent")
     rows = safe_q(d, "SELECT night, score, total, deep, rem, light, awake, efficiency, latency, waso,"
                      " timing, hr_min, hr_mean, hrv_rmssd, recovery_index, resp_rate, temp_mean, temp_dev,"
-                     " temp_status, restfulness FROM sleep_scores ORDER BY night DESC LIMIT ?", (days,))
-    rd = {r["day"]: r["score"] for r in safe_q(d, "SELECT day, score FROM readiness")}
-    act = safe_q(d, "SELECT day, met_min_mh, inactive_min, active_kcal, score, partial FROM activity_daily"
-                    " ORDER BY day DESC LIMIT ?", (days,))
+                     " temp_status, restfulness, start_unix, stop_unix, onset_unix, end_unix, provisional,"
+                     " ref_excluded FROM sleep_scores ORDER BY night DESC LIMIT ?", (days,))
+    rd = {r["day"]: r for r in safe_q(d, "SELECT day, score, sleep_debt_h FROM readiness")}
+    act = safe_q(d, "SELECT day, met_min_mh, inactive_min, active_kcal, total_kcal, steps, hr_day_rest,"
+                    " hr_day_mean, score, partial FROM activity_daily ORDER BY day DESC LIMIT ?", (days,))
     for r in rows:
-        r["readiness"] = rd.get(r["night"])
-    out = {"nights": list(reversed(rows)), "activity": list(reversed(act)), "baselines": baselines(d)}
+        x = rd.get(r["night"]) or {}
+        r["readiness"], r["sleep_debt_h"] = x.get("score"), x.get("sleep_debt_h")
+    since = rows[-1]["night"] if rows else "9999"
+    tags_q = safe_q(d, "SELECT day, kind, note FROM tags WHERE day>=? ORDER BY day",
+                    ((datetime.strptime(since, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+                     if rows else since,))
+    out = {"nights": list(reversed(rows)), "activity": list(reversed(act)), "baselines": baselines(d),
+           "tags": tags_q, "tag_kinds": TAG_KINDS}
     d.close()
     return out
 
@@ -412,20 +450,16 @@ def activity(date: str | None = Query(None, pattern=DATE_RE)):
     t0 = d0.timestamp()
     t1 = t0 + 86400
     day = d0.strftime("%Y-%m-%d")
-    mets = oc.met_minutes(c, ax, t0, t1)
-    met_list = [{"t": t, "met": v} for t, v in sorted(mets.items())]
+    am = oc.activity_minutes(c, ax, t0, t1)
+    met_list = [{"t": t, "met": v["met"], "steps": round(v["steps"], 1)} for t, v in sorted(am.items())]
+    steps_h = {}
+    for p in met_list:
+        k = int(p["t"] // 3600) * 3600
+        steps_h[k] = steps_h.get(k, 0.0) + p["steps"]
 
-    # FC diurne : mesures de 1 min de l'anneau (tag 128, battements de bonne qualité)
-    hr = []
+    # FC de jour : médiane par minute des mesures de l'anneau (tag 128, LED verte)
     s_ds, e_ds = ax.to_ds(t0 - 600), ax.to_ds(t1 + 600)
-    for r in q(c, "SELECT ring_timestamp rt, captured_unix cap, decoded_json dj FROM events"
-                  " WHERE tag=? AND ring_timestamp>=? AND ring_timestamp<?", (oc.T_GREEN_IBI, s_ds, e_ds)):
-        j = oc.jget(r["dj"]) or {}
-        beats = sorted(b for b in (j.get("hr_bpm") or []) if oc.HR_MIN_BPM <= b <= oc.HR_MAX_BPM)
-        if len(beats) >= 5:
-            t = ax(r["rt"], r["cap"])
-            if t is not None and t0 <= t < t1:
-                hr.append({"t": t, "hr": beats[len(beats) // 2]})
+    hr = [{"t": t + 30, "hr": round(v)} for t, v in oc.day_hr_minutes(c, ax, t0, t1).items()]
     # FC de nuit : bins 5 min de l'anneau
     for cds, h, _ in oc.hrv_bins(c, s_ds, e_ds):
         t = ax(cds)
@@ -467,12 +501,41 @@ def activity(date: str | None = Query(None, pattern=DATE_RE)):
     c.close()
     dd = derived()
     summary = activity_row(safe_one(dd, "SELECT * FROM activity_daily WHERE day=?", (day,))) if dd else None
-    prof = safe_one(dd, "SELECT weight_kg FROM user_profile WHERE id=1") if dd else None
+    prof = safe_one(dd, "SELECT weight_kg, age_years, height_cm, sex FROM user_profile WHERE id=1") if dd else None
+    rest_list = safe_q(dd, "SELECT start_unix, end_unix, minutes, kind, hr_median, move_pct FROM rests"
+                           " WHERE end_unix>? AND start_unix<? ORDER BY start_unix", (t0, t1)) if dd else []
     if dd:
         dd.close()
     return {"date": day, "mode": ax.mode, "met": met_list, "hr": hr, "segments": segs,
-            "sleep": sleep, "rests": rests, "charging": charging, "summary": summary,
-            "weight_kg": prof["weight_kg"] if prof else None}
+            "steps_hourly": [{"t": k, "steps": round(v)} for k, v in sorted(steps_h.items())],
+            "sleep": sleep, "rests": rests, "rest_list": rest_list, "charging": charging, "summary": summary,
+            "weight_kg": prof["weight_kg"] if prof else None,
+            "profile_complete": bool(prof and prof["age_years"] and prof["height_cm"] and prof["weight_kg"])}
+
+
+@app.get("/api/battery")
+def battery(days: int = Query(14, ge=1, le=90)):
+    c = raw()
+    ax = axis_for(c)
+    out = battery_summary(c, ax, days)
+    c.close()
+    out["since"] = time.time() - days * 86400
+    return out
+
+
+@app.get("/api/quality")
+def quality(days: int = Query(30, ge=7, le=365)):
+    """Qualité des données par nuit et par jour (couverture des signaux)."""
+    d = derived()
+    if not d:
+        raise HTTPException(503, "derived.db absent")
+    nights_q = safe_q(d, "SELECT night, provisional, axis_mode, hr_source, staging_source, ref_excluded,"
+                         " beats_kept_pct, lead_min, hr_bins_pct, resp_n, in_bed FROM sleep_scores"
+                         " ORDER BY night DESC LIMIT ?", (days,))
+    days_q = safe_q(d, "SELECT day, partial, worn_min, met_cover_pct, hr_day_n, charge_min, rest_min"
+                       " FROM activity_daily ORDER BY day DESC LIMIT ?", (days,))
+    d.close()
+    return {"nights": nights_q, "days": days_q}
 
 
 # ---------------------------------------------------------------- API : signaux bruts
@@ -681,7 +744,8 @@ CHAT_SYSTEM = (
     "collectées localement sans cloud. Tu reçois en JSON ses dernières nuits (durées, stades "
     "ESTIMÉS, FC la plus basse, FC moyenne, HRV moyen, Recovery Index, respiration expérimentale, "
     "température et écart à sa ligne de base), sa récupération (contributeurs, signes de tension), "
-    "son activité récente, son journal (tags) et les signaux des dernières 24 h.\n"
+    "son activité récente (dont des pas ESTIMÉS non validés), sa dette de sommeil, ses références "
+    "personnelles, son journal (tags), l'état de l'anneau et les dernières mesures avec leur ancienneté.\n"
     "Règles : réponds en français en vouvoyant, concis et factuel ; n'utilise QUE les chiffres du "
     "contexte (si une donnée manque, dis-le) ; n'affirme aucune cause sans appui dans les données ou "
     "le journal ; les stades de sommeil sont des estimations peu fiables ; aucun diagnostic médical "
@@ -690,27 +754,85 @@ CHAT_SYSTEM = (
 )
 
 
+def _hmin(h):
+    """Heures décimales → « 7 h 13 » (un modèle lit 7,22 h comme 7 h 22)."""
+    if h is None:
+        return None
+    m = int(round(h * 60))
+    return f"{m // 60} h {m % 60:02d}"
+
+
+def _clock(unix):
+    return datetime.fromtimestamp(unix).strftime("%d/%m %H:%M") if unix else None
+
+
+def _age(unix):
+    if not unix:
+        return None
+    m = int((time.time() - unix) // 60)
+    return f"il y a {m} min" if m < 120 else f"il y a {m // 60} h {m % 60:02d}"
+
+
+CHAT_NIGHT_KEYS = (("night", "nuit"), ("score", "score_sommeil"), ("total", "sommeil_total"),
+                   ("in_bed", "temps_au_lit"), ("deep", "profond_estime"), ("rem", "rem_estime"),
+                   ("efficiency", "efficacite_pct"), ("latency", "latence_min"), ("waso", "eveil_nocturne_min"),
+                   ("awakenings", "reveils_plus_de_5_min"), ("hr_min", "fc_la_plus_basse_bpm"),
+                   ("hr_mean", "fc_moyenne_bpm"), ("hrv_rmssd", "hrv_moyen_ms"),
+                   ("recovery_index", "indice_de_recuperation"), ("resp_rate", "respiration_par_min_experimental"),
+                   ("temp_dev", "ecart_temperature_c"), ("ref_excluded", "exclue_des_references"))
+CHAT_HOURS = ("total", "in_bed", "deep", "rem", "recovery_index")
+
+
 def chat_context():
     ctx = {}
     d = derived()
     if d:
-        keys = ("night", "score", "total", "deep", "rem", "efficiency", "latency", "waso", "awakenings",
-                "timing", "hr_min", "hr_mean", "hrv_rmssd", "recovery_index", "resp_rate",
-                "temp_mean", "temp_dev", "temp_status")
-        ctx["nuits"] = [{k: r[k] for k in keys if r.get(k) is not None}
-                        for r in reversed(safe_q(d, "SELECT * FROM sleep_scores ORDER BY night DESC LIMIT 30"))]
+        nights_ = []
+        for r in reversed(safe_q(d, "SELECT * FROM sleep_scores ORDER BY night DESC LIMIT 30")):
+            o = {name: (_hmin(r[k]) if k in CHAT_HOURS else r[k]) for k, name in CHAT_NIGHT_KEYS
+                 if r.get(k) is not None}
+            o["coucher_lever"] = f"{r.get('bedtime')}–{r.get('wake_time')}"
+            if r.get("provisional"):
+                o["nuit_en_cours"] = True
+            nights_.append(o)
+        ctx["nuits"] = nights_
+        ctx["references_personnelles"] = {
+            m: {"moyenne": round(b["mean"], 1), "ecart_type": round(b["sd"], 1), "nuits": b["n"]}
+            for m, b in baselines(d).items() if m in ("hr_min", "hr_mean", "hrv_rmssd", "resp_rate", "total")}
         rd = readiness_row(safe_one(d, "SELECT * FROM readiness ORDER BY day DESC LIMIT 1"))
         if rd:
-            ctx["recuperation"] = rd
-        ctx["activite"] = [{k: a[k] for k in ("day", "met_min_mh", "inactive_min", "active_kcal", "partial")}
-                           for a in safe_q(d, "SELECT * FROM activity_daily ORDER BY day DESC LIMIT 7")]
+            ctx["recuperation"] = {"jour": rd["day"], "score": rd["score"],
+                                   "contributeurs_sur_100": {k: v.get("score") for k, v in rd["contributors"].items()},
+                                   "signes_de_tension": rd["tension"].get("level"),
+                                   "dette_de_sommeil_14j": _hmin(rd["sleep_debt_h"]),
+                                   "besoin_de_sommeil_retenu": _hmin(rd["sleep_need_h"])}
+        ctx["activite_7j"] = [
+            {"jour": a["day"], "journee_incomplete": bool(a["partial"]), "score": a.get("score"),
+             "pas_estimes_non_valides": a.get("steps"), "effort_modere_intense_met_min": a["met_min_mh"],
+             "temps_inactif": _hmin(a["inactive_min"] / 60), "kcal_totales_estimees": a.get("total_kcal"),
+             "fc_repos_de_jour_bpm": a.get("hr_day_rest")}
+            for a in safe_q(d, "SELECT * FROM activity_daily ORDER BY day DESC LIMIT 7")]
+        ctx["repos_7j"] = [{"debut": _clock(x["start_unix"]), "minutes": x["minutes"], "type": x["kind"]}
+                           for x in safe_q(d, "SELECT * FROM rests WHERE start_unix>? ORDER BY start_unix",
+                                           (time.time() - 7 * 86400,))]
         ctx["journal"] = safe_q(d, "SELECT day, kind, note FROM tags ORDER BY day DESC LIMIT 20")
         d.close()
     try:
         c = raw()
         ax = axis_for(c)
-        ctx["anneau"] = {k: v for k, v in ring_status(c, ax).items() if k in ("battery", "state", "worn", "skin_temp")}
+        st = ring_status(c, ax)
+        live = live_signals(c, ax)
         c.close()
+        bat = st.get("battery") or {}
+        rem = bat.get("remaining_h")
+        ctx["anneau"] = {"batterie_pct": bat.get("pct"),
+                         "autonomie_restante": f"{rem / 24:.1f} jours".replace(".", ",") if rem else None,
+                         "etat": (st.get("state") or {}).get("label"), "porte": st.get("worn")}
+        ctx["dernieres_mesures"] = {
+            "fc_de_jour_bpm": {"valeur": live["hr"]["v"], "quand": _age(live["hr"]["t"])} if live.get("hr") else None,
+            "intensite_met": {"valeur": live["met"]["v"], "quand": _age(live["met"]["t"])} if live.get("met") else None,
+            "temperature_cutanee_c": ({"valeur": st["skin_temp"]["v"], "quand": _age(st["skin_temp"]["t"])}
+                                      if st.get("skin_temp") else None)}
     except HTTPException:
         pass
     return json.dumps(ctx, ensure_ascii=False, default=str)

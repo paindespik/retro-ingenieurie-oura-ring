@@ -125,7 +125,7 @@ class Ring:
         self.con.close()
 
 
-def build(path, nights=5, sick_last=False, start=None, sick=(), lead_min=0):
+def build(path, nights=5, sick_last=False, start=None, sick=(), lead_min=0, rests=()):
     """Base de `nights` nuits consécutives (la dernière éventuellement « malade »,
     ainsi que celles d'indice `sick`)."""
     start = start or datetime(2026, 9, 1, 12, 0)
@@ -143,5 +143,10 @@ def build(path, nights=5, sick_last=False, start=None, sick=(), lead_min=0):
         ill = (sick_last and i == nights - 1) or i in sick
         ring.night(bed, wake, hr_boost=15 if ill else 0, temp=36.4 if ill else 35.2,
                    rr=17 if ill else 14, lead_min=lead_min)
+    # repos de jour (bedtime_period < 3 h) : (indice du jour, heure de début, minutes)
+    for i, h, mins in rests:
+        a = (start + timedelta(days=i, hours=h - 12)).timestamp()
+        ring.ev(118, "bedtime_period", ring.rt(a + mins * 60 + 300),
+                {"bedtime_start_ds": ring.rt(a), "bedtime_end_ds": ring.rt(a + mins * 60)})
     ring.close()
     return ring

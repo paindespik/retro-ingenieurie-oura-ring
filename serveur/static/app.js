@@ -70,6 +70,33 @@ function shiftDay(d, k) { const x = new Date(d + "T12:00:00"); x.setDate(x.getDa
 const dayNoon = (d) => new Date(d + "T12:00:00").getTime() / 1000;
 
 const RATING = { optimal: "Optimal", bon: "Bon", moyen: "Moyen", attention: "À surveiller" };
+// Dette de sommeil : catégories Oura (aucune / faible < 2 h / modérée 2–5 h / élevée > 5 h)
+function debtCat(h) {
+  if (h == null) return null;
+  return h < 1 / 60 ? ["aucune", "ok"] : h < 2 ? ["faible", ""] : h <= 5 ? ["modérée", "warn"] : ["élevée", "bad"];
+}
+function debtText(r) {
+  if (!r || r.sleep_debt_h == null) return `dette de sommeil : pas encore calculable (5 nuits sur 14 jours nécessaires)`;
+  const [c] = debtCat(r.sleep_debt_h);
+  const val = r.sleep_debt_h < 1 / 60 ? "<b>aucune</b>" : `<b>${dur(r.sleep_debt_h)}</b> · ${c}`;
+  return `dette de sommeil (14 j) : ${val}
+    <span class="muted">— besoin fixé à ${dur(r.sleep_need_h)}, non personnalisé</span>`;
+}
+// moyenne glissante sur k points consécutifs disponibles (nuits ou jours)
+function rolling(points, k = 7) {
+  const P = points.filter((p) => p[1] != null);
+  return P.map((p, i) => {
+    const w = P.slice(Math.max(0, i - k + 1), i + 1).map((x) => x[1]);
+    return w.length >= Math.min(k, 4) ? [p[0], w.reduce((a, b) => a + b, 0) / w.length] : [p[0], null];
+  });
+}
+// heure d'horloge d'une nuit sur un axe continu : 18:00 → 18, 01:30 → 25,5
+function nightHour(t) {
+  if (t == null) return null;
+  const d = new Date(t * 1000), h = d.getHours() + d.getMinutes() / 60;
+  return h < 15 ? h + 24 : h;
+}
+const STEPS_BADGE = `<span class="badge warn" title="Octet des mesures d'activité très probablement égal au nombre de pas ; pas encore vérifié par une marche comptée">estimation non validée</span>`;
 const ratingOf = (s) => s == null ? null : s >= 85 ? "optimal" : s >= 70 ? "bon" : s >= 60 ? "moyen" : "attention";
 const pl = (n, w) => `${n} ${w}${Math.abs(n) > 1 ? "s" : ""}`;
 
@@ -181,6 +208,15 @@ const hideTip = () => { tipEl().hidden = true; };
 function chartWidth() {
   return Math.max(300, Math.min(1040, ($("#main").clientWidth || 800) - 34));
 }
+// Largeur d'un graphe dans une carte de grille (.grid : colonnes ≥ minCol px, écart .7rem).
+// Les graphes sont dessinés AVANT d'être insérés dans la page : sans cette largeur, un SVG
+// dessiné sur toute la page puis réduit à une colonne a des textes de 4 px.
+function gridChartWidth(minCol = 260) {
+  const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  const content = Math.min(1080, $("#main").clientWidth || 800) - 1.6 * rem, gap = 0.7 * rem;
+  const cols = Math.max(1, Math.floor((content + gap) / (Math.min(minCol, content) + gap)));
+  return Math.max(240, Math.floor((content - (cols - 1) * gap) / cols - 2 * rem - 2));
+}
 const TSTEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800, 1209600];
 function timeTicks(x0, x1, n) {
   const step = TSTEPS.find((s) => (x1 - x0) / s <= n) || 2592000;
@@ -223,7 +259,8 @@ function nearest(points, t) {
 /**
  * Graphe temporel. o = {series:[{name, color, unit, dec, type:"line"|"bar"|"dots", points:[[t,v]],
  * colorOf?, binW?, fmt?}], x0, x1, y0, y1, height, band:[lo,hi,label], shades:[{from,to,color}],
- * markers:[{t,v,label,color}], hline:{v,label}, dayAxis:boolean, empty}
+ * markers:[{t,v,label,color}], hline:{v,label}, dayAxis:boolean, empty,
+ * yFmt?: (v) => texte des graduations Y, vmarks?: [{t, label, color}] (traits verticaux, ex. journal)}
  */
 function timeChart(o) {
   const box = document.createElement("div");
@@ -231,7 +268,7 @@ function timeChart(o) {
   const series = o.series.map((s) => ({ ...s, points: (s.points || []).filter((p) => p[1] != null && !Number.isNaN(p[1])).sort((a, b) => a[0] - b[0]) }));
   const all = series.flatMap((s) => s.points);
   if (!all.length) { box.innerHTML = `<div class="muted small">${o.empty || "pas de données sur la période"}</div>`; return box; }
-  const W = chartWidth(), H = o.height || 170, L = 40, R = 10, T = 10, B = 22;
+  const W = o.width || chartWidth(), H = o.height || 170, L = 40, R = 10, T = 10, B = 22;
   let x0 = o.x0 ?? Math.min(...all.map((p) => p[0])), x1 = Math.max(o.x1 ?? Math.max(...all.map((p) => p[0])), x0 + 60);
   if (o.dayAxis) { x0 -= 43200; x1 += 43200; }        // une demi-journée de marge autour des barres
   const extra = [...(o.band ? [o.band[0], o.band[1]] : []), ...(o.hline ? [o.hline.v] : [])];
@@ -255,7 +292,7 @@ function timeChart(o) {
   g += `<g class="ax">`;
   for (const v of niceTicks(y0, y1, o.yTicks || 4)) {
     g += `<line class="grid-l" x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}"/>
-      <text x="${L - 6}" y="${Y(v) + 4}" text-anchor="end">${num(v, o.yDec ?? (Math.abs(y1 - y0) < 5 ? 1 : 0))}</text>`;
+      <text x="${L - 6}" y="${Y(v) + 4}" text-anchor="end">${o.yFmt ? o.yFmt(v) : num(v, o.yDec ?? (Math.abs(y1 - y0) < 5 ? 1 : 0))}</text>`;
   }
   const tt = o.dayAxis ? dayTicks(x0, x1, Math.max(3, Math.floor(W / 90))) : timeTicks(x0, x1, Math.max(3, Math.floor(W / 110)));
   for (const t of tt.ticks) {
@@ -265,6 +302,12 @@ function timeChart(o) {
   g += `</g>`;
   if (o.hline) {
     g += `<line x1="${L}" x2="${W - R}" y1="${Y(o.hline.v)}" y2="${Y(o.hline.v)}" stroke="var(--muted)" stroke-dasharray="4 4"/>`;
+  }
+  for (const vm of o.vmarks || []) {
+    if (vm.t < x0 || vm.t > x1) continue;
+    g += `<g><title>${esc(vm.label || "")}</title><line x1="${X(vm.t)}" x2="${X(vm.t)}" y1="${T}" y2="${H - B}"
+      stroke="${vm.color || "var(--tag)"}" stroke-width="1.5" stroke-dasharray="3 3" opacity=".8"/>
+      <circle cx="${X(vm.t)}" cy="${T + 3}" r="3.5" fill="${vm.color || "var(--tag)"}"/></g>`;
   }
   for (const s of series) {
     const P = s.points;
@@ -299,10 +342,10 @@ function timeChart(o) {
   g += `<line class="cursor" x1="0" x2="0" y1="${T}" y2="${H - B}" visibility="hidden"/></svg>`;
   box.innerHTML = g;
   const mkLeg = (o.markers || []).filter((mk) => mk.label);
-  if ((o.legend !== false && series.length > 1) || o.legend === true || mkLeg.length) {
+  if ((o.legend !== false && series.length > 1) || o.legend === true || mkLeg.length || (o.vmarks || []).length) {
     box.insertAdjacentHTML("beforeend", `<div class="legend">${series.filter((s) => s.name).map((s) =>
       `<span style="--c:${s.color}"><i></i>${esc(s.name)}</span>`).join("")}${mkLeg.map((mk) =>
-      `<span>◯ ${esc(mk.label)}</span>`).join("")}${o.band && o.band[2] ? `<span style="--c:var(--accent)"><i style="opacity:.35;height:.6rem"></i>${esc(o.band[2])}</span>` : ""}</div>`);
+      `<span>◯ ${esc(mk.label)}</span>`).join("")}${(o.vmarks || []).length ? `<span style="--c:var(--tag)"><i style="height:.6rem;width:2px"></i>journal</span>` : ""}${o.band && o.band[2] ? `<span style="--c:var(--accent)"><i style="opacity:.35;height:.6rem"></i>${esc(o.band[2])}</span>` : ""}</div>`);
   }
   const svg = box.querySelector("svg"), cur = box.querySelector(".cursor");
   const move = (ev) => {
@@ -336,7 +379,7 @@ function hypnogram(stg, o = {}) {
   box.className = "chart hyp";
   if (!stg || !stg.stages || !stg.start) { box.innerHTML = `<div class="muted small">pas d'hypnogramme</div>`; return box; }
   const n = stg.stages.length, ep = stg.epoch_s || 30, x0 = stg.start, x1 = stg.start + n * ep;
-  const W = chartWidth(), H = o.height || 170, L = o.compact ? 8 : 58, R = 10, T = 6, B = 20;
+  const W = o.width || chartWidth(), H = o.height || 170, L = o.compact ? 8 : 58, R = 10, T = 6, B = 20;
   const rowH = (H - T - B) / 4;
   const X = (t) => L + ((t - x0) / (x1 - x0)) * (W - L - R);
   const runs = [];
@@ -432,7 +475,7 @@ function readyContribValue(k, c) {
     case "temperature": return `${signed(c.value, 2)} °C · référence ${c.status}`;
     case "recovery_index": return `${dur(c.value)} de sommeil après la FC la plus basse`;
     case "sleep": return dur(c.value);
-    case "sleep_balance": return `moyenne pondérée ${dur(c.value)} / besoin ${num(c.need)} h`;
+    case "sleep_balance": return `moyenne pondérée ${dur(c.value)} / besoin ${dur(c.need)} (non personnalisé)`;
     case "sleep_regularity": return `écart-type du milieu de sommeil ${c.value} min`;
     case "previous_day_activity": return `${num(c.value)} MET-min · ${dur(c.inactive_min / 60)} inactif`;
     default: return "";
@@ -478,7 +521,8 @@ async function pageToday(m) {
   html += `<div class="grid">
     <div class="card"><h2>Nuit dernière ${n ? `<a class="right small" href="#/sommeil/${n.night}">détail ›</a>` : ""}</h2>
       <div id="mini-hyp"></div>
-      ${n ? `<div class="small muted">${n.bedtime} → ${n.wake_time} · ${dur(n.total)} de sommeil · efficacité ${num(n.efficiency)} %</div>` : ""}</div>
+      ${n ? `<div class="small muted">${n.bedtime} → ${n.wake_time} · ${dur(n.total)} de sommeil · efficacité ${num(n.efficiency)} %</div>` : ""}
+      ${rd ? `<div class="small" style="margin-top:.3rem">${debtText(rd)}</div>` : ""}</div>
     <div class="card"><h2>Résumé du matin ${b && !(open && b.night !== n.night) ? `<span class="badge">${esc(b.model)}</span>` : ""}
       ${b && b.stale && !open ? `<span class="badge warn">données modifiées depuis</span>` : ""}
       ${b && open && b.night === n.night ? `<span class="badge warn">rédigé avant la fin de la nuit</span>` : ""}
@@ -490,7 +534,10 @@ async function pageToday(m) {
   const push = r.push && r.push.phone;
   html += `<div class="grid">
     <div class="card"><h2>Anneau</h2>
-      <div class="kv"><span>Batterie</span><b>${r.battery ? `${r.battery.pct} %` : "—"}</b></div>
+      <div class="kv"><span>Batterie</span><span>${r.battery ? `<b>${r.battery.pct} %</b>${r.battery.remaining_h != null
+        ? ` · ≈ ${num(r.battery.remaining_h / 24, 1)} j d'autonomie` : ""}` : "—"}</span></div>
+      ${r.battery && r.battery.to_20_h != null ? `<div class="kv"><span>Recharge conseillée (20 %)</span><span>${r.battery.to_20_h > 0
+        ? `dans ≈ ${num(r.battery.to_20_h / 24, 1)} j` : "<b style='color:var(--bad)'>maintenant</b>"} <a class="small" href="#/donnees/batterie">détail ›</a></span></div>` : ""}
       <div class="kv"><span>État</span><span>${r.on_charger ? "sur le chargeur" : r.worn ? "au doigt" : r.worn === false ? "retiré" : "—"}${r.state ? ` · ${esc(r.state.label)}` : ""}</span></div>
       <div class="kv"><span>Dernier envoi du téléphone</span><span>${push ? ago(push.last_push_unix) : "—"}</span></div>
       <div class="kv"><span>Horloge</span><span>${r.axis.mode === "sync" ? "synchronisée" : "estimée"}${r.axis.drift_s ? ` (recalée de ${num(r.axis.drift_s / 60)} min)` : ""}</span></div></div>
@@ -498,9 +545,11 @@ async function pageToday(m) {
       <div class="kv"><span>Température cutanée</span><span>${r.skin_temp && r.skin_temp.v != null ? `<b>${num(r.skin_temp.v, 1)} °C</b> · ${ago(r.skin_temp.t)}` : "—"}</span></div>
       <div class="kv"><span>Fréquence cardiaque</span><span>${live.hr ? `<b>${live.hr.v} bpm</b> · ${ago(live.hr.t)}` : "—"}</span></div>
       <div class="kv"><span>Intensité (MET)</span><span>${live.met ? `<b>${num(live.met.v, 1)}</b> · ${ago(live.met.t)}` : "—"}</span></div>
-      <div class="kv"><span>Activité du jour</span><span>${a ? `${num(a.met_min_mh)} MET-min · ${num(a.active_kcal)} kcal actives (est.)` : "—"}</span></div></div></div>`;
+      <div class="kv"><span>Pas aujourd'hui ${STEPS_BADGE}</span><span>${a && a.steps != null ? `<b>${num(a.steps)}</b>` : "—"}</span></div>
+      <div class="kv"><span>Activité du jour</span><span>${a ? `${num(a.met_min_mh)} MET-min · ${a.total_kcal != null
+        ? `${num(a.total_kcal)} kcal dépensées (est.)` : `${num(a.active_kcal)} kcal actives (est.)`}` : "—"}</span></div></div></div>`;
   m.innerHTML = html;
-  if (o.staging && $("#mini-hyp", m)) $("#mini-hyp", m).append(hypnogram(o.staging, { height: 100, compact: true }));
+  if (o.staging && $("#mini-hyp", m)) $("#mini-hyp", m).append(hypnogram(o.staging, { height: 64, compact: true, width: gridChartWidth() }));
 }
 
 async function pageSleep(m, date) {
@@ -577,13 +626,13 @@ async function pageSleep(m, date) {
   $("#c-hr", m).append(timeChart({ x0, x1, height: 170, series: [{ name: "FC", color: "var(--hr)", unit: "bpm", points: pts("hr") }],
     markers: n.hr_lowest_at ? [{ t: n.hr_lowest_at, v: n.hr_min, label: `FC la plus basse ${num(n.hr_min)} bpm à ${hm(n.hr_lowest_at)}`, color: "var(--hr)" }] : [],
     band: hrB && hrB.n >= 3 ? [hrB.mean - Math.max(hrB.sd, 1), hrB.mean + Math.max(hrB.sd, 1), "FC la plus basse habituelle (± 1 écart-type)"] : null, legend: true }));
-  $("#c-hrv", m).append(timeChart({ x0, x1, height: 140, series: [{ name: "RMSSD", color: "var(--hrv)", unit: "ms", points: pts("rmssd") }],
+  $("#c-hrv", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 140, series: [{ name: "RMSSD", color: "var(--hrv)", unit: "ms", points: pts("rmssd") }],
     hline: n.hrv_rmssd ? { v: n.hrv_rmssd } : null }));
-  $("#c-resp", m).append(timeChart({ x0, x1, height: 140, series: [{ name: "Respiration", color: "var(--resp)", unit: "/min", dec: 1, points: pts("resp") }],
+  $("#c-resp", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 140, series: [{ name: "Respiration", color: "var(--resp)", unit: "/min", dec: 1, points: pts("resp") }],
     minSpan: 4, empty: "pas assez de battements propres pour estimer la respiration" }));
-  $("#c-mot", m).append(timeChart({ x0, x1, height: 120, series: [{ name: "Mouvement (max 5 min)", color: "var(--motion)", type: "bar", binW: 300, dec: 2,
+  $("#c-mot", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 120, series: [{ name: "Mouvement (max 5 min)", color: "var(--motion)", type: "bar", binW: 300, dec: 2,
     points: S.map((p) => [p.t - 150, p.motion == null ? null : Math.min(p.motion, 10)]) }], y0: 0 }));
-  $("#c-temp", m).append(timeChart({ x0, x1, height: 140, series: [{ name: "Température", color: "var(--temp)", unit: "°C", dec: 2, points: pts("temp") }], minSpan: 0.5 }));
+  $("#c-temp", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 140, series: [{ name: "Température", color: "var(--temp)", unit: "°C", dec: 2, points: pts("temp") }], minSpan: 0.5 }));
   bindJournal(m);
 }
 
@@ -601,6 +650,7 @@ async function pageRecovery(m, date) {
     <div class="row" style="margin-top:.6rem;align-items:flex-start">
       <div>${ring(r.score, "Récupération", r.score == null ? `calibrage (${Object.keys(c).length}/5 contributeurs)` : undefined)}</div>
       <div style="flex:1 1 320px">${Object.keys(READY_CONTRIB).map((k) => c[k] ? contribRow(READY_CONTRIB[k], c[k], readyContribValue(k, c[k])) : "").join("")}
+      <div class="small" style="margin-top:.6rem">${debtText(r)}</div>
       ${Object.keys(READY_CONTRIB).filter((k) => !c[k]).length ? `<div class="tiny muted" style="margin-top:.4rem">En attente de données : ${Object.keys(READY_CONTRIB).filter((k) => !c[k]).map((k) => READY_CONTRIB[k]).join(", ")}.</div>` : ""}</div></div></div>`;
   html += tensionCard(r.tension, r.day);
   html += `<div class="card"><h2>Récupération au fil des jours</h2><div id="c-rd"></div></div>
@@ -608,7 +658,11 @@ async function pageRecovery(m, date) {
     <p>Contributeurs inspirés de la Readiness d'Oura (documentation publique) : FC la plus basse vs votre moyenne
     (baisse au-delà de +3 à +5 bpm), équilibre HRV (14 derniers jours pondérés vs moyenne longue), écart de
     température (ne peut que diminuer la note), indice de récupération (optimal ≥ 6 h), sommeil de la nuit, équilibre
-    du sommeil sur 14 jours (besoin 8 h), régularité du milieu de sommeil, activité de la veille.</p>
+    du sommeil sur 14 jours, régularité du milieu de sommeil, activité de la veille.</p>
+    <p><b>Besoin de sommeil</b> : fixé à 7 h 30 (non personnalisé ; Oura l'estime sur 90 jours d'historique).
+    <b>Dette de sommeil</b> (définition Oura) : manque de sommeil des 14 derniers jours par rapport à ce besoin, les nuits
+    récentes pesant davantage ; une nuit plus longue la rembourse. Aucune, faible (&lt; 2 h), modérée (2–5 h), élevée (&gt; 5 h) ;
+    au moins 5 nuits sur 14 jours.</p>
     <p>Barèmes et pondération (moyenne simple) sont <b>locaux</b> : Oura ne publie pas les siens. Le score global
     n'apparaît qu'à partir de 5 contributeurs disponibles.</p>
     <p><b>Signes de tension</b> : FC la plus basse ≥ +5 bpm (et ≥ 2 écarts-types), FC moyenne ≥ +8 bpm, HRV ≤ −25 %,
@@ -637,6 +691,12 @@ async function pageActivity(m, date) {
       <div style="flex:1 1 320px">${Object.keys(ACT_CONTRIB).map((k) => c[k] ? contribRow(ACT_CONTRIB[k], c[k], actContribValue(k, c[k])) : "").join("") || `<div class="muted small">pas de contributeurs pour ce jour</div>`}</div></div></div>`;
   if (s) {
     html += `<div class="card"><h2>Journée</h2><div class="tiles">
+      ${tile(`Pas ${STEPS_BADGE}`, s.steps == null ? "—" : num(s.steps), "", "compteur de l'anneau, à valider par une marche comptée")}
+      ${tile("Dépense totale", s.total_kcal == null ? "—" : num(s.total_kcal), s.total_kcal == null ? "" : "kcal",
+        s.total_kcal == null ? `profil incomplet (âge, taille, poids : page Données)` :
+          `${s.partial ? "depuis minuit · " : ""}repos ${num(s.bmr_kcal)} + activité ${num(s.active_kcal)} (estimation)`)}
+      ${tile("FC de jour", s.hr_day_mean == null ? "—" : num(s.hr_day_mean), s.hr_day_mean == null ? "" : "bpm",
+        s.hr_day_mean == null ? "pas assez de mesures" : `repos ${num(s.hr_day_rest)} · max ${num(s.hr_day_max)} · ${dur(s.hr_day_n / 60)} mesurées`)}
       ${tile("Effort modéré + intense", num(s.met_min_mh), "MET-min", "repère Oura : 100 / jour")}
       ${tile("Minutes actives", num(s.low_min + s.medium_min + s.high_min), "min", `léger ${s.low_min} · modéré ${s.medium_min} · intense ${s.high_min}`)}
       ${tile("Temps inactif", dur(s.inactive_min / 60), "", `${pl(s.sedentary_bouts, "période")} > 50 min`, s.inactive_min > 720 ? "up-bad" : "")}
@@ -648,7 +708,18 @@ async function pageActivity(m, date) {
       <div class="legend"><span style="--c:var(--met)"><i></i>< 3 léger</span><span style="--c:var(--fair)"><i></i>3–6 modéré</span>
       <span style="--c:var(--bad)"><i></i>≥ 6 intense</span><span style="--c:var(--st-deep)"><i style="opacity:.4"></i>sommeil</span>
       <span style="--c:var(--fair)"><i style="opacity:.4"></i>charge</span></div></div>
+    <div class="card"><h2>Pas par heure ${STEPS_BADGE}</h2><div id="c-steps"></div></div>
     <div class="card"><h2>Fréquence cardiaque</h2><div id="c-dhr"></div></div>`;
+  if ((a.rest_list || []).length) {
+    const KIND = { "sieste probable": "ok", "repos": "", "début de nuit": "" };
+    html += `<div class="card"><h2>Repos détectés par l'anneau <span class="right small muted">périodes de moins de 3 h hors nuit</span></h2>
+      <div class="scroll"><table class="tbl"><tr><th>Début</th><th>Fin</th><th class="n">Durée</th><th>Type</th><th class="n">FC médiane</th><th class="n">Mouvement</th></tr>
+      ${a.rest_list.map((x) => `<tr><td>${hm(x.start_unix)}</td><td>${hm(x.end_unix)}</td><td class="n">${num(x.minutes)} min</td>
+        <td><span class="badge ${KIND[x.kind] || ""}">${esc(x.kind)}</span></td><td class="n">${x.hr_median == null ? "—" : num(x.hr_median) + " bpm"}</td>
+        <td class="n">${x.move_pct == null ? "—" : num(x.move_pct) + " %"}</td></tr>`).join("")}</table></div>
+      <div class="tiny muted" style="margin-top:.3rem">« Sieste probable » : au moins 15 min, peu de mouvement et une FC proche de celle de
+      vos nuits ; « repos » : allongé mais éveillé (FC de jour) ; « début de nuit » : se termine moins de 30 min avant la nuit.</div></div>`;
+  }
   if (a.segments.length) {
     html += `<div class="card"><h2>Tranches d'effort <span class="right small muted">MET ≥ 3 pendant ≥ 5 min</span></h2><div class="scroll"><table class="tbl">
       <tr><th>Début</th><th>Fin</th><th class="n">Durée</th><th class="n">MET moyen</th><th class="n">FC moy / max</th></tr>
@@ -658,7 +729,13 @@ async function pageActivity(m, date) {
   html += `<div class="card"><details><summary>Méthode et limites</summary><div class="small">
     <p>Intensité : MET par minute calculés par l'anneau (accéléromètre). Temps inactif = minutes d'éveil, anneau au doigt
     (température cutanée > 30 °C), MET < 1,5. Effort modéré ≥ 3 MET, intense ≥ 6 MET ; « MET-min » = somme des MET de ces
-    minutes. Calories actives = (MET − 1) × 3,5 × poids / 200 par minute d'activité : ordre de grandeur seulement.</p>
+    minutes. Calories actives = (MET − 1) × 3,5 × poids / 200 par minute d'activité ; dépense totale = métabolisme de base
+    (formule de Mifflin-St Jeor, profil de la page Données) + calories actives : ordres de grandeur seulement.</p>
+    <p><b>Pas</b> : chaque mesure d'activité de l'anneau commence par un octet qui suit l'intensité minute par minute
+    (corrélation 0,96 avec le MET, nul au repos) : c'est très probablement le nombre de pas de la fenêtre, mais ce n'est pas
+    encore vérifié. Pour le valider : marcher 1 000 pas comptés en notant l'heure de début et de fin, puis rester 10 min assis.</p>
+    <p><b>FC de jour</b> : mesures de l'anneau à la LED verte (médiane par minute), hors sommeil et repos ; « repos » =
+    10<sup>e</sup> percentile des minutes calmes (MET &lt; 1,5), « max » = 99<sup>e</sup> percentile.</p>
     <p>Contributeurs inspirés de l'Activity Score d'Oura (seuils publiés : 5–8 h d'inactivité au plus, rappel après 50 min,
     3–4 jours d'entraînement, 2 000 MET-min/semaine, 1–2 jours légers). L'objectif quotidien personnalisé n'est pas calculé.</p>
     </div></details></div>`;
@@ -670,46 +747,101 @@ async function pageActivity(m, date) {
     series: [{ name: "MET", type: "bar", binW: 60, dec: 1, points: a.met.map((p) => [p.t, p.met]),
       colorOf: (v) => v >= 6 ? "var(--bad)" : v >= 3 ? "var(--fair)" : "var(--met)" }],
     empty: "aucune donnée d'intensité ce jour-là" }));
+  $("#c-steps", m).append(timeChart({ x0: t0, x1: t1, y0: 0, height: 130, shades, legend: false,
+    series: [{ name: "Pas", type: "bar", binW: 3600, color: "var(--met)", points: (a.steps_hourly || []).map((p) => [p.t, p.steps]) }],
+    empty: "aucun pas compté ce jour-là" }));
   $("#c-dhr", m).append(timeChart({ x0: t0, x1: t1, height: 170, shades,
-    series: [{ name: "FC diurne (mesures 1 min)", color: "var(--hr)", type: "dots", unit: "bpm", points: a.hr.filter((p) => !p.night).map((p) => [p.t, p.hr]) },
+    series: [{ name: "FC de jour (médiane par minute)", color: "var(--hr)", type: "dots", unit: "bpm", points: a.hr.filter((p) => !p.night).map((p) => [p.t, p.hr]) },
       { name: "FC de nuit (5 min)", color: "var(--hrv)", unit: "bpm", points: a.hr.filter((p) => p.night).map((p) => [p.t, p.hr]) }],
     empty: "aucune mesure de FC ce jour-là" }));
 }
 
 let trendDays = 30;
+const REF_LABELS = {
+  hr_min: ["FC la plus basse", "bpm", 1], hr_mean: ["FC moyenne (sommeil)", "bpm", 1], hrv_rmssd: ["HRV moyen", "ms", 0],
+  resp_rate: ["Respiration (expérimental)", "/min", 1], temp_mean: ["Température de nuit", "°C", 2],
+  total: ["Sommeil total", "h", null], efficiency: ["Efficacité", "%", 1], score: ["Score de sommeil", "", 0],
+  deep: ["Profond (estimation)", "h", null], rem: ["REM (estimation)", "h", null], waso: ["Éveil après endormissement", "min", 0],
+  recovery_index: ["Indice de récupération", "h", null],
+};
 async function pageTrends(m) {
   const t = await api("trends?days=" + trendDays);
-  const N = t.nights || [], B = t.baselines || {};
+  const N = t.nights || [], B = t.baselines || {}, A = t.activity || [], kinds = t.tag_kinds || {};
   let html = `<div class="card row"><div class="seg">${[14, 30, 90].map((d) => `<button class="chip ${d === trendDays ? "on" : ""}" data-d="${d}">${d} nuits</button>`).join("")}</div>
     <span class="muted small" style="margin-left:auto">${pl(N.length, "nuit")} disponible${N.length > 1 ? "s" : ""}</span></div>`;
   if (!N.length) { m.innerHTML = html + `<div class="card muted">Pas encore de nuits.</div>`; bindTrend(m); return; }
-  const blocks = [["c-score", "Scores (sommeil, récupération)"], ["c-tst", "Sommeil total"], ["c-rhr", "FC la plus basse"],
-    ["c-hrv", "HRV moyen"], ["c-tdev", "Écart de température"], ["c-rr", "Respiration (expérimental)"], ["c-act", "Effort modéré + intense (MET-min / jour)"]];
-  html += `<div class="grid">${blocks.map(([id, h]) => `<div class="card"><h2>${h}</h2><div id="${id}"></div></div>`).join("")}</div>`;
+  const blocks = [["c-score", "Scores (sommeil, récupération)"], ["c-sched", "Horaires de sommeil"], ["c-tst", "Sommeil total"],
+    ["c-debt", "Dette de sommeil (14 j)"], ["c-rhr", "FC la plus basse"], ["c-hrv", "HRV moyen"], ["c-tdev", "Écart de température"],
+    ["c-rr", "Respiration (expérimental)"], ["c-steps", `Pas par jour ${STEPS_BADGE}`], ["c-act", "Effort modéré + intense (MET-min / jour)"],
+    ["c-dhr", "FC de jour (repos et moyenne)"], ["c-kcal", "Dépense totale (estimation)"]];
+  html += `<div class="grid g2">${blocks.map(([id, h]) => `<div class="card"><h2>${h}</h2><div id="${id}"></div></div>`).join("")}</div>`;
+  html += `<div class="card"><h2>Vos références <span class="right small muted">nuits saines précédant la dernière nuit</span></h2>
+    <div class="scroll"><table class="tbl"><tr><th>Mesure</th><th class="n">Moyenne</th><th class="n">Écart-type</th><th class="n">Médiane</th><th class="n">Nuits</th></tr>
+    ${Object.entries(REF_LABELS).filter(([k]) => B[k]).map(([k, [lbl, unit, d]]) => {
+      const b = B[k], f = (v) => d == null ? dur(v) : `${num(v, d)}${unit ? " " + unit : ""}`;
+      return `<tr><td>${lbl}</td><td class="n">${f(b.mean)}</td><td class="n">± ${f(b.sd)}</td><td class="n">${f(b.median)}</td>
+        <td class="n">${b.n}${b.n < 14 ? ` <span class="badge warn">provisoire</span>` : ""}</td></tr>`;
+    }).join("")}</table></div>
+    <div class="tiny muted" style="margin-top:.3rem">Sans les nuits qui suivent un jour noté « malade » dans le journal ni celles
+    qui présentent des signes de tension marqués (60 nuits au plus).</div></div>`;
   html += `<div class="card"><h2>Toutes les nuits</h2><div class="scroll"><table class="tbl"><tr><th>Nuit</th><th class="n">Score</th><th class="n">Récup.</th>
-    <th class="n">Sommeil</th><th class="n">Profond</th><th class="n">REM</th><th class="n">Effic.</th><th class="n">FC basse</th><th class="n">HRV</th>
-    <th class="n">Resp.</th><th class="n">Temp. δ</th></tr>
-    ${N.slice().reverse().map((n) => `<tr><td><a href="#/sommeil/${n.night}">${dayLabel(n.night)}</a></td><td class="n">${num(n.score)}</td>
-      <td class="n">${num(n.readiness)}</td><td class="n">${dur(n.total)}</td><td class="n">${dur(n.deep)}</td><td class="n">${dur(n.rem)}</td>
-      <td class="n">${num(n.efficiency)} %</td><td class="n">${num(n.hr_min, 1)}</td><td class="n">${num(n.hrv_rmssd)}</td>
-      <td class="n">${num(n.resp_rate, 1)}</td><td class="n">${n.temp_dev == null ? "—" : signed(n.temp_dev, 2)}</td></tr>`).join("")}</table></div></div>`;
+    <th class="n">Coucher</th><th class="n">Sommeil</th><th class="n">Effic.</th><th class="n">Latence</th><th class="n">FC basse</th><th class="n">HRV</th>
+    <th class="n">Resp.</th><th class="n">Temp. δ</th><th class="n">Dette</th></tr>
+    ${N.slice().reverse().map((n) => `<tr><td><a href="#/sommeil/${n.night}">${dayLabel(n.night)}</a>${n.provisional ? " <span class='badge warn'>en cours</span>" : ""}
+      ${n.ref_excluded ? ` <span class="badge" title="exclue des références : ${esc(n.ref_excluded)}">hors réf.</span>` : ""}</td>
+      <td class="n">${num(n.score)}</td><td class="n">${num(n.readiness)}</td><td class="n">${hm(n.start_unix)}</td><td class="n">${dur(n.total)}</td>
+      <td class="n">${num(n.efficiency)} %</td><td class="n">${num(n.latency)} min</td><td class="n">${num(n.hr_min, 1)}</td><td class="n">${num(n.hrv_rmssd)}</td>
+      <td class="n">${num(n.resp_rate, 1)}</td><td class="n">${n.temp_dev == null ? "—" : signed(n.temp_dev, 2)}</td>
+      <td class="n">${n.sleep_debt_h == null ? "—" : dur(n.sleep_debt_h)}</td></tr>`).join("")}</table></div></div>`;
   m.innerHTML = html;
   bindTrend(m);
+  // journal : un jour noté J concerne la nuit J+1 et la journée J
+  const tagLabel = (xs) => xs.map((x) => (kinds[x.kind] || x.kind) + (x.note ? ` (${x.note})` : "")).join(", ");
+  const byDay = {};
+  for (const x of t.tags || []) (byDay[x.day] ??= []).push(x);
+  const vNights = Object.entries(byDay).map(([d, xs]) => ({ t: dayNoon(shiftDay(d, 1)), label: `nuit du ${dayLabel(shiftDay(d, 1))} — journal de la veille : ${tagLabel(xs)}` }));
+  const vDays = Object.entries(byDay).map(([d, xs]) => ({ t: dayNoon(d), label: `${dayLabel(d)} — journal : ${tagLabel(xs)}` }));
   const P = (k) => N.map((n) => [dayNoon(n.night), n[k]]);
   const band = (k) => { const b = B[k]; return b && b.n >= 3 ? [b.mean - b.sd, b.mean + b.sd, "habituel (± 1 écart-type)"] : null; };
-  const opt = { dayAxis: true, height: 150 };
-  $("#c-score", m).append(timeChart({ ...opt, y0: 0, y1: 100, series: [
+  const opt = { dayAxis: true, height: 160, width: gridChartWidth(420) };
+  const avg7 = (name, color, pts, extra = {}) => ({ name: "moyenne 7 nuits", color, dash: "5 4", width: 1.5, points: rolling(pts), gap: 86400 * 4, ...extra });
+  $("#c-score", m).append(timeChart({ ...opt, y0: 0, y1: 100, vmarks: vNights, series: [
     { name: "Sommeil", color: "var(--st-light)", points: P("score"), gap: 86400 * 3 },
     { name: "Récupération", color: "var(--opt)", points: P("readiness"), gap: 86400 * 3 }] }));
-  $("#c-tst", m).append(timeChart({ ...opt, y0: 0, band: [7, 9, "repère adulte 7–9 h"], legend: true,
-    series: [{ name: "Sommeil total", color: "var(--st-light)", type: "bar", center: true, binW: 86400 * 0.7, fmt: dur, points: P("total") }] }));
-  $("#c-rhr", m).append(timeChart({ ...opt, band: band("hr_min"), legend: true, series: [{ name: "FC la plus basse", color: "var(--hr)", unit: "bpm", dec: 1, points: P("hr_min"), gap: 86400 * 3 }] }));
-  $("#c-hrv", m).append(timeChart({ ...opt, band: band("hrv_rmssd"), legend: true, series: [{ name: "HRV moyen", color: "var(--hrv)", unit: "ms", points: P("hrv_rmssd"), gap: 86400 * 3 }] }));
-  $("#c-tdev", m).append(timeChart({ ...opt, minSpan: 1, band: [-0.5, 0.5, "± 0,5 °C"], legend: true, series: [{ name: "Écart", type: "bar", center: true, binW: 86400 * 0.6,
+  const H = (k) => N.map((n) => [dayNoon(n.night), nightHour(n[k])]);
+  $("#c-sched", m).append(timeChart({ ...opt, height: 170, yFmt: (v) => hmDec(v), vmarks: vNights, series: [
+    { name: "Coucher", color: "var(--st-rem)", type: "dots", r: 3.5, opacity: 1, fmt: hmDec, points: H("start_unix") },
+    { name: "Milieu du sommeil", color: "var(--fg)", fmt: hmDec, gap: 86400 * 3, width: 1.5,
+      points: N.map((n) => [dayNoon(n.night), n.timing == null ? null : (n.timing < 15 ? n.timing + 24 : n.timing)]) },
+    { name: "Lever", color: "var(--fair)", type: "dots", r: 3.5, opacity: 1, fmt: hmDec, points: H("stop_unix") }],
+    legend: true }));
+  $("#c-tst", m).append(timeChart({ ...opt, y0: 0, band: [7, 9, "repère adulte 7–9 h"], legend: true, vmarks: vNights,
+    series: [{ name: "Sommeil total", color: "var(--st-light)", type: "bar", center: true, binW: 86400 * 0.7, fmt: dur, points: P("total") },
+      avg7("", "var(--fg)", P("total"), { fmt: dur })] }));
+  $("#c-debt", m).append(timeChart({ ...opt, y0: 0, minSpan: 2, legend: false, hline: { v: 2 },
+    series: [{ name: "Dette", type: "bar", center: true, binW: 86400 * 0.6, fmt: dur, points: P("sleep_debt_h"),
+      colorOf: (v) => v > 5 ? "var(--bad)" : v >= 2 ? "var(--fair)" : "var(--opt)" }],
+    empty: "calculable à partir de 5 nuits sur 14 jours" }));
+  $("#c-rhr", m).append(timeChart({ ...opt, band: band("hr_min"), legend: true, vmarks: vNights, series: [
+    { name: "FC la plus basse", color: "var(--hr)", unit: "bpm", dec: 1, points: P("hr_min"), gap: 86400 * 3 },
+    avg7("", "var(--hr)", P("hr_min"), { unit: "bpm", dec: 1 })] }));
+  $("#c-hrv", m).append(timeChart({ ...opt, band: band("hrv_rmssd"), legend: true, vmarks: vNights, series: [
+    { name: "HRV moyen", color: "var(--hrv)", unit: "ms", points: P("hrv_rmssd"), gap: 86400 * 3 },
+    avg7("", "var(--hrv)", P("hrv_rmssd"), { unit: "ms" })] }));
+  $("#c-tdev", m).append(timeChart({ ...opt, minSpan: 1, band: [-0.5, 0.5, "± 0,5 °C"], legend: true, vmarks: vNights, series: [{ name: "Écart", type: "bar", center: true, binW: 86400 * 0.6,
     unit: "°C", fmt: (v) => signed(v, 2), points: P("temp_dev"), colorOf: (v) => Math.abs(v) >= 0.5 ? "var(--bad)" : "var(--temp)" }], empty: "écart disponible à partir de 3 nuits" }));
   $("#c-rr", m).append(timeChart({ ...opt, minSpan: 3, band: band("resp_rate"), legend: true, series: [{ name: "Respiration", color: "var(--resp)", unit: "/min", dec: 1, points: P("resp_rate"), gap: 86400 * 3 }] }));
-  $("#c-act", m).append(timeChart({ ...opt, y0: 0, hline: { v: 100 }, series: [{ name: "MET-min", type: "bar", center: true, binW: 86400 * 0.7, color: "var(--met)",
-    points: (t.activity || []).filter((a) => !a.partial).map((a) => [dayNoon(a.day), a.met_min_mh]) }], empty: "pas encore de journée complète" }));
+  const full = A.filter((a) => !a.partial), D = (k) => full.map((a) => [dayNoon(a.day), a[k]]);
+  $("#c-steps", m).append(timeChart({ ...opt, y0: 0, vmarks: vDays, series: [{ name: "Pas", type: "bar", center: true, binW: 86400 * 0.7, color: "var(--met)", points: D("steps") },
+    avg7("", "var(--fg)", D("steps"), { name: "moyenne 7 jours" })], empty: "pas encore de journée complète" }));
+  $("#c-act", m).append(timeChart({ ...opt, y0: 0, hline: { v: 100 }, vmarks: vDays, series: [{ name: "MET-min", type: "bar", center: true, binW: 86400 * 0.7, color: "var(--met)",
+    points: D("met_min_mh") }], empty: "pas encore de journée complète" }));
+  $("#c-dhr", m).append(timeChart({ ...opt, legend: true, vmarks: vDays, series: [
+    { name: "FC de repos de jour", color: "var(--hr)", unit: "bpm", dec: 1, points: D("hr_day_rest"), gap: 86400 * 3 },
+    { name: "FC moyenne de jour", color: "var(--fair)", unit: "bpm", dec: 1, points: D("hr_day_mean"), gap: 86400 * 3 }],
+    empty: "pas encore de journée complète" }));
+  $("#c-kcal", m).append(timeChart({ ...opt, y0: 0, series: [{ name: "kcal", type: "bar", center: true, binW: 86400 * 0.7, color: "var(--temp)",
+    points: D("total_kcal") }], empty: "profil incomplet (page Données) ou pas encore de journée complète" }));
 }
 function bindTrend(m) {
   m.querySelectorAll("[data-d]").forEach((b) => { b.onclick = () => { trendDays = +b.dataset.d; render(); }; });
@@ -827,10 +959,11 @@ async function pageAssistant(m) {
   $("#chat-in", m).addEventListener("keydown", (e) => { if (e.key === "Enter") send(false); });
 }
 
-let dataTab = "signaux", teleHours = 24, evType = "", evLimit = 100, evAll = false;
+let dataTab = "signaux", teleHours = 24, evType = "", evLimit = 100, evAll = false, batDays = 14;
 async function pageData(m, tab) {
   dataTab = tab || dataTab;
-  const tabs = { signaux: "Signaux bruts", evenements: "Événements", sante: "Santé du système" };
+  const tabs = { signaux: "Signaux bruts", batterie: "Batterie", qualite: "Qualité des données",
+    evenements: "Événements", sante: "Santé du système" };
   let html = `<div class="card row"><div class="seg">${Object.entries(tabs).map(([k, v]) =>
     `<button class="chip ${k === dataTab ? "on" : ""}" onclick="location.hash='#/donnees/${k}'">${v}</button>`).join("")}</div></div>`;
   if (dataTab === "signaux") {
@@ -859,6 +992,58 @@ async function pageData(m, tab) {
     $("#t-mot", m).append(timeChart({ x0, x1, y0: 0, series: [{ name: "s actives", color: "var(--motion)", type: "bar", binW: 3600, unit: "s",
       points: Object.entries(hh).map(([k, v]) => [+k, v]) }] }));
     $("#t-spo", m).append(timeChart({ x0, x1, series: [{ name: "R", color: "var(--good)", dec: 3, points: t.spo2.map((p) => [p.t, p.r]) }] }));
+    return;
+  }
+  if (dataTab === "batterie") {
+    const b = await api("battery?days=" + batDays);
+    html += `<div class="card"><h2>Batterie de l'anneau</h2><div class="tiles">
+      ${tile("Niveau", b.pct == null ? "—" : num(b.pct), b.pct == null ? "" : "%", b.t ? `mesuré ${ago(b.t)}` : "")}
+      ${tile("Autonomie restante", b.remaining_h == null ? "—" : num(b.remaining_h / 24, 1), b.remaining_h == null ? "" : "j",
+        b.to_20_h == null ? "" : b.to_20_h > 0 ? `recharge conseillée (20 %) dans ≈ ${num(b.to_20_h / 24, 1)} j` : "à recharger", b.to_20_h === 0 ? "up-bad" : "")}
+      ${tile("Décharge", b.rate_pct_h == null ? "—" : num(b.rate_pct_h, 2), b.rate_pct_h == null ? "" : "%/h",
+        b.rate_pct_h == null ? "pas assez de mesures" : `${b.rate_source === "en cours" ? "depuis la dernière charge" : "typique (charges précédentes)"} · ≈ ${num(b.full_days, 1)} j par charge`)}
+      </div></div>
+      <div class="card row"><div class="seg">${[7, 14, 30, 90].map((d) => `<button class="chip ${d === batDays ? "on" : ""}" data-bd="${d}">${d} j</button>`).join("")}</div></div>
+      <div class="card"><h2>Niveau de charge <span class="right small muted">pourcentage indiqué par l'anneau</span></h2><div id="b-pct"></div></div>
+      <div class="card"><h2>Charges (${b.charges.length})</h2>${b.charges.length ? b.charges.slice().reverse().map(([f, to]) =>
+        `<div class="kv"><span>${dtShort(f)}</span><span>${dur((to - f) / 3600)} sur le chargeur</span></div>`).join("") : `<div class="muted small">aucune sur la période</div>`}
+      <div class="tiny muted" style="margin-top:.4rem">Autonomie : pente de décharge (régression) depuis la dernière charge, ou celle des
+      décharges précédentes s'il y a moins de 6 h de recul. Sources : événements « battery_level_changed » et traces « batt: » du firmware.</div></div>`;
+    m.innerHTML = html;
+    m.querySelectorAll("[data-bd]").forEach((x) => { x.onclick = () => { batDays = +x.dataset.bd; render(); }; });
+    $("#b-pct", m).append(timeChart({ x0: b.since, x1: Date.now() / 1000, y0: 0, y1: 100, height: 180, hline: { v: 20 },
+      shades: b.charges.map(([f, to]) => ({ from: f, to, color: "var(--shade-charge)" })),
+      series: [{ name: "Batterie", color: "var(--opt)", unit: "%", points: b.points.map((p) => [p.t, p.pct]), gap: 6 * 3600 }],
+      empty: "aucune mesure de batterie sur la période" }));
+    return;
+  }
+  if (dataTab === "qualite") {
+    const qd = await api("quality?days=30");
+    const cls = (v, lo) => v != null && v < lo ? " style=\"color:var(--bad)\"" : "";
+    html += `<div class="card"><h2>Nuits</h2><div class="scroll"><table class="tbl"><tr><th>Nuit</th>
+      <th class="n" title="délai entre l'ouverture de la fenêtre et le passage de l'anneau en mode sommeil">Mode sommeil après</th>
+      <th class="n" title="battements conservés après filtrage des artefacts">Battements gardés</th>
+      <th class="n" title="intervalles de 5 min avec une FC valide pendant le sommeil">FC valide</th>
+      <th class="n" title="fenêtres de 5 min où la respiration a pu être estimée">Respiration</th>
+      <th>Source FC</th><th>Horloge</th><th>Statut</th></tr>
+      ${qd.nights.map((n) => `<tr><td><a href="#/sommeil/${n.night}">${dayLabel(n.night)}</a></td>
+        <td class="n">${n.lead_min == null ? "—" : num(n.lead_min, 1) + " min"}</td>
+        <td class="n"${cls(n.beats_kept_pct, 90)}>${n.beats_kept_pct == null ? "—" : num(n.beats_kept_pct, 1) + " %"}</td>
+        <td class="n"${cls(n.hr_bins_pct, 90)}>${n.hr_bins_pct == null ? "—" : num(n.hr_bins_pct) + " %"}</td>
+        <td class="n">${n.resp_n ?? "—"}</td><td>${esc(n.hr_source || "—")}</td><td>${esc(n.axis_mode || "—")}</td>
+        <td>${n.provisional ? `<span class="badge warn">en cours</span> ` : ""}${n.ref_excluded ? `<span class="badge">hors réf. : ${esc(n.ref_excluded)}</span>` : ""}</td></tr>`).join("")}
+      </table></div></div>
+      <div class="card"><h2>Journées</h2><div class="scroll"><table class="tbl"><tr><th>Jour</th><th class="n">Anneau porté</th>
+      <th class="n" title="minutes portées et éveillées qui ont une mesure d'intensité">Couverture activité</th>
+      <th class="n">FC de jour mesurée</th><th class="n">Sur le chargeur</th><th class="n">Repos</th><th>Statut</th></tr>
+      ${qd.days.map((x) => `<tr><td><a href="#/activite/${x.day}">${dayLabel(x.day)}</a></td><td class="n">${dur(x.worn_min / 60)}</td>
+        <td class="n"${cls(x.met_cover_pct, 90)}>${x.met_cover_pct == null ? "—" : num(x.met_cover_pct, 1) + " %"}</td>
+        <td class="n">${x.hr_day_n == null ? "—" : dur(x.hr_day_n / 60)}</td><td class="n">${x.charge_min ? x.charge_min + " min" : "—"}</td>
+        <td class="n">${x.rest_min ? x.rest_min + " min" : "—"}</td><td>${x.partial ? `<span class="badge">incomplète</span>` : ""}</td></tr>`).join("")}
+      </table></div>
+      <div class="tiny muted" style="margin-top:.4rem">En rouge : moins de 90 %. Une journée est « incomplète » si elle est en cours
+      ou compte moins de 10 h d'éveil mesurées (pas de score d'activité).</div></div>`;
+    m.innerHTML = html;
     return;
   }
   if (dataTab === "evenements") {

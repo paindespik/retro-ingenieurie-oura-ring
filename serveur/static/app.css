@@ -4,7 +4,7 @@
   --opt: #34d399; --good: #60a5fa; --fair: #fbbf24; --bad: #f87171;
   --st-awake: #e2e8f0; --st-rem: #22d3ee; --st-light: #3b82f6; --st-deep: #4338ca;
   --hr: #f87171; --hrv: #a78bfa; --resp: #2dd4bf; --temp: #fb923c; --met: #34d399; --motion: #94a3b8;
-  --shade-sleep: rgba(99, 102, 241, .13); --shade-charge: rgba(251, 191, 36, .14);
+  --tag: #e879f9; --shade-sleep: rgba(99, 102, 241, .13); --shade-charge: rgba(251, 191, 36, .14);
   --radius: 14px; --shadow: 0 1px 2px rgba(0, 0, 0, .35);
   color-scheme: dark;
 }
@@ -64,6 +64,7 @@ main { max-width: 1080px; margin: 0 auto; padding: .8rem .8rem 1.5rem; }
 .card > h2 .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
 .grid { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .grid > .card { margin: 0; }
+.grid.g2 { grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); }
 .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
 .muted { color: var(--muted); } .small { font-size: .82rem; } .tiny { font-size: .74rem; }
 .center { text-align: center; }

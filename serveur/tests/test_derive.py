@@ -361,5 +361,102 @@ class HealthyReferenceTest(Base):
         self.assertAlmostEqual(cmp_["fc_la_plus_basse_bpm"]["reference"], round(ref["hr_min"]["mean"], 1))
 
 
+
+class LotBUnitTest(unittest.TestCase):
+    def test_bmr_mifflin(self):
+        self.assertAlmostEqual(oc.bmr_kcal(27, 185, 82, "male"), 1846.25)
+        self.assertAlmostEqual(oc.bmr_kcal(27, 185, 82, "female"), 1846.25 - 166)
+        self.assertIsNone(oc.bmr_kcal(None, 185, 82, "male"))
+
+    def test_discharge_rate(self):
+        t0 = 1_800_000_000
+        pts = [(t0 + h * 3600, 100 - round(0.4 * h), None) for h in range(0, 49, 2)]
+        cur, typ = oc.discharge_rate(pts, [])
+        self.assertAlmostEqual(cur, 0.4, delta=0.03)
+        self.assertAlmostEqual(typ, 0.4, delta=0.03)
+        # charge récente (< 6 h de recul) : pas de pente en cours, la typique reste
+        cur, typ = oc.discharge_rate(pts + [(t0 + 52 * 3600, 99, None)], [(t0 + 49 * 3600, t0 + 51 * 3600)])
+        self.assertIsNone(cur)
+        self.assertAlmostEqual(typ, 0.4, delta=0.03)
+
+    def test_sleep_debt(self):
+        def nights(totals):
+            return [{"night": f"2026-09-{d:02d}", "total": t} for d, t in enumerate(totals, start=1)]
+        self.assertEqual(dn.sleep_debt(3, nights([6.0] * 4)), (None, 4))       # < 5 nuits
+        debt, k = dn.sleep_debt(13, nights([dn.SLEEP_NEED_H] * 14))
+        self.assertEqual((debt, k), (0.0, 14))
+        debt, _ = dn.sleep_debt(13, nights([dn.SLEEP_NEED_H - 1] * 14))
+        self.assertAlmostEqual(debt, 14.0, places=6)                         # poids moyens = 1
+        # les nuits récentes pèsent davantage ; un surplus rembourse
+        recent, _ = dn.sleep_debt(13, nights([dn.SLEEP_NEED_H] * 13 + [dn.SLEEP_NEED_H - 2]))
+        old, _ = dn.sleep_debt(13, nights([dn.SLEEP_NEED_H - 2] + [dn.SLEEP_NEED_H] * 13))
+        self.assertGreater(recent, old)
+        paid, _ = dn.sleep_debt(13, nights([dn.SLEEP_NEED_H - 1] * 13 + [dn.SLEEP_NEED_H + 3]))
+        self.assertLess(paid, 14.0 - 1)
+
+
+class LotBDayTest(Base):
+    """Pas (octet d'en-tête du tag 80), dépense totale, repos, dette de sommeil."""
+    nights = 6
+    sick_last = False
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.raw = os.path.join(cls.tmp.name, "oura.db")
+        cls.der = os.path.join(cls.tmp.name, "derived.db")
+        cls.ring = synth.build(cls.raw, nights=cls.nights, rests=((2, 14, 25),))
+        d = sqlite3.connect(cls.der)
+        dn.ensure_schema(d)
+        d.execute("INSERT INTO user_profile VALUES (1, 27, 185, 82, 'male', 0)")
+        d.commit()
+        d.close()
+        dn.run(cls.raw, cls.der, recompute_all=True, log=lambda *_: None)
+        cls.con = sqlite3.connect(f"file:{cls.raw}?mode=ro", uri=True)
+        d = sqlite3.connect(cls.der)
+        d.row_factory = sqlite3.Row
+        cls.act = {r["day"]: dict(r) for r in d.execute("SELECT * FROM activity_daily")}
+        cls.rests = [dict(r) for r in d.execute("SELECT * FROM rests")]
+        cls.readiness = [dict(r) for r in d.execute("SELECT * FROM readiness ORDER BY day")]
+        cls.derived = d
+
+    def test_steps_are_event_header_counts(self):
+        ax = oc.TimeAxis(self.con)
+        day = "2026-09-03"
+        t0 = datetime_ts(day)
+        n = 0
+        for rt, cap, dj in self.con.execute("SELECT ring_timestamp, captured_unix, decoded_json FROM events WHERE tag=80"):
+            end = ax(rt, cap)
+            k = len(json.loads(dj)["met"])
+            if t0 <= end - k * 60 and end <= t0 + 86400:
+                n += json.loads(dj)["state"]
+        self.assertGreater(n, 0)
+        self.assertAlmostEqual(self.act[day]["steps"], n, delta=1)
+
+    def test_total_energy(self):
+        a = self.act["2026-09-03"]
+        self.assertEqual(a["bmr_kcal"], 1846)
+        self.assertEqual(a["total_kcal"], a["bmr_kcal"] + a["active_kcal"])
+
+    def test_rest_period_recorded(self):
+        self.assertEqual(len(self.rests), 1)
+        self.assertEqual(self.rests[0]["kind"], "repos")
+        self.assertAlmostEqual(self.rests[0]["minutes"], 25, delta=0.5)
+        self.assertEqual(self.act["2026-09-03"]["rest_min"], 25)
+
+    def test_sleep_debt_stored(self):
+        self.assertIsNone(self.readiness[3]["sleep_debt_h"])
+        self.assertEqual(self.readiness[4]["sleep_debt_n"], 5)
+        rows = dn.nights_table(self.derived)
+        self.assertEqual(self.readiness[4]["sleep_debt_h"], dn.sleep_debt(4, rows)[0])
+        self.assertGreater(self.readiness[4]["sleep_debt_h"], 0)            # sommeil < 7 h 30 au lit
+        self.assertEqual(self.readiness[4]["sleep_need_h"], dn.SLEEP_NEED_H)
+
+
+def datetime_ts(day):
+    from datetime import datetime
+    return datetime.strptime(day, "%Y-%m-%d").timestamp()
+
+
 if __name__ == "__main__":
     unittest.main()

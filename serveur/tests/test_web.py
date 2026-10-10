@@ -59,6 +59,25 @@ class WebTest(unittest.TestCase):
         self.assertTrue(d["series"])
         self.assertEqual(d["readiness"]["tension"]["level"], "marqués")
 
+    def test_lot_b_routes(self):
+        b = self.c.get("/api/battery?days=14").json()
+        self.assertEqual(b["points"], [])
+        self.assertIsNone(b["remaining_h"])
+        qd = self.c.get("/api/quality?days=30").json()
+        self.assertEqual(len(qd["nights"]), 4)
+        self.assertIn("beats_kept_pct", qd["nights"][0])
+        t = self.c.get("/api/trends?days=30").json()
+        self.assertIn("sleep_debt_h", t["nights"][-1])
+        self.assertIn("steps", t["activity"][0])
+        self.assertIn("tags", t)
+        a = self.c.get(f"/api/activity?date={self.night}").json()
+        self.assertIn("steps_hourly", a)
+        self.assertIn("rest_list", a)
+        import json
+        ctx = json.loads(self.web.chat_context())
+        self.assertIn("references_personnelles", ctx)
+        self.assertRegex(ctx["nuits"][-1]["sommeil_total"], r"^\d+ h \d\d$")
+
     def test_night_uses_its_own_references(self):
         d = self.c.get(f"/api/night?date={self.night}").json()
         self.assertNotIn("ref", d["night"])
