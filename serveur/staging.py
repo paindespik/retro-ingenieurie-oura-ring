@@ -14,7 +14,12 @@ caractéristique circadienne) :
   la première heure, plus fréquent en seconde moitié ;
 - éveil : mouvement franc, ou FC haute + HRV basse ;
 - lissage par Viterbi (HMM 4 états, forte persistance) : des stades de 30 s
-  qui alternent sans cesse ne sont pas physiologiques.
+  qui alternent sans cesse ne sont pas physiologiques ;
+- début de fenêtre : l'anneau ouvre la fenêtre « bedtime » 3 à 17 min avant de
+  passer en mode sommeil (premiers tags 114 / 96). Pendant ce trou, aucune
+  caractéristique : seul l'a priori déciderait (« léger »), alors que le
+  mouvement (tag 71) et la FC diurne (tag 128) montrent une personne éveillée.
+  Ces epochs sont donc comptés en éveil (latence d'endormissement réelle).
 """
 import bisect
 import math
@@ -112,7 +117,22 @@ def _emission(st, zf, mot, mot_s, u_min, frac, bias=None):
     return s
 
 
-def viterbi(feats, n, bias=None):
+def leading_gap(n, s_ds, motion_events, beats):
+    """Nombre d'epochs en tête de fenêtre AVANT la première donnée du mode
+    sommeil (mouvement tag 114 ou battement tag 96). 0 si la nuit n'a aucune
+    donnée (rien à corriger)."""
+    firsts = []
+    if motion_events:
+        firsts.append(min(int((rt - EPOCH_DS / 2 - s_ds) // EPOCH_DS) for rt, _ in motion_events))
+    if beats:
+        firsts.append(int((beats[0][0] - s_ds) // EPOCH_DS))
+    if not firsts:
+        return 0
+    return max(0, min(n, min(firsts)))
+
+
+def viterbi(feats, n, bias=None, lead=0):
+    """lead : epochs de tête forcés en éveil (cf. leading_gap)."""
     ls, lsw = math.log(P_STAY), math.log((1 - P_STAY) / 3)
     idx = {s: k for k, s in enumerate(STATES)}
     trans = [[ls if a == b else lsw + PAIR_PENALTY.get((a, b), 0.0) for b in STATES] for a in STATES]
@@ -121,8 +141,11 @@ def viterbi(feats, n, bias=None):
     for i in range(n):
         zf = (feats["z_hr"][i], feats["z_irr"][i])
         u = i * EPOCH_DS / 600.0
-        em = [_emission(s, zf, feats["motion"][i], feats["motion_s"][i], u, i / max(1, n - 1), bias)
-              for s in STATES]
+        if i < lead:
+            em = [0.0 if s == "awake" else -30.0 for s in STATES]
+        else:
+            em = [_emission(s, zf, feats["motion"][i], feats["motion_s"][i], u, i / max(1, n - 1), bias)
+                  for s in STATES]
         cur, bk = [], []
         for b in range(4):
             best = max(range(4), key=lambda a: prev[a] + trans[a][b])
@@ -146,10 +169,12 @@ def _share(stages, st):
 
 
 def stage_night(n, s_ds, motion_events, beats):
-    """→ (stages, feats, caps_appliqués)."""
+    """→ (stages, feats, caps_appliqués). feats["lead"] = epochs de tête
+    forcés en éveil (avant le passage de l'anneau en mode sommeil)."""
     feats = epoch_features(n, s_ds, motion_events, beats)
+    lead = feats["lead"] = leading_gap(n, s_ds, motion_events, beats)
     bias = {}
-    stages = viterbi(feats, n, bias)
+    stages = viterbi(feats, n, bias, lead)
     capped = []
     for st, cap in CAPS.items():
         if _share(stages, st) <= cap:
@@ -158,12 +183,12 @@ def stage_night(n, s_ds, motion_events, beats):
         for _ in range(8):
             mid = (lo + hi) / 2
             bias[st] = mid
-            if _share(viterbi(feats, n, bias), st) > cap:
+            if _share(viterbi(feats, n, bias, lead), st) > cap:
                 hi = mid
             else:
                 lo = mid
         bias[st] = lo
-        stages = viterbi(feats, n, bias)
+        stages = viterbi(feats, n, bias, lead)
         capped.append(st)
     return stages, feats, capped
 

@@ -10,7 +10,8 @@ Lit oura.db (brut open_oura, lecture seule) et écrit derived.db :
                   sous-scores et score (estimé)
   night_staging   hypnogramme 30 s (heuristique ouverte, cf. staging.py)
   night_series    séries 5 min pour les graphes (FC, HRV, respiration, mouvement, T°)
-  baselines       lignes de base personnelles (nuits antérieures à la dernière)
+  baselines       lignes de base personnelles (nuits SAINES antérieures à la
+                  dernière ; chaque nuit garde aussi les siennes : ref_json)
   readiness       contributeurs de récupération + signes de tension, par jour
   activity_daily  activité par jour civil (MET, inactivité, calories estimées)
   llm_briefings   résumé LLM de la dernière nuit (régénéré si ses entrées changent)
@@ -20,7 +21,14 @@ Définitions alignées sur la documentation Oura quand elle existe :
   l'anneau) pendant le sommeil ; HRV = moyenne des RMSSD 5 min (+ max) ;
 - Recovery Index = sommeil restant après la FC la plus basse (optimal ≥ 6 h) ;
 - écart de température = nuit − médiane des nuits précédentes (≤ 30),
-  « provisoire » avant 14 nuits (Oura : ~2 semaines de calibrage).
+  « provisoire » avant 14 nuits (Oura : ~2 semaines de calibrage) ;
+- références personnelles : nuits antérieures SAINES seulement (sont exclues
+  les nuits qui suivent un jour noté « maladie » dans le journal et celles
+  qui présentent des signes de tension marqués), sinon une infection gonfle
+  la moyenne et l'écart-type et masque les écarts des nuits suivantes ;
+- une nuit reste « provisoire » tant qu'aucun signe d'éveil n'a été observé
+  après la fin de sa fenêtre (l'anneau la prolonge au fil de la nuit) : pas de
+  résumé du matin avant sa clôture.
 
 Tout est calculé localement, sans modèle propriétaire ; les scores sont des
 ESTIMATIONS (staging heuristique, pondérations publiques ou locales).
@@ -42,7 +50,7 @@ from datetime import datetime, timedelta
 import oura_core as oc
 import staging
 
-VERSION = 2                      # incrémenter → recalcul de toutes les nuits
+VERSION = 3                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 # Résumé du matin : le 27B résident de la RTX 3090 (préchargé par llama-swap,
 # jamais déchargé) quand il est disponible, sinon le 4B de la P40. On ne
@@ -57,7 +65,19 @@ SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_alg
                 "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
 SLEEP_NEED_H = 8.0               # milieu de la plage NSF 7–9 h (adultes)
 TEMP_BASE_NIGHTS = 30
+REF_NIGHTS = 60
 BASE_RELIABLE_N = 14
+SICK_TAG = "maladie"
+
+# Clôture de la nuit. L'anneau réémet la fenêtre « bedtime » en cours au fil de
+# la nuit (fin = heure d'émission), parfois après 4 à 5 h sans révision : une
+# nuit n'est close qu'une fois un signe d'éveil observé APRÈS la fin de sa
+# fenêtre. Rejeu aux heures du timer sur 19 nuits réelles : 0 nuit tronquée,
+# clôture ~40 min après le réveil (médiane), contre 12 nuits tronquées de 1 h 30
+# à 4 h 15 avec l'ancienne règle « fin + 45 min ».
+CLOSE_HR_MEASURES = 3            # mesures de FC de jour (tag 128) après fin + 5 min
+CLOSE_MET_MIN = 10               # minutes à ≥ 1,5 MET après la fin
+CLOSE_FALLBACK_S = 6 * 3600      # sans signe d'éveil (téléphone muet…) : close à fin + 6 h
 
 
 # ---------------------------------------------------------------- utilitaires
@@ -358,6 +378,38 @@ def compute_night(con, axis, night, charging):
     return row
 
 
+def night_closed(con, axis, night, now):
+    """La nuit est-elle terminée ? → (bool, motif). Signe d'éveil APRÈS la fin
+    de la fenêtre, parmi les données captées à `now` : reprise des mesures de
+    FC de jour (tag 128, suspendues pendant le sommeil) ou de l'activité
+    (≥ 10 min à ≥ 1,5 MET). Sans aucun signe (téléphone muet), repli à fin + 6 h."""
+    end = night["end_unix"]
+    hr = 0
+    for rt, cap in oc.rows(con, "SELECT ring_timestamp, captured_unix FROM events WHERE tag=?"
+                                " AND captured_unix>=? AND captured_unix<=?",
+                           (oc.T_GREEN_IBI, int(end) - 3600, int(now))):
+        t = axis(rt, cap)
+        if t is not None and t > end + 300:
+            hr += 1
+    if hr >= CLOSE_HR_MEASURES:
+        return True, "FC de jour reprise"
+    met = 0
+    for rt, cap, dj in oc.rows(con, "SELECT ring_timestamp, captured_unix, decoded_json FROM events"
+                                    " WHERE tag=? AND captured_unix>=? AND captured_unix<=?",
+                               (oc.T_ACTIVITY, int(end) - 3600, int(now))):
+        vals = (oc.jget(dj) or {}).get("met") or []
+        t_end = axis(rt, cap)
+        if t_end is None:
+            continue
+        met += sum(1 for k, v in enumerate(vals)
+                   if v is not None and v >= 1.5 and t_end - (len(vals) - k) * oc.MET_BIN_S >= end)
+    if met >= CLOSE_MET_MIN:
+        return True, "activité reprise"
+    if now - end >= CLOSE_FALLBACK_S:
+        return True, "délai écoulé sans signe d'éveil"
+    return False, None
+
+
 # ---------------------------------------------------------------- schéma
 
 SLEEP_COLS = [
@@ -372,6 +424,7 @@ SLEEP_COLS = [
     ("start_unix", "INTEGER"), ("stop_unix", "INTEGER"), ("onset_unix", "INTEGER"),
     ("end_unix", "INTEGER"), ("staging_source", "TEXT"), ("subscores", "TEXT"),
     ("score_source", "TEXT"), ("axis_mode", "TEXT"), ("version", "INTEGER"),
+    ("provisional", "INTEGER"), ("ref_json", "TEXT"), ("ref_excluded", "TEXT"),
     ("input_hash", "TEXT"), ("ts", "INTEGER"),
 ]
 
@@ -437,21 +490,6 @@ def nights_table(der):
     return out
 
 
-def update_temperature_deviation(der, nights):
-    """Écart de température = nuit − médiane des nuits STRICTEMENT antérieures
-    (≤ 30). Aucune valeur avant 3 nuits ; « provisoire » avant 14."""
-    for i, n in enumerate(nights):
-        prev = [p["temp_mean"] for p in nights[max(0, i - TEMP_BASE_NIGHTS):i]
-                if p["temp_mean"] is not None]
-        dev, status = None, "calibrage"
-        if n["temp_mean"] is not None and len(prev) >= 3:
-            dev = round(n["temp_mean"] - statistics.median(prev), 2)
-            status = "fiable" if len(prev) >= BASE_RELIABLE_N else "provisoire"
-        n["temp_dev"], n["temp_n"], n["temp_status"] = dev, len(prev), status
-        der.execute("UPDATE sleep_scores SET temp_dev=?, temp_n=?, temp_status=? WHERE night=?",
-                    (dev, len(prev), status, n["night"]))
-
-
 BASELINE_METRICS = ("hr_min", "hr_mean", "hrv_rmssd", "resp_rate", "temp_mean", "total",
                     "efficiency", "score", "deep", "rem", "waso", "recovery_index")
 
@@ -464,10 +502,73 @@ def base_stats(vals):
             "median": statistics.median(vals), "n": len(vals)}
 
 
+def sick_nights(der):
+    """Nuits qui suivent un jour noté « maladie » dans le journal : le tag du
+    jour J décrit la journée, la nuit concernée est celle qui se termine le
+    matin de J+1 (même convention que la page Sommeil)."""
+    out = set()
+    for (day,) in der.execute("SELECT DISTINCT day FROM tags WHERE kind=?", (SICK_TAG,)):
+        try:
+            out.add((datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def ref_stats(ref):
+    """Statistiques de référence par métrique (format de la table baselines)."""
+    out = {}
+    for m in BASELINE_METRICS:
+        b = base_stats([p.get(m) for p in ref])
+        if b:
+            out[m] = {"mean": round(b["mean"], 3), "sd": round(b["sd"], 3),
+                      "median": round(b["median"], 3), "n": b["n"]}
+    return out
+
+
+def update_references(der, nights):
+    """Passe chronologique, causale : pour chaque nuit, les références sont les
+    nuits SAINES strictement antérieures (≤ 60 ; ≤ 30 pour la température).
+
+    Une nuit est exclue des références des nuits suivantes si elle suit un jour
+    noté « maladie » dans le journal, ou si elle présente elle-même des signes
+    de tension marqués (calculés contre ses propres références) : une infection
+    non notée ne doit pas non plus gonfler la moyenne et l'écart-type.
+
+    Écrit pour chaque nuit l'écart de température, ses références figées
+    (ref_json, affichées sur sa page même des semaines plus tard) et le motif
+    d'exclusion ; renseigne n["_ref"] et n["_tension"] pour la récupération."""
+    sick = sick_nights(der)
+    clean = []
+    for i, n in enumerate(nights):
+        ref = clean[-REF_NIGHTS:]
+        prev_t = [p["temp_mean"] for p in clean[-TEMP_BASE_NIGHTS:] if p["temp_mean"] is not None]
+        dev, status = None, "calibrage"
+        if n["temp_mean"] is not None and len(prev_t) >= 3:
+            dev = round(n["temp_mean"] - statistics.median(prev_t), 2)
+            status = "fiable" if len(prev_t) >= BASE_RELIABLE_N else "provisoire"
+        n["temp_dev"], n["temp_n"], n["temp_status"] = dev, len(prev_t), status
+        n["_ref"] = ref
+        n["_tension"] = tension_for(i, nights, ref)
+        reason = ("maladie (journal)" if n["night"] in sick else
+                  "signes de tension marqués" if n["_tension"]["level"] == "marqués" else None)
+        n["ref_json"] = json.dumps(ref_stats(ref))
+        n["ref_excluded"] = reason
+        der.execute("UPDATE sleep_scores SET temp_dev=?, temp_n=?, temp_status=?, ref_json=?,"
+                    " ref_excluded=? WHERE night=?",
+                    (dev, len(prev_t), status, n["ref_json"], reason, n["night"]))
+        if reason is None:
+            clean.append(n)
+
+
 def update_baselines(der, nights, now):
-    """Lignes de base affichées : nuits antérieures à la dernière (≤ 60)."""
+    """Lignes de base affichées : références de la dernière nuit, c.-à-d. les
+    nuits saines qui la précèdent (≤ 60)."""
     der.execute("DELETE FROM baselines")
-    prev = nights[:-1][-60:]
+    if not nights:
+        return
+    last = nights[-1]
+    prev = last["_ref"] if "_ref" in last else nights[:-1][-REF_NIGHTS:]
     for m in BASELINE_METRICS:
         b = base_stats([p.get(m) for p in prev])
         if b:
@@ -478,11 +579,11 @@ def update_baselines(der, nights, now):
 
 # ---------------------------------------------------------------- récupération
 
-def readiness_for(i, nights, activity):
+def readiness_for(i, nights, activity, ref=None):
     """Contributeurs de type Readiness (Oura) pour le jour de la nuit i.
     Chaque contributeur 0–100, None si données insuffisantes."""
     n = nights[i]
-    prev = nights[max(0, i - 60):i]
+    prev = nights[max(0, i - REF_NIGHTS):i] if ref is None else ref
     c = {}
 
     b = base_stats([p["hr_min"] for p in prev])
@@ -546,12 +647,12 @@ def readiness_for(i, nights, activity):
     return score, c, len(prev)
 
 
-def tension_for(i, nights):
+def tension_for(i, nights, ref=None):
     """Signes de tension (analogue non diagnostique du Symptom Radar Oura) :
     écarts simultanés de la FC la plus basse, de la FC moyenne, du HRV, de la
     température et de la respiration par rapport aux nuits antérieures."""
     n = nights[i]
-    prev = nights[max(0, i - 60):i]
+    prev = nights[max(0, i - REF_NIGHTS):i] if ref is None else ref
     sig = []
 
     def chk(metric, label, unit, cond, strong=None):
@@ -581,8 +682,8 @@ def tension_for(i, nights):
 
 def update_readiness(der, nights, activity, now):
     for i, n in enumerate(nights):
-        score, contrib, nb = readiness_for(i, nights, activity)
-        tension = tension_for(i, nights)
+        score, contrib, nb = readiness_for(i, nights, activity, n.get("_ref"))
+        tension = n.get("_tension") or tension_for(i, nights, n.get("_ref"))
         der.execute("INSERT OR REPLACE INTO readiness (day, score, contributors, tension, n_base,"
                     " provisional, ts) VALUES (?,?,?,?,?,?,?)",
                     (n["night"], score, json.dumps(contrib, ensure_ascii=False),
@@ -621,7 +722,8 @@ def worn_minutes(con, axis, t0, t1, charging):
     return hot
 
 
-def compute_activity_day(con, axis, day, sleep_windows, charging, weight):
+def compute_activity_day(con, axis, day, sleep_windows, charging, weight, now=None):
+    now = time.time() if now is None else now
     t0 = datetime.strptime(day, "%Y-%m-%d").timestamp()
     t1 = t0 + 86400
     mets = oc.met_minutes(con, axis, t0, t1)
@@ -650,7 +752,7 @@ def compute_activity_day(con, axis, day, sleep_windows, charging, weight):
             "inactive_min": len(inactive), "low_min": low, "medium_min": med, "high_min": high,
             "met_min_mh": round(met_mh, 1), "sedentary_bouts": bouts, "active_kcal": round(kcal),
             "easy_day": int(high <= 15 and med + high <= 85),
-            "partial": int(len(awake) < 600 or t1 > time.time())}
+            "partial": int(len(awake) < 600 or t1 > now)}
 
 
 def activity_contributors(day, activity):
@@ -692,7 +794,7 @@ def update_activity(con, der, axis, nights_raw, charging, recompute_all, now):
     while d <= today:
         day = d.strftime("%Y-%m-%d")
         if recompute_all or day not in known or known[day] or (today - d).days <= 1:
-            a = compute_activity_day(con, axis, day, windows, charging, weight)
+            a = compute_activity_day(con, axis, day, windows, charging, weight, now)
             der.execute("INSERT OR REPLACE INTO activity_daily (day, worn_min, sleep_min, inactive_min,"
                         " low_min, medium_min, high_min, met_min_mh, sedentary_bouts, active_kcal, easy_day,"
                         " partial, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -705,6 +807,11 @@ def update_activity(con, der, axis, nights_raw, charging, recompute_all, now):
     der.row_factory = None
     for day in act:
         score, contrib = activity_contributors(day, act)
+        if act[day]["partial"]:
+            # journée en cours (ou trop peu de minutes d'éveil mesurées) : les
+            # contributeurs restent visibles, mais un score sur 3 h de données
+            # (inactivité faible → « Optimal ») serait trompeur
+            score = None
         der.execute("UPDATE activity_daily SET score=?, contributors=? WHERE day=?",
                     (score, json.dumps(contrib, ensure_ascii=False), day))
         act[day]["score"], act[day]["contributors"] = score, contrib
@@ -766,14 +873,15 @@ REF_METRICS = (("fc_la_plus_basse_bpm", "hr_min", 1), ("fc_moyenne_sommeil_bpm",
                ("sommeil_total_h", "total", 2), ("efficacite_pct", "efficiency", 1))
 
 
-def reference_comparison(nights):
-    """Valeur de la nuit vs moyenne des nuits précédentes (≤ 60), calculée ici :
-    un petit modèle se trompe dans les soustractions et les sens de variation."""
-    last, prev = nights[-1], nights[:-1][-60:]
+def reference_comparison(night):
+    """Valeur de la nuit vs ses références (nuits saines antérieures, ≤ 60 :
+    les mêmes que le portail, cf. update_references), calculée ici : un petit
+    modèle se trompe dans les soustractions et les sens de variation."""
+    refs = json.loads(night.get("ref_json") or "{}")
     out = {}
     for name, key, nd in REF_METRICS:
-        v = last.get(key)
-        b = base_stats([p.get(key) for p in prev])
+        v = night.get(key)
+        b = refs.get(key)
         if v is None or not b or b["n"] < 3:
             continue
         out[name] = {"nuit": round(v, nd), "reference": round(b["mean"], nd),
@@ -785,7 +893,8 @@ def briefing_context(der, night, days=14):
     """Contexte du résumé : la nuit à résumer À PART des nuits de comparaison,
     contributeurs réduits à « nom → score » (un modèle de 4 milliards de
     paramètres se perd sinon dans le JSON imbriqué)."""
-    nights = [n for n in nights_table(der) if n["night"] <= night][-days:]
+    upto = [n for n in nights_table(der) if n["night"] <= night]
+    nights = upto[-days:]
     if not nights:
         return json.dumps({})
     rd = der.execute("SELECT score, contributors, tension FROM readiness WHERE day=?", (night,)).fetchone()
@@ -804,7 +913,7 @@ def briefing_context(der, night, days=14):
         "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
         ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
     ctx = {"nuit_a_resumer": _brief_night(nights[-1]),
-           "comparaison_a_vos_references": reference_comparison(nights),
+           "comparaison_a_vos_references": reference_comparison(upto[-1]),
            "recuperation_du_jour": rec,
            "nuits_precedentes_pour_comparaison": [_brief_night(n) for n in nights[:-1]],
            "journal": tags}
@@ -955,14 +1064,14 @@ def briefing_hash(ctx):
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def maybe_briefing(der, latest, now, min_age_s=2700, upgrade_window_s=18 * 3600, log=print):
-    """(Ré)écrit le résumé de la dernière nuit, une fois la nuit stabilisée
-    (fin de fenêtre il y a ≥ 45 min : l'anneau révise son analyse pendant ~1 h) :
+def maybe_briefing(der, latest, now, upgrade_window_s=18 * 3600, log=print):
+    """(Ré)écrit le résumé de la dernière nuit, une fois la nuit CLOSE (signe
+    d'éveil observé après la fin de sa fenêtre, cf. night_closed) :
     - entrées modifiées → réécriture ;
     - résumé écrit par le 4B faute de 3090 libre → réécrit par le 27B dès qu'il
       redevient disponible (pendant 18 h après le réveil)."""
     stop = latest.get("stop_unix") or now
-    if now - stop < min_age_s:
+    if latest.get("provisional"):
         return
     ctx = briefing_context(der, latest["night"])
     h = briefing_hash(ctx)
@@ -1011,8 +1120,18 @@ def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
             f"FC basse {row['hr_min']}, HRV {row['hrv_rmssd']}, resp {row['resp_rate']}, axe {row['axis_mode']})")
     der.commit()
 
+    # nuit en cours ? (seule la dernière peut l'être)
+    der.execute("UPDATE sleep_scores SET provisional=0")
+    if nights_raw:
+        last = nights_raw[-1]
+        closed, _why = night_closed(con, axis, last, now)
+        der.execute("UPDATE sleep_scores SET provisional=? WHERE night=?", (int(not closed), last["night"]))
+        if not closed:
+            log(f"nightly: nuit {last['night']} en cours (aucun signe d'éveil après "
+                f"{datetime.fromtimestamp(last['end_unix']).strftime('%H:%M')}) — provisoire, pas de résumé")
+
     nights = nights_table(der)
-    update_temperature_deviation(der, nights)
+    update_references(der, nights)
     update_baselines(der, nights, now)
     activity = update_activity(con, der, axis, nights_raw, charging, recompute_all, now)
     update_readiness(der, nights, activity, now)

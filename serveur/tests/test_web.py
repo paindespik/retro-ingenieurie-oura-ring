@@ -59,6 +59,15 @@ class WebTest(unittest.TestCase):
         self.assertTrue(d["series"])
         self.assertEqual(d["readiness"]["tension"]["level"], "marqués")
 
+    def test_night_uses_its_own_references(self):
+        d = self.c.get(f"/api/night?date={self.night}").json()
+        self.assertNotIn("ref", d["night"])
+        self.assertEqual(d["baselines"]["hr_min"]["n"], 3)          # les 3 nuits saines précédentes
+        first = self.c.get("/api/nights").json()["nights"][0]["night"]
+        self.assertEqual(self.c.get(f"/api/night?date={first}").json()["baselines"], {})
+        o = self.c.get("/api/overview").json()
+        self.assertIn("provisional", o["night"])
+
     def test_overview_state_is_text(self):
         o = self.c.get("/api/overview").json()
         st = o["ring"]["state"]

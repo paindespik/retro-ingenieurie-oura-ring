@@ -200,5 +200,166 @@ class RecoveryTest(Base):
         self.assertTrue(math.isclose(oc.lerp_score(4, pts), 67.5))
 
 
+
+class LeadingGapTest(unittest.TestCase):
+    """L'anneau ouvre la fenêtre de sommeil quelques minutes avant ses premières
+    données de nuit : ces epochs sans données sont de l'éveil (latence)."""
+
+    def test_epochs_before_first_data_are_awake(self):
+        n, s_ds, lead = 200, 0, 24
+        motion = [(s_ds + (i + 1) * staging.EPOCH_DS, 0.1) for i in range(lead, n)]
+        beats, t = [], s_ds + lead * staging.EPOCH_DS
+        while t < s_ds + n * staging.EPOCH_DS:
+            t += 10.0                                  # 1 battement/s (ds)
+            beats.append((t, 1000))
+        self.assertEqual(staging.leading_gap(n, s_ds, motion, beats), lead)
+        stages, feats, _ = staging.stage_night(n, s_ds, motion, beats)
+        self.assertEqual(feats["lead"], lead)
+        self.assertTrue(all(x == "awake" for x in stages[:lead]))
+        sm = staging.summarize(stages, feats["motion"])
+        self.assertGreaterEqual(sm["latency"], lead * 30)
+
+    def test_no_data_no_forcing(self):
+        self.assertEqual(staging.leading_gap(50, 0, [], []), 0)
+
+
+class LatencyNightTest(Base):
+    nights = 3
+    sick_last = False
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.raw = os.path.join(cls.tmp.name, "oura.db")
+        cls.der = os.path.join(cls.tmp.name, "derived.db")
+        cls.ring = synth.build(cls.raw, nights=cls.nights, lead_min=12)
+        dn.run(cls.raw, cls.der, recompute_all=True, log=lambda *_: None)
+        cls.con = sqlite3.connect(f"file:{cls.raw}?mode=ro", uri=True)
+        d = sqlite3.connect(cls.der)
+        d.row_factory = sqlite3.Row
+        cls.rows = [dict(r) for r in d.execute("SELECT * FROM sleep_scores ORDER BY night")]
+        cls.derived = d
+
+    def test_latency_measured(self):
+        for r in self.rows:
+            self.assertGreaterEqual(r["latency"], 11, r["night"])   # gigue ± 1 s des paquets
+            self.assertLess(r["latency"], 30, r["night"])
+
+
+class OpenNightTest(Base):
+    """Au réveil, tant qu'aucun signe d'éveil n'a suivi la fin de la fenêtre,
+    la nuit est provisoire et aucun résumé n'est rédigé."""
+    nights = 5
+    sick_last = False
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.raw = os.path.join(cls.tmp.name, "oura.db")
+        cls.der = os.path.join(cls.tmp.name, "derived.db")
+        cls.ring = synth.build(cls.raw, nights=cls.nights)
+        cls.con = sqlite3.connect(f"file:{cls.raw}?mode=ro", uri=True)
+        cls.axis = oc.TimeAxis(cls.con)
+        cls.raw_nights = oc.load_nights(cls.con, cls.axis)
+        cls.wake = cls.raw_nights[-1]["end_unix"]
+        dn.run(cls.raw, cls.der, recompute_all=True, now=cls.wake + 3600, log=lambda *_: None)
+        d = sqlite3.connect(cls.der)
+        d.row_factory = sqlite3.Row
+        cls.rows = [dict(r) for r in d.execute("SELECT * FROM sleep_scores ORDER BY night")]
+        cls.act = {r["day"]: dict(r) for r in d.execute("SELECT * FROM activity_daily")}
+        cls.derived = d
+
+    def test_closure_rule(self):
+        last, prev = self.raw_nights[-1], self.raw_nights[-2]
+        self.assertFalse(dn.night_closed(self.con, self.axis, last, last["end_unix"] + 3600)[0])
+        ok, why = dn.night_closed(self.con, self.axis, last, last["end_unix"] + dn.CLOSE_FALLBACK_S)
+        self.assertTrue(ok)
+        self.assertIn("délai", why)
+        # la nuit précédente : l'activité de la journée suivante prouve le réveil
+        ok, why = dn.night_closed(self.con, self.axis, prev, prev["end_unix"] + 6 * 3600 - 300)
+        self.assertTrue(ok)
+        self.assertIn("activité", why)
+
+    def test_only_last_night_provisional(self):
+        self.assertEqual(self.rows[-1]["provisional"], 1)
+        self.assertTrue(all(r["provisional"] == 0 for r in self.rows[:-1]))
+
+    def test_no_briefing_on_open_night(self):
+        calls = []
+        orig = dn.llm_briefing
+        dn.llm_briefing = lambda *a, **k: calls.append(a) or "texte"
+        orig_choose = dn.choose_model
+        dn.choose_model = lambda: dn.LLM_MODEL
+        try:
+            dn.maybe_briefing(self.derived, self.rows[-1], self.wake + 3600, log=lambda *_: None)
+            self.assertEqual(calls, [])
+            closed = dict(self.rows[-1], provisional=0)
+            dn.maybe_briefing(self.derived, closed, self.wake + 3600, log=lambda *_: None)
+            self.assertEqual(len(calls), 1)
+        finally:
+            dn.llm_briefing, dn.choose_model = orig, orig_choose
+
+    def test_partial_day_has_no_score(self):
+        today = max(self.act)
+        self.assertEqual(self.act[today]["partial"], 1)
+        self.assertIsNone(self.act[today]["score"])
+        complete = [a for a in self.act.values() if not a["partial"]]
+        self.assertTrue(complete and all(a["score"] is not None for a in complete[2:]))
+
+
+class HealthyReferenceTest(Base):
+    """Nuit malade au milieu de la série (signes marqués) et nuit notée
+    « maladie » dans le journal : exclues des références des nuits suivantes."""
+    nights = 8
+    sick_last = False
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.raw = os.path.join(cls.tmp.name, "oura.db")
+        cls.der = os.path.join(cls.tmp.name, "derived.db")
+        cls.ring = synth.build(cls.raw, nights=cls.nights, sick=(4,))
+        d = sqlite3.connect(cls.der)
+        dn.ensure_schema(d)
+        # tag du jour J → nuit J+1 : la nuit d'indice 6 se termine le 08/09
+        d.execute("INSERT INTO tags (day, kind, note, created_unix) VALUES ('2026-09-07', 'maladie', NULL, 0)")
+        d.commit()
+        d.close()
+        dn.run(cls.raw, cls.der, recompute_all=True, log=lambda *_: None)
+        cls.con = sqlite3.connect(f"file:{cls.raw}?mode=ro", uri=True)
+        d = sqlite3.connect(cls.der)
+        d.row_factory = sqlite3.Row
+        cls.rows = [dict(r) for r in d.execute("SELECT * FROM sleep_scores ORDER BY night")]
+        cls.readiness = {r["day"]: dict(r) for r in d.execute("SELECT * FROM readiness")}
+        cls.derived = d
+
+    def test_exclusions(self):
+        self.assertEqual(self.rows[6]["night"], "2026-09-08")
+        self.assertEqual(self.rows[4]["ref_excluded"], "signes de tension marqués")
+        self.assertEqual(self.rows[6]["ref_excluded"], "maladie (journal)")
+        self.assertEqual([r["night"] for r in self.rows if r["ref_excluded"]],
+                         [self.rows[4]["night"], self.rows[6]["night"]])
+
+    def test_references_skip_sick_nights(self):
+        last = self.rows[-1]
+        self.assertEqual(self.readiness[last["night"]]["n_base"], 5)      # 0,1,2,3,5
+        ref = json.loads(last["ref_json"])
+        healthy = [r["hr_min"] for i, r in enumerate(self.rows[:-1]) if i not in (4, 6)]
+        self.assertAlmostEqual(ref["hr_min"]["mean"], sum(healthy) / len(healthy), places=2)
+        b = dict(self.derived.execute("SELECT metric, n FROM baselines").fetchall())
+        self.assertEqual(b["hr_min"], 5)
+        # la nuit qui suit la nuit malade n'est pas comparée à elle
+        after = self.rows[5]
+        self.assertEqual(json.loads(after["ref_json"])["hr_min"]["n"], 4)
+        self.assertEqual(json.loads(self.readiness[after["night"]]["tension"])["level"], "aucun")
+
+    def test_briefing_uses_same_references(self):
+        night = self.rows[-1]["night"]
+        cmp_ = json.loads(dn.briefing_context(self.derived, night))["comparaison_a_vos_references"]
+        ref = json.loads(self.rows[-1]["ref_json"])
+        self.assertEqual(cmp_["fc_la_plus_basse_bpm"]["nuits_de_reference"], 5)
+        self.assertAlmostEqual(cmp_["fc_la_plus_basse_bpm"]["reference"], round(ref["hr_min"]["mean"], 1))
+
+
 if __name__ == "__main__":
     unittest.main()

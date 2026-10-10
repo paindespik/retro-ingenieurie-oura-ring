@@ -57,11 +57,14 @@ class Ring:
             self.ev(66, "time_sync", rt, {"unix_time": int(t + self.rnd.uniform(-noise, noise))})
             t += every
 
-    def night(self, bed, wake, hr_base=62.0, hr_boost=0.0, temp=35.2, rr=14.0):
+    def night(self, bed, wake, hr_base=62.0, hr_boost=0.0, temp=35.2, rr=14.0, lead_min=0):
         """Nuit simulée : FC en « hamac » (+ hr_boost), battements modulés par la
         respiration (arythmie sinusale à rr cycles/min), bins 5 min, mouvement,
-        température, fenêtre bedtime_period."""
+        température, fenêtre bedtime_period. lead_min : comme l'anneau réel, les
+        données du mode sommeil ne commencent que lead_min après le début de la
+        fenêtre."""
         rnd = self.rnd
+        win_start, bed = bed, bed + lead_min * 60
         dur = wake - bed
         # battements (tag 96) : paquets de 6, horodatage arrondi alterné
         t, beats, pkt = bed, [], []
@@ -104,7 +107,7 @@ class Ring:
                     {"temps_c": [round(temp + rnd.gauss(0, 0.05), 2) for _ in range(6)]})
             t += 300
         self.ev(118, "bedtime_period", self.rt(wake + 600),
-                {"bedtime_start_ds": self.rt(bed), "bedtime_end_ds": self.rt(wake)})
+                {"bedtime_start_ds": self.rt(win_start), "bedtime_end_ds": self.rt(wake)})
 
     def day(self, start, end, met_base=1.3):
         """Journée : MET (13 bins d'1 min alignés sur la fin), température cutanée."""
@@ -122,19 +125,23 @@ class Ring:
         self.con.close()
 
 
-def build(path, nights=5, sick_last=False, start=None):
-    """Base de `nights` nuits consécutives (la dernière éventuellement « malade »)."""
+def build(path, nights=5, sick_last=False, start=None, sick=(), lead_min=0):
+    """Base de `nights` nuits consécutives (la dernière éventuellement « malade »,
+    ainsi que celles d'indice `sick`)."""
     start = start or datetime(2026, 9, 1, 12, 0)
     t0 = start.timestamp() - 3600
     ring = Ring(path, t0)
     ring.time_syncs(t0 + 60, t0 + (nights + 1) * 86400)
     for i in range(nights):
         d = start + timedelta(days=i)
-        ring.day(d.timestamp(), (d + timedelta(hours=11)).timestamp())
+        # journée dès le réveil (07:30) sauf la première : ≥ 600 min d'éveil mesurées,
+        # donc des journées complètes (score d'activité)
+        day0 = d if i == 0 else d - timedelta(hours=4, minutes=30)
+        ring.day(day0.timestamp(), (d + timedelta(hours=11)).timestamp())
         bed = (d + timedelta(hours=11, minutes=30)).timestamp()     # 23:30
         wake = bed + 7.5 * 3600
-        sick = sick_last and i == nights - 1
-        ring.night(bed, wake, hr_boost=15 if sick else 0, temp=36.4 if sick else 35.2,
-                   rr=17 if sick else 14)
+        ill = (sick_last and i == nights - 1) or i in sick
+        ring.night(bed, wake, hr_boost=15 if ill else 0, temp=36.4 if ill else 35.2,
+                   rr=17 if ill else 14, lead_min=lead_min)
     ring.close()
     return ring

@@ -170,11 +170,21 @@ def night_row(r):
         return None
     r = dict(r)
     r["subscores"] = jparse(r.get("subscores"), {})
+    r["ref"] = jparse(r.pop("ref_json", None), None)
     return r
 
 
 def baselines(d):
     return {b["metric"]: b for b in safe_q(d, "SELECT * FROM baselines")} if d else {}
+
+
+def night_baselines(d, n):
+    """Références d'une nuit : celles figées à son calcul (nuits saines
+    antérieures), sinon les lignes de base courantes (base dérivée ancienne)."""
+    ref = n.pop("ref", None) if n else None
+    if ref is not None:                  # {} = aucune nuit de référence (première nuit)
+        return {m: dict(b, metric=m) for m, b in ref.items()}
+    return baselines(d)
 
 
 def readiness_row(r):
@@ -282,7 +292,7 @@ def overview():
     if d:
         n = night_row(safe_one(d, "SELECT * FROM sleep_scores ORDER BY night DESC LIMIT 1"))
         out["night"] = n
-        out["baselines"] = baselines(d)
+        out["baselines"] = night_baselines(d, n)
         if n:
             out["staging"] = staging_payload(d, n)
             out["readiness"] = readiness_row(safe_one(d, "SELECT * FROM readiness WHERE day=?", (n["night"],)))
@@ -334,7 +344,7 @@ def night(date: str = Query(..., pattern=DATE_RE)):
     out = {
         "night": n, "prev": prev["night"] if prev else None, "next": nxt["night"] if nxt else None,
         "prev_row": prev_row, "staging": staging_payload(d, n), "series": series,
-        "baselines": baselines(d),
+        "baselines": night_baselines(d, n),
         "readiness": readiness_row(safe_one(d, "SELECT * FROM readiness WHERE day=?", (date,))),
         "briefing": safe_one(d, "SELECT * FROM llm_briefings WHERE night=? ORDER BY ts DESC LIMIT 1", (date,)),
         "tags": safe_q(d, "SELECT * FROM tags WHERE day IN (?,?) ORDER BY created_unix", (day0, date)),

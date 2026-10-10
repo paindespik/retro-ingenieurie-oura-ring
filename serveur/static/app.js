@@ -115,7 +115,8 @@ function vsBase(v, b, { d = 0, unit = "", bad = 0, thr = 0, rel = false } = {}) 
 function vitalTiles(n, B) {
   if (!n) return `<div class="muted">aucune nuit</div>`;
   const out = [];
-  let x = vsBase(n.hr_min, B.hr_min, { d: 1, unit: "bpm", bad: 1, thr: 5 });
+  // même seuil que la carte « Signes de tension » : +5 bpm et au moins 2 écarts-types
+  let x = vsBase(n.hr_min, B.hr_min, { d: 1, unit: "bpm", bad: 1, thr: Math.max(5, 2 * ((B.hr_min && B.hr_min.sd) || 0)) });
   out.push(tile("FC la plus basse", num(n.hr_min, 0), "bpm",
     `${n.hr_lowest_at ? "à " + hm(n.hr_lowest_at) + " · " : ""}${x.html}`, x.cls));
   x = vsBase(n.hrv_rmssd, B.hrv_rmssd, { d: 0, unit: "ms", bad: -1, thr: 0.25, rel: true });
@@ -419,7 +420,7 @@ function sleepContribValue(k, n) {
     restfulness: `éveil après endormissement ${num(n.waso)} min · ${pl(n.awakenings ?? 0, "réveil")} > 5 min · ${num(n.movement)} min agitées`,
     rem: `${dur(n.rem)} · ${num((100 * n.rem) / sleep)} % (repère adulte 21–30 %)`,
     deep: `${dur(n.deep)} · ${num((100 * n.deep) / sleep)} % (repère adulte 16–20 %)`,
-    latency: `${num(n.latency)} min (repère < 30 min)`,
+    latency: `${num(n.latency)} min (repère Oura 15–20 min)`,
     timing: `milieu du sommeil ${hmDec(n.timing)} (repère 00:00–03:00 selon le chronotype)`,
   }[k];
 }
@@ -457,23 +458,33 @@ async function pageToday(m) {
   const n = o.night, rd = o.readiness, a = o.activity, B = o.baselines || {};
   let html = "";
   if (rd && rd.tension && rd.tension.level !== "aucun") html += tensionCard(rd.tension, n && n.night);
+  const open = !!(n && n.provisional);   // nuit pas encore close (aucun signe d'éveil)
   const aSub = a ? (a.partial ? "journée en cours" : undefined) : "pas de données";
-  const rSub = rd ? (rd.score == null ? "calibrage" : `${RATING[ratingOf(rd.score)]}${rd.provisional ? " · provisoire" : ""}`) : "—";
+  const rSub = rd ? (rd.score == null ? "calibrage" : open ? "provisoire · nuit en cours"
+    : `${RATING[ratingOf(rd.score)]}${rd.provisional ? " · provisoire" : ""}`) : "—";
+  const openBadge = open ? `<span class="badge warn">nuit en cours · provisoire</span>` : "";
   html += `<div class="card"><div class="rings">
-      ${ring(n ? n.score : null, "Sommeil", n ? dayLabel(n.night) : "aucune nuit", n ? "#/sommeil/" + n.night : null)}
+      ${ring(n ? n.score : null, "Sommeil", n ? (open ? "nuit en cours" : dayLabel(n.night)) : "aucune nuit", n ? "#/sommeil/" + n.night : null)}
       ${ring(rd ? rd.score : null, "Récupération", rSub, n ? "#/recuperation/" + n.night : null)}
       ${ring(a ? a.score : null, "Activité", aSub, "#/activite/" + today())}</div></div>`;
-  html += `<div class="card"><h2>Constantes de la nuit <span class="right small">${n ? dayLong(n.night) : ""}</span></h2>
+  if (open) {
+    html += `<div class="card small muted">${openBadge} L'anneau prolonge encore la fenêtre de sommeil (dernière mise à jour
+      ${hm(n.stop_unix)}) : les chiffres de la nuit sont provisoires et le résumé du matin sera rédigé une fois le réveil
+      détecté (reprise des mesures de FC de jour ou de l'activité).</div>`;
+  }
+  html += `<div class="card"><h2>Constantes de la nuit ${openBadge} <span class="right small">${n ? dayLong(n.night) : ""}</span></h2>
       <div class="tiles">${vitalTiles(n, B)}</div></div>`;
   const b = o.briefing;
   html += `<div class="grid">
     <div class="card"><h2>Nuit dernière ${n ? `<a class="right small" href="#/sommeil/${n.night}">détail ›</a>` : ""}</h2>
       <div id="mini-hyp"></div>
       ${n ? `<div class="small muted">${n.bedtime} → ${n.wake_time} · ${dur(n.total)} de sommeil · efficacité ${num(n.efficiency)} %</div>` : ""}</div>
-    <div class="card"><h2>Résumé du matin ${b ? `<span class="badge">${esc(b.model)}</span>` : ""}
-      ${b && b.stale ? `<span class="badge warn">données modifiées depuis</span>` : ""}
+    <div class="card"><h2>Résumé du matin ${b && !(open && b.night !== n.night) ? `<span class="badge">${esc(b.model)}</span>` : ""}
+      ${b && b.stale && !open ? `<span class="badge warn">données modifiées depuis</span>` : ""}
+      ${b && open && b.night === n.night ? `<span class="badge warn">rédigé avant la fin de la nuit</span>` : ""}
       ${b && b.checked === 0 ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
-      ${b ? `<div class="brief">${esc(b.text)}</div><div class="tiny muted" style="margin-top:.4rem">nuit du ${dayLabel(b.night)} · rédigé ${ago(b.ts)} par un modèle local${b.stale ? " — régénéré automatiquement au prochain passage" : ""}</div>`
+      ${open && (!b || b.night !== n.night) ? `<div class="muted small">Nuit en cours : le résumé sera rédigé une fois le réveil détecté.</div>`
+      : b ? `<div class="brief">${esc(b.text)}</div><div class="tiny muted" style="margin-top:.4rem">nuit du ${dayLabel(b.night)} · rédigé ${ago(b.ts)} par un modèle local${open ? " — réécrit une fois la nuit terminée" : b.stale ? " — régénéré automatiquement au prochain passage" : ""}</div>`
       : `<div class="muted small">Aucun résumé pour l'instant (rédigé chaque matin par le LLM local).</div>`}</div></div>`;
   const r = o.ring, live = o.live || {};
   const push = r.push && r.push.phone;
@@ -502,13 +513,13 @@ async function pageSleep(m, date) {
   const n = d.night, B = d.baselines || {}, sub = n.subscores || {};
   const S = d.series || [];
   let html = `<div class="card"><div class="row" style="justify-content:space-between">
-      ${dayNav("#/sommeil", date, d.prev, d.next)}<span class="badge">${esc(n.staging_source)}</span></div>
+      ${dayNav("#/sommeil", date, d.prev, d.next)}<span>${n.provisional ? `<span class="badge warn">nuit en cours · provisoire</span> ` : ""}${n.ref_excluded ? `<span class="badge" title="Cette nuit n'entre pas dans vos références personnelles">hors références : ${esc(n.ref_excluded)}</span> ` : ""}<span class="badge">${esc(n.staging_source)}</span></span></div>
     <div class="row" style="margin-top:.6rem;align-items:flex-start">
       <div style="flex:0 0 auto">${ring(n.score, "Score de sommeil", d.prev_row && n.score != null && d.prev_row.score != null ? `${signed(n.score - d.prev_row.score)} vs nuit préc.` : undefined)}</div>
       <div class="tiles" style="flex:1 1 320px">
         ${tile("Sommeil total", dur(n.total), "", `au lit ${dur(n.in_bed)}`)}
         ${tile("Efficacité", num(n.efficiency), "%", "repère > 85 %")}
-        ${tile("Latence", num(n.latency), "min", "repère < 30 min", n.latency > 30 ? "up-bad" : "")}
+        ${tile("Latence", num(n.latency), "min", "repère 15–20 min", n.latency > 30 ? "up-bad" : "")}
         ${tile("Éveil après endormissement", num(n.waso), "min", `${pl(n.awakenings ?? 0, "réveil")} > 5 min`, n.waso > 20 ? "up-bad" : "")}
         ${tile("Au lit", `${n.bedtime}–${n.wake_time}`, "", `endormi ${hm(n.onset_unix)} · réveil ${hm(n.end_unix)}`)}
         ${tile("Milieu du sommeil", hmDec(n.timing), "", "repère 00:00–03:00")}
@@ -539,7 +550,10 @@ async function pageSleep(m, date) {
       <div class="brief">${esc(d.briefing.text)}</div><div class="tiny muted">rédigé ${dtShort(d.briefing.ts)}</div></div>`;
   }
   html += `<div class="card"><details><summary>Méthode et limites</summary><div class="small">
-    <p><b>Fenêtre de sommeil</b> : détectée par l'anneau (analyse embarquée « bedtime »). <b>Stades</b> : heuristique ouverte
+    <p><b>Fenêtre de sommeil</b> : détectée par l'anneau (analyse embarquée « bedtime »). Les minutes qui précèdent son
+    passage en mode sommeil (premières mesures de mouvement et de battements de nuit, en général 3 à 17 min après le coucher)
+    sont comptées comme éveil : la <b>latence</b> va du coucher détecté à la première période de 10 min de sommeil.
+    Tant qu'aucun signe d'éveil n'a suivi la fin de la fenêtre, la nuit est <b>provisoire</b> (l'anneau la prolonge). <b>Stades</b> : heuristique ouverte
     (mouvement de l'accéléromètre + FC et régularité de la FC battement par battement, lissage par modèle de Markov caché,
     a priori circadiens : peu de REM dans la première heure, profond plutôt en début de nuit), avec des plafonds
     physiologiques (profond ≤ 25 %, REM ≤ 30 %). Non validée contre polysomnographie : l'éveil calme et le REM restent
@@ -548,7 +562,9 @@ async function pageSleep(m, date) {
     sur 5 min calculés par l'anneau. <b>Indice de récupération</b> : sommeil restant après la FC la plus basse
     (Oura : optimal ≥ 6 h). <b>Respiration</b> : estimée à partir de l'arythmie sinusale respiratoire (variation de la FC
     avec la respiration) — expérimentale, non vérifiée contre une référence. <b>Température</b> : capteur cutané pendant le
-    sommeil ; l'écart est comparé à la médiane de vos nuits précédentes (provisoire avant 14 nuits).</p>
+    sommeil ; l'écart est comparé à la médiane de vos nuits saines précédentes (provisoire avant 14 nuits).</p>
+    <p><b>Références</b> : vos nuits précédentes, sans celles qui suivent un jour noté « malade » dans le journal ni celles
+    qui présentent des signes de tension marqués ; elles sont figées au calcul de chaque nuit.</p>
     <p><b>Score</b> : 7 contributeurs pondérés 35/15/10/10/10/10/10 (pondération Oura publiée), barèmes publics pour
     durée/stades/efficacité/latence/horaire et barème local pour la tranquillité (seuils NSF). ${esc(n.score_source || "")}</p>
     <p class="muted">Axe horaire : ${esc(n.axis_mode)} · source FC : ${esc(n.hr_source)} · HRV recalculé sur les battements
@@ -596,7 +612,8 @@ async function pageRecovery(m, date) {
     <p>Barèmes et pondération (moyenne simple) sont <b>locaux</b> : Oura ne publie pas les siens. Le score global
     n'apparaît qu'à partir de 5 contributeurs disponibles.</p>
     <p><b>Signes de tension</b> : FC la plus basse ≥ +5 bpm (et ≥ 2 écarts-types), FC moyenne ≥ +8 bpm, HRV ≤ −25 %,
-    température ≥ +0,5 °C, respiration ≥ +2/min, par rapport aux nuits précédentes. « Marqués » = au moins deux signaux
+    température ≥ +0,5 °C, respiration ≥ +2/min, par rapport à vos nuits saines précédentes (sans les nuits qui
+    suivent un jour noté « malade » dans le journal ni celles qui présentent elles-mêmes des signes marqués). « Marqués » = au moins deux signaux
     dont un fort. Outil d'attention, pas de diagnostic.</p></div></details></div>`;
   m.innerHTML = html;
   $("#c-rd", m).append(timeChart({ dayAxis: true, y0: 0, y1: 100, height: 160,
@@ -615,7 +632,8 @@ async function pageActivity(m, date) {
       ${dayNav("#/activite", date, shiftDay(date, -1), date < today() ? shiftDay(date, 1) : null)}
       ${s && s.partial ? `<span class="badge">journée en cours ou incomplète</span>` : ""}</div>
     <div class="row" style="margin-top:.6rem;align-items:flex-start">
-      <div>${ring(s ? s.score : null, "Activité", s ? (s.score == null ? "calibrage" : undefined) : "pas de données")}</div>
+      <div>${ring(s ? s.score : null, "Activité", s ? (s.partial ? (date < today() ? "journée incomplète" : "journée en cours")
+        : s.score == null ? "calibrage" : undefined) : "pas de données")}</div>
       <div style="flex:1 1 320px">${Object.keys(ACT_CONTRIB).map((k) => c[k] ? contribRow(ACT_CONTRIB[k], c[k], actContribValue(k, c[k])) : "").join("") || `<div class="muted small">pas de contributeurs pour ce jour</div>`}</div></div></div>`;
   if (s) {
     html += `<div class="card"><h2>Journée</h2><div class="tiles">
