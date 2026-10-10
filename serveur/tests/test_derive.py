@@ -158,6 +158,9 @@ class RecoveryTest(Base):
     def test_contributors_in_range(self):
         for r in self.readiness.values():
             for k, c in json.loads(r["contributors"]).items():
+                if c.get("status") == "calibrage":                  # équilibre HRV avant 60 nuits
+                    self.assertIsNone(c["score"])
+                    continue
                 self.assertTrue(0 <= c["score"] <= 100, (k, c))
 
     def test_briefing_number_guard(self):
@@ -456,6 +459,41 @@ class LotBDayTest(Base):
 def datetime_ts(day):
     from datetime import datetime
     return datetime.strptime(day, "%Y-%m-%d").timestamp()
+
+
+
+class LotA2Test(Base):
+    """Indice de récupération par stabilisation, température médiane, plafonds,
+    résumés inachevés."""
+    nights = 6
+    sick_last = False
+
+    def test_recovery_from_stabilisation(self):
+        for r in self.rows:
+            self.assertIsNotNone(r["hr_stable_at"])
+            self.assertLessEqual(r["hr_stable_at"], r["hr_lowest_at"])
+            # plus de sommeil après la stabilisation qu'après le minimum strict
+            self.assertGreaterEqual(r["recovery_index"], 4)
+
+    def test_temperature_is_median_of_sleep_samples(self):
+        for r in self.rows:
+            self.assertAlmostEqual(r["temp_mean"], 35.2, delta=0.1)
+            self.assertIsNotNone(r["temp_ecore"])
+
+    def test_caps_hold(self):
+        for r in self.rows:
+            sleep = r["deep"] + r["rem"] + r["light"]
+            self.assertLessEqual(r["deep"] / sleep, staging.CAPS["deep"] + 0.005)
+            self.assertLessEqual(r["rem"] / sleep, staging.CAPS["rem"] + 0.005)
+
+    def test_hrv_balance_calibrating(self):
+        c = json.loads(self.readiness[self.rows[-1]["night"]]["contributors"])
+        self.assertEqual(c["hrv_balance"]["status"], "calibrage")
+        self.assertIsNone(c["hrv_balance"]["score"])
+
+    def test_truncated_briefing(self):
+        self.assertTrue(dn.truncated("Vous avez dormi 7 h 13 avec une efficacité de 89"))
+        self.assertFalse(dn.truncated("Phrase complète. " * 15))
 
 
 if __name__ == "__main__":

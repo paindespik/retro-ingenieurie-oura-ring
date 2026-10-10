@@ -82,6 +82,10 @@ function debtText(r) {
   return `dette de sommeil (14 j) : ${val}
     <span class="muted">— besoin fixé à ${dur(r.sleep_need_h)}, non personnalisé</span>`;
 }
+// dernière mesure : en gras si elle a moins de 30 min, grisée sinon (ex. FC de jour suspendue la nuit)
+function lastVal(v, t) {
+  return Date.now() / 1000 - t < 1800 ? `<b>${v}</b> · ${ago(t)}` : `<span class="muted">${v} · ${ago(t)}</span>`;
+}
 // moyenne glissante sur k points consécutifs disponibles (nuits ou jours)
 function rolling(points, k = 7) {
   const P = points.filter((p) => p[1] != null);
@@ -156,7 +160,8 @@ function vitalTiles(n, B) {
   x = vsBase(n.resp_rate, B.resp_rate, { d: 1, unit: "/min", bad: 1, thr: 2 });
   out.push(tile("Respiration <span class='badge'>expérimental</span>", num(n.resp_rate, 1), "/min", x.html, x.cls));
   out.push(tile("Indice de récupération", dur(n.recovery_index), "",
-    "sommeil après la FC la plus basse (optimal ≥ 6 h)", n.recovery_index != null && n.recovery_index < 4 ? "up-bad" : ""));
+    `sommeil après la stabilisation de la FC${n.hr_stable_at ? " (" + hm(n.hr_stable_at) + ")" : ""} · optimal ≥ 6 h`,
+    n.recovery_index != null && n.recovery_index < 4 ? "up-bad" : ""));
   x = vsBase(n.hr_mean, B.hr_mean, { d: 1, unit: "bpm", bad: 1, thr: 8 });
   out.push(tile("FC moyenne (sommeil)", num(n.hr_mean, 0), "bpm", x.html, x.cls));
   return out.join("");
@@ -211,10 +216,11 @@ function chartWidth() {
 // Largeur d'un graphe dans une carte de grille (.grid : colonnes ≥ minCol px, écart .7rem).
 // Les graphes sont dessinés AVANT d'être insérés dans la page : sans cette largeur, un SVG
 // dessiné sur toute la page puis réduit à une colonne a des textes de 4 px.
-function gridChartWidth(minCol = 260) {
+function gridChartWidth(minCol = 260, items = 99) {
   const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
   const content = Math.min(1080, $("#main").clientWidth || 800) - 1.6 * rem, gap = 0.7 * rem;
-  const cols = Math.max(1, Math.floor((content + gap) / (Math.min(minCol, content) + gap)));
+  // auto-fit : avec moins de cartes que de colonnes possibles, les cartes s'élargissent
+  const cols = Math.max(1, Math.min(items, Math.floor((content + gap) / (Math.min(minCol, content) + gap))));
   return Math.max(240, Math.floor((content - (cols - 1) * gap) / cols - 2 * rem - 2));
 }
 const TSTEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800, 1209600];
@@ -461,19 +467,21 @@ function sleepContribValue(k, n) {
     total_sleep: `${dur(n.total)} (repère adulte 7–9 h)`,
     efficiency: `${num(n.efficiency)} % du temps au lit (repère > 85 %)`,
     restfulness: `éveil après endormissement ${num(n.waso)} min · ${pl(n.awakenings ?? 0, "réveil")} > 5 min · ${num(n.movement)} min agitées`,
-    rem: `${dur(n.rem)} · ${num((100 * n.rem) / sleep)} % (repère adulte 21–30 %)`,
-    deep: `${dur(n.deep)} · ${num((100 * n.deep) / sleep)} % (repère adulte 16–20 %)`,
+    rem: `${dur(n.rem)} · ${num((100 * n.rem) / sleep)} % (ordre de grandeur adulte ~20–25 %)`,
+    deep: `${dur(n.deep)} · ${num((100 * n.deep) / sleep)} % (ordre de grandeur adulte ~15–25 %)`,
     latency: `${num(n.latency)} min (repère Oura 15–20 min)`,
-    timing: `milieu du sommeil ${hmDec(n.timing)} (repère 00:00–03:00 selon le chronotype)`,
+    timing: `milieu du sommeil ${hmDec(n.timing)} (100 jusqu'à 02:40 ; courbe fixe, non ajustée au chronotype)`,
   }[k];
 }
 
 function readyContribValue(k, c) {
   switch (k) {
     case "rhr": return `${num(c.value, 1)} bpm · ${signed(c.delta, 1)} vs réf. ${num(c.baseline, 1)}`;
-    case "hrv_balance": return `${num(c.value, 0)} ms (14 j pondérés) vs ${num(c.baseline, 0)} ms · ${signed(c.delta, 0)} %`;
+    case "hrv_balance": return c.status === "calibrage"
+      ? `calibrage : ${c.nights}/60 nuits, hors du score · ${num(c.value, 0)} ms (14 j pondérés) vs ${num(c.baseline, 0)} ms`
+      : `${num(c.value, 0)} ms (14 j pondérés) vs ${num(c.baseline, 0)} ms · ${signed(c.delta, 0)} %`;
     case "temperature": return `${signed(c.value, 2)} °C · référence ${c.status}`;
-    case "recovery_index": return `${dur(c.value)} de sommeil après la FC la plus basse`;
+    case "recovery_index": return `${dur(c.value)} de sommeil après la stabilisation de la FC`;
     case "sleep": return dur(c.value);
     case "sleep_balance": return `moyenne pondérée ${dur(c.value)} / besoin ${dur(c.need)} (non personnalisé)`;
     case "sleep_regularity": return `écart-type du milieu de sommeil ${c.value} min`;
@@ -526,9 +534,9 @@ async function pageToday(m) {
     <div class="card"><h2>Résumé du matin ${b && !(open && b.night !== n.night) ? `<span class="badge">${esc(b.model)}</span>` : ""}
       ${b && b.stale && !open ? `<span class="badge warn">données modifiées depuis</span>` : ""}
       ${b && open && b.night === n.night ? `<span class="badge warn">rédigé avant la fin de la nuit</span>` : ""}
-      ${b && b.checked === 0 ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
+      ${b && b.checked !== 1 && !(open && b.night !== n.night) ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
       ${open && (!b || b.night !== n.night) ? `<div class="muted small">Nuit en cours : le résumé sera rédigé une fois le réveil détecté.</div>`
-      : b ? `<div class="brief">${esc(b.text)}</div><div class="tiny muted" style="margin-top:.4rem">nuit du ${dayLabel(b.night)} · rédigé ${ago(b.ts)} par un modèle local${open ? " — réécrit une fois la nuit terminée" : b.stale ? " — régénéré automatiquement au prochain passage" : ""}</div>`
+      : b ? `<div class="brief md">${md(b.text)}</div><div class="tiny muted" style="margin-top:.4rem">nuit du ${dayLabel(b.night)} · rédigé ${ago(b.ts)} par un modèle local${open ? " — réécrit une fois la nuit terminée" : b.stale ? " — régénéré automatiquement au prochain passage" : ""}</div>`
       : `<div class="muted small">Aucun résumé pour l'instant (rédigé chaque matin par le LLM local).</div>`}</div></div>`;
   const r = o.ring, live = o.live || {};
   const push = r.push && r.push.phone;
@@ -541,15 +549,15 @@ async function pageToday(m) {
       <div class="kv"><span>État</span><span>${r.on_charger ? "sur le chargeur" : r.worn ? "au doigt" : r.worn === false ? "retiré" : "—"}${r.state ? ` · ${esc(r.state.label)}` : ""}</span></div>
       <div class="kv"><span>Dernier envoi du téléphone</span><span>${push ? ago(push.last_push_unix) : "—"}</span></div>
       <div class="kv"><span>Horloge</span><span>${r.axis.mode === "sync" ? "synchronisée" : "estimée"}${r.axis.drift_s ? ` (recalée de ${num(r.axis.drift_s / 60)} min)` : ""}</span></div></div>
-    <div class="card"><h2>En ce moment</h2>
-      <div class="kv"><span>Température cutanée</span><span>${r.skin_temp && r.skin_temp.v != null ? `<b>${num(r.skin_temp.v, 1)} °C</b> · ${ago(r.skin_temp.t)}` : "—"}</span></div>
-      <div class="kv"><span>Fréquence cardiaque</span><span>${live.hr ? `<b>${live.hr.v} bpm</b> · ${ago(live.hr.t)}` : "—"}</span></div>
-      <div class="kv"><span>Intensité (MET)</span><span>${live.met ? `<b>${num(live.met.v, 1)}</b> · ${ago(live.met.t)}` : "—"}</span></div>
+    <div class="card"><h2>Dernières mesures</h2>
+      <div class="kv"><span>Température cutanée</span><span>${r.skin_temp && r.skin_temp.v != null ? lastVal(`${num(r.skin_temp.v, 1)} °C`, r.skin_temp.t) : "—"}</span></div>
+      <div class="kv"><span>FC de jour</span><span>${live.hr ? lastVal(`${live.hr.v} bpm`, live.hr.t) : "—"}</span></div>
+      <div class="kv"><span>Intensité (MET)</span><span>${live.met ? lastVal(num(live.met.v, 1), live.met.t) : "—"}</span></div>
       <div class="kv"><span>Pas aujourd'hui ${STEPS_BADGE}</span><span>${a && a.steps != null ? `<b>${num(a.steps)}</b>` : "—"}</span></div>
       <div class="kv"><span>Activité du jour</span><span>${a ? `${num(a.met_min_mh)} MET-min · ${a.total_kcal != null
         ? `${num(a.total_kcal)} kcal dépensées (est.)` : `${num(a.active_kcal)} kcal actives (est.)`}` : "—"}</span></div></div></div>`;
   m.innerHTML = html;
-  if (o.staging && $("#mini-hyp", m)) $("#mini-hyp", m).append(hypnogram(o.staging, { height: 64, compact: true, width: gridChartWidth() }));
+  if (o.staging && $("#mini-hyp", m)) $("#mini-hyp", m).append(hypnogram(o.staging, { height: 64, compact: true, width: gridChartWidth(260, 2) }));
 }
 
 async function pageSleep(m, date) {
@@ -571,11 +579,12 @@ async function pageSleep(m, date) {
         ${tile("Latence", num(n.latency), "min", "repère 15–20 min", n.latency > 30 ? "up-bad" : "")}
         ${tile("Éveil après endormissement", num(n.waso), "min", `${pl(n.awakenings ?? 0, "réveil")} > 5 min`, n.waso > 20 ? "up-bad" : "")}
         ${tile("Au lit", `${n.bedtime}–${n.wake_time}`, "", `endormi ${hm(n.onset_unix)} · réveil ${hm(n.end_unix)}`)}
-        ${tile("Milieu du sommeil", hmDec(n.timing), "", "repère 00:00–03:00")}
+        ${tile("Milieu du sommeil", hmDec(n.timing), "", "note maximale jusqu'à 02:40 (non ajusté au chronotype)")}
       </div></div></div>`;
   html += `<div class="card"><h2>Hypnogramme <span class="right small muted">estimation — voir « Méthode »</span></h2>
     <div id="hyp"></div>${stageBreakdown(n)}
-    <div class="tiny muted" style="margin-top:.3rem">Repères adultes 26–64 ans (National Sleep Foundation 2017) : profond 16–20 %, REM 21–30 % du sommeil.</div></div>`;
+    <div class="tiny muted" style="margin-top:.3rem">Ordres de grandeur chez l'adulte : profond ~15–25 %, REM ~20–25 % du sommeil.
+    La National Sleep Foundation (Ohayon 2017) ne juge défavorables que profond ≤ 5 % ou REM ≥ 41 %.</div></div>`;
   html += `<div class="grid"><div class="card"><h2>Contributeurs du score</h2>
       ${Object.keys(SLEEP_CONTRIB).map((k) => contribRow(SLEEP_CONTRIB[k], sub[k] == null ? null : { score: sub[k] }, sleepContribValue(k, n))).join("")}</div>
     <div class="card"><h2>Constantes</h2><div class="tiles">${vitalTiles(n, B)}</div></div></div>`;
@@ -594,9 +603,9 @@ async function pageSleep(m, date) {
   html += journalCard(shiftDay(date, -1), d.tags || []);
   if (d.briefing) {
     html += `<div class="card"><h2>Résumé du matin <span class="badge">${esc(d.briefing.model)}</span>
-      ${d.briefing.ts < (n.ts || 0) ? `<span class="badge warn">rédigé avant le dernier calcul — régénération au prochain passage</span>` : ""}
-      ${d.briefing.checked === 0 ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
-      <div class="brief">${esc(d.briefing.text)}</div><div class="tiny muted">rédigé ${dtShort(d.briefing.ts)}</div></div>`;
+      ${d.briefing.stale ? `<span class="badge warn">données modifiées depuis${d.next ? "" : " — réécrit au prochain passage"}</span>` : ""}
+      ${d.briefing.checked !== 1 ? `<span class="badge warn">chiffres non vérifiés</span>` : ""}</h2>
+      <div class="brief md">${md(d.briefing.text)}</div><div class="tiny muted">rédigé ${dtShort(d.briefing.ts)}</div></div>`;
   }
   html += `<div class="card"><details><summary>Méthode et limites</summary><div class="small">
     <p><b>Fenêtre de sommeil</b> : détectée par l'anneau (analyse embarquée « bedtime »). Les minutes qui précèdent son
@@ -608,14 +617,16 @@ async function pageSleep(m, date) {
     physiologiques (profond ≤ 25 %, REM ≤ 30 %). Non validée contre polysomnographie : l'éveil calme et le REM restent
     difficiles à distinguer, les durées par stade sont indicatives.</p>
     <p><b>FC la plus basse</b> : minimum des moyennes sur 10 min pendant le sommeil. <b>HRV</b> : moyenne des RMSSD
-    sur 5 min calculés par l'anneau. <b>Indice de récupération</b> : sommeil restant après la FC la plus basse
-    (Oura : optimal ≥ 6 h). <b>Respiration</b> : estimée à partir de l'arythmie sinusale respiratoire (variation de la FC
-    avec la respiration) — expérimentale, non vérifiée contre une référence. <b>Température</b> : capteur cutané pendant le
-    sommeil ; l'écart est comparé à la médiane de vos nuits saines précédentes (provisoire avant 14 nuits).</p>
+    sur 5 min calculés par l'anneau. <b>Indice de récupération</b> : sommeil restant après la stabilisation de la FC,
+    premier instant où sa moyenne sur 10 min revient à moins de 3 bpm de la plus basse (Oura : optimal ≥ 6 h). <b>Respiration</b> : estimée à partir de l'arythmie sinusale respiratoire (variation de la FC
+    avec la respiration) — expérimentale, non vérifiée contre une référence. <b>Température</b> : médiane du capteur cutané entre
+    l'endormissement et la fin du sommeil ; l'écart est comparé à la médiane de vos nuits saines précédentes (provisoire avant 14 nuits).</p>
     <p><b>Références</b> : vos nuits précédentes, sans celles qui suivent un jour noté « malade » dans le journal ni celles
     qui présentent des signes de tension marqués ; elles sont figées au calcul de chaque nuit.</p>
-    <p><b>Score</b> : 7 contributeurs pondérés 35/15/10/10/10/10/10 (pondération Oura publiée), barèmes publics pour
-    durée/stades/efficacité/latence/horaire et barème local pour la tranquillité (seuils NSF). ${esc(n.score_source || "")}</p>
+    <p><b>Score</b> : 7 contributeurs pondérés 35/15/10/10/10/10/10 (pondération estimée par rétro-ingénierie,
+    dmturner44/oura_sleep_score_algo : Oura ne la publie pas), barèmes de la même source pour
+    durée/stades/efficacité/latence/horaire et barème local pour la tranquillité (seuils NSF). L'horaire suit une courbe
+    fixe (100 jusqu'à un milieu de sommeil à 02:40, 0 à partir de 05:43), non ajustée au chronotype. ${esc(n.score_source || "")}</p>
     <p class="muted">Axe horaire : ${esc(n.axis_mode)} · source FC : ${esc(n.hr_source)} · HRV recalculé sur les battements
     (contrôle) : ${num(n.hrv_beats)} ms · calcul ${dtShort(n.ts)}</p></div></details></div>`;
   m.innerHTML = html;
@@ -624,15 +635,18 @@ async function pageSleep(m, date) {
   const pts = (k) => S.map((p) => [p.t, p[k]]);
   const hrB = B.hr_min;
   $("#c-hr", m).append(timeChart({ x0, x1, height: 170, series: [{ name: "FC", color: "var(--hr)", unit: "bpm", points: pts("hr") }],
-    markers: n.hr_lowest_at ? [{ t: n.hr_lowest_at, v: n.hr_min, label: `FC la plus basse ${num(n.hr_min)} bpm à ${hm(n.hr_lowest_at)}`, color: "var(--hr)" }] : [],
+    markers: [...(n.hr_lowest_at ? [{ t: n.hr_lowest_at, v: n.hr_min, label: `FC la plus basse ${num(n.hr_min)} bpm à ${hm(n.hr_lowest_at)}`, color: "var(--hr)" }] : []),
+      ...(n.hr_stable_at && n.hr_stable_at !== n.hr_lowest_at ? [{ t: n.hr_stable_at, v: n.hr_min + 3, label: `FC stabilisée (≤ +3 bpm) à ${hm(n.hr_stable_at)}`, color: "var(--fair)" }] : [])],
     band: hrB && hrB.n >= 3 ? [hrB.mean - Math.max(hrB.sd, 1), hrB.mean + Math.max(hrB.sd, 1), "FC la plus basse habituelle (± 1 écart-type)"] : null, legend: true }));
-  $("#c-hrv", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 140, series: [{ name: "RMSSD", color: "var(--hrv)", unit: "ms", points: pts("rmssd") }],
+  $("#c-hrv", m).append(timeChart({ x0, x1, width: gridChartWidth(260, 2), height: 140, series: [{ name: "RMSSD", color: "var(--hrv)", unit: "ms", points: pts("rmssd") }],
     hline: n.hrv_rmssd ? { v: n.hrv_rmssd } : null }));
-  $("#c-resp", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 140, series: [{ name: "Respiration", color: "var(--resp)", unit: "/min", dec: 1, points: pts("resp") }],
+  $("#c-resp", m).append(timeChart({ x0, x1, width: gridChartWidth(260, 2), height: 140, series: [{ name: "Respiration", color: "var(--resp)", unit: "/min", dec: 1, points: pts("resp") }],
     minSpan: 4, empty: "pas assez de battements propres pour estimer la respiration" }));
-  $("#c-mot", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 120, series: [{ name: "Mouvement (max 5 min)", color: "var(--motion)", type: "bar", binW: 300, dec: 2,
-    points: S.map((p) => [p.t - 150, p.motion == null ? null : Math.min(p.motion, 10)]) }], y0: 0 }));
-  $("#c-temp", m).append(timeChart({ x0, x1, width: gridChartWidth(), height: 140, series: [{ name: "Température", color: "var(--temp)", unit: "°C", dec: 2, points: pts("temp") }], minSpan: 0.5 }));
+  // échelle logarithmique : les mouvements francs (jusqu'à ~150) écrasaient tout, l'écrêtage à 10 les cachait
+  $("#c-mot", m).append(timeChart({ x0, x1, width: gridChartWidth(260, 2), height: 120, y0: 0, yFmt: (v) => num(10 ** v - 1, v < 0.5 ? 1 : 0),
+    series: [{ name: "Mouvement (accéléromètre, max sur 5 min, échelle log.)", color: "var(--motion)", type: "bar", binW: 300,
+      fmt: (v) => num(10 ** v - 1, 2), points: S.map((p) => [p.t - 150, p.motion == null ? null : Math.log10(1 + p.motion)]) }] }));
+  $("#c-temp", m).append(timeChart({ x0, x1, width: gridChartWidth(260, 2), height: 140, series: [{ name: "Température", color: "var(--temp)", unit: "°C", dec: 2, points: pts("temp") }], minSpan: 0.5 }));
   bindJournal(m);
 }
 
@@ -651,7 +665,8 @@ async function pageRecovery(m, date) {
       <div>${ring(r.score, "Récupération", r.score == null ? `calibrage (${Object.keys(c).length}/5 contributeurs)` : undefined)}</div>
       <div style="flex:1 1 320px">${Object.keys(READY_CONTRIB).map((k) => c[k] ? contribRow(READY_CONTRIB[k], c[k], readyContribValue(k, c[k])) : "").join("")}
       <div class="small" style="margin-top:.6rem">${debtText(r)}</div>
-      ${Object.keys(READY_CONTRIB).filter((k) => !c[k]).length ? `<div class="tiny muted" style="margin-top:.4rem">En attente de données : ${Object.keys(READY_CONTRIB).filter((k) => !c[k]).map((k) => READY_CONTRIB[k]).join(", ")}.</div>` : ""}</div></div></div>`;
+      ${Object.keys(READY_CONTRIB).filter((k) => !c[k] && k !== "activity_balance").length ? `<div class="tiny muted" style="margin-top:.4rem">En attente de données : ${Object.keys(READY_CONTRIB).filter((k) => !c[k] && k !== "activity_balance").map((k) => READY_CONTRIB[k]).join(", ")}.</div>` : ""}
+      <div class="tiny muted" style="margin-top:.2rem">Équilibre de l'activité : non calculé (méthode Oura non publiée).</div></div></div></div>`;
   html += tensionCard(r.tension, r.day);
   html += `<div class="card"><h2>Récupération au fil des jours</h2><div id="c-rd"></div></div>
     <div class="card"><details><summary>Méthode et limites</summary><div class="small">
@@ -664,7 +679,10 @@ async function pageRecovery(m, date) {
     récentes pesant davantage ; une nuit plus longue la rembourse. Aucune, faible (&lt; 2 h), modérée (2–5 h), élevée (&gt; 5 h) ;
     au moins 5 nuits sur 14 jours.</p>
     <p>Barèmes et pondération (moyenne simple) sont <b>locaux</b> : Oura ne publie pas les siens. Le score global
-    n'apparaît qu'à partir de 5 contributeurs disponibles.</p>
+    n'apparaît qu'à partir de 5 contributeurs disponibles. L'<b>équilibre HRV</b> reste en calibrage, hors du score,
+    tant qu'il n'y a pas 60 nuits : avant, la moyenne longue se confond avec les 14 derniers jours et il vaut toujours ~100.
+    <b>Indice de récupération</b> : sommeil restant après le premier instant où la FC (moyenne sur 10 min) revient à moins
+    de 3 bpm de sa valeur la plus basse.</p>
     <p><b>Signes de tension</b> : FC la plus basse ≥ +5 bpm (et ≥ 2 écarts-types), FC moyenne ≥ +8 bpm, HRV ≤ −25 %,
     température ≥ +0,5 °C, respiration ≥ +2/min, par rapport à vos nuits saines précédentes (sans les nuits qui
     suivent un jour noté « malade » dans le journal ni celles qui présentent elles-mêmes des signes marqués). « Marqués » = au moins deux signaux
@@ -936,7 +954,7 @@ async function pageAssistant(m) {
     <div class="tiny muted" style="margin-top:.4rem">Modèles locaux (llama-swap) : « Envoyer » utilise le 4B (rapide), « Analyse approfondie »
     le 27B s'il est libre. Ils ne voient que vos données résumées (30 nuits, récupération, activité, journal) et peuvent se
     tromper. Ce n'est pas un avis médical.</div></div>
-    ${b ? `<div class="card"><h2>Dernier résumé du matin <span class="badge">${esc(b.model)}</span></h2><div class="brief">${esc(b.text)}</div>
+    ${b ? `<div class="card"><h2>Dernier résumé du matin <span class="badge">${esc(b.model)}</span>${b.checked !== 1 ? ` <span class="badge warn">chiffres non vérifiés</span>` : ""}</h2><div class="brief md">${md(b.text)}</div>
       <div class="tiny muted">nuit du ${dayLabel(b.night)} · ${dtShort(b.ts)}</div></div>` : ""}`;
   const log = $("#log", m);
   const draw = () => { log.innerHTML = chatLog.map((x) => x.u ? `<div class="msg u">${esc(x.text)}</div>`

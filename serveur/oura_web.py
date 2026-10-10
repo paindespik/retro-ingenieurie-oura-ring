@@ -333,10 +333,23 @@ def overview():
         out["activity_yesterday"] = activity_row(safe_one(d, "SELECT * FROM activity_daily WHERE day=?", (yday,)))
         b = safe_one(d, "SELECT * FROM llm_briefings ORDER BY ts DESC LIMIT 1")
         if b:
-            b["stale"] = bool(n and (b["night"] != n["night"] or (n.get("ts") or 0) > b["ts"]))
+            # « données modifiées » : les entrées du résumé (nuit, références, score,
+            # tension, journal) diffèrent de celles d'aujourd'hui, pas un simple recalcul
+            b["stale"] = briefing_stale(b, n)
         out["briefing"] = b
         d.close()
     return out
+
+
+def briefing_stale(b, n):
+    return bool(n and b and b.get("night") == n.get("night") and n.get("brief_hash")
+                and b.get("input_hash") != n["brief_hash"])
+
+
+def briefing_with_state(b, n):
+    if b:
+        b["stale"] = briefing_stale(b, n)
+    return b
 
 
 def staging_payload(d, n):
@@ -377,7 +390,8 @@ def night(date: str = Query(..., pattern=DATE_RE)):
         "prev_row": prev_row, "staging": staging_payload(d, n), "series": series,
         "baselines": night_baselines(d, n),
         "readiness": readiness_row(safe_one(d, "SELECT * FROM readiness WHERE day=?", (date,))),
-        "briefing": safe_one(d, "SELECT * FROM llm_briefings WHERE night=? ORDER BY ts DESC LIMIT 1", (date,)),
+        "briefing": briefing_with_state(safe_one(d, "SELECT * FROM llm_briefings WHERE night=?"
+                                               " ORDER BY ts DESC LIMIT 1", (date,)), n),
         "tags": safe_q(d, "SELECT * FROM tags WHERE day IN (?,?) ORDER BY created_unix", (day0, date)),
     }
     d.close()

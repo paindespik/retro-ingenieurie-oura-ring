@@ -179,6 +179,9 @@ pre { font-size: .72rem; background: var(--panel2); padding: .5rem; border-radiu
 .msg.u { align-self: flex-end; background: var(--accent); color: #fff; }
 .msg.a { align-self: flex-start; background: var(--panel2); }
 .brief { white-space: pre-wrap; }
+.brief.md { white-space: normal; }
+.brief.md p { margin: 0 0 .45rem; }
+.brief.md p:last-child { margin-bottom: 0; }
 .msg.md { white-space: normal; }
 .msg.md p { margin: .35rem 0; }
 .msg.md ul { margin: .3rem 0; padding-left: 1.2rem; }

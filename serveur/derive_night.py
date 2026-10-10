@@ -21,7 +21,15 @@ Lit oura.db (brut open_oura, lecture seule) et écrit derived.db :
 Définitions alignées sur la documentation Oura quand elle existe :
 - FC la plus basse = minimum des moyennes glissantes 10 min (bins 5 min de
   l'anneau) pendant le sommeil ; HRV = moyenne des RMSSD 5 min (+ max) ;
-- Recovery Index = sommeil restant après la FC la plus basse (optimal ≥ 6 h) ;
+- Recovery Index = sommeil restant après la STABILISATION de la FC : premier
+  instant où la moyenne sur 10 min revient à moins de 3 bpm de la FC la plus
+  basse (Oura, « Readiness Score » ; optimal ≥ 6 h). Le minimum strict est
+  souvent un plateau atteint tard : l'indice basculait pour 0,5 bpm ;
+- température de la nuit = médiane des échantillons cutanés (tag 117) entre
+  l'endormissement et la fin du sommeil (l'estimateur ecore, minimum des
+  maxima de fenêtres de 30 échantillons, reste en valeur secondaire
+  temp_ecore : sur des échantillons à 30 s, une seule fenêtre froide le fixe,
+  σ entre nuits saines 0,50 °C contre 0,28 °C pour la médiane) ;
 - écart de température = nuit − médiane des nuits précédentes (≤ 30),
   « provisoire » avant 14 nuits (Oura : ~2 semaines de calibrage) ;
 - références personnelles : nuits antérieures SAINES seulement (sont exclues
@@ -52,7 +60,7 @@ from datetime import datetime, timedelta
 import oura_core as oc
 import staging
 
-VERSION = 4                      # incrémenter → recalcul de toutes les nuits
+VERSION = 5                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 # Résumé du matin : le 27B résident de la RTX 3090 (préchargé par llama-swap,
 # jamais déchargé) quand il est disponible, sinon le 4B de la P40. On ne
@@ -78,6 +86,10 @@ TEMP_BASE_NIGHTS = 30
 REF_NIGHTS = 60
 BASE_RELIABLE_N = 14
 SICK_TAG = "maladie"
+# Équilibre HRV (Oura : 14 derniers jours pondérés vs ~3 mois) : tant que la
+# fenêtre longue n'est guère plus longue que la courte, le rapport vaut ~1 et le
+# contributeur sature à 100 → « calibrage », hors du score, avant 60 nuits.
+HRV_BALANCE_MIN_NIGHTS = 60
 
 # Clôture de la nuit. L'anneau réémet la fenêtre « bedtime » en cours au fil de
 # la nuit (fin = heure d'émission), parfois après 4 à 5 h sans révision : une
@@ -272,9 +284,16 @@ def compute_night(con, axis, night, charging):
     if hr_low is None and hrs:
         c, h = min(hrs, key=lambda p: p[1])
         hr_low, hr_low_at = float(h), c
+    # stabilisation : 1er instant où la moyenne sur 10 min ≤ FC la plus basse + 3 bpm
+    hr_stable_at = hr_low_at
+    if hr_low is not None:
+        for (c0, h0), (c1, h1) in zip(hrs, hrs[1:]):
+            if c1 - c0 <= 3300 and (h0 + h1) / 2 <= hr_low + 3:
+                hr_stable_at = (c0 + c1) / 2
+                break
     recovery_h = None
-    if hr_low_at is not None:
-        k = int((hr_low_at - S) // staging.EPOCH_DS)
+    if hr_stable_at is not None:
+        k = int((hr_stable_at - S) // staging.EPOCH_DS)
         recovery_h = sum(staging.EPOCH_DS / 10 for s in stages[max(0, k):] if s != "awake") / 3600
 
     # RMSSD « maison » sur les battements : contrôle croisé seulement
@@ -295,8 +314,10 @@ def compute_night(con, axis, night, charging):
     # --- température
     temps = temp_samples(con, S, E, charging)
     t_centi = nightly_temperature_centi([int(round(t * 100)) for _, t in temps])
-    temp_mean = (t_centi / 100.0) if t_centi is not None else (
-        oc.median([t for _, t in temps]) if len(temps) >= 60 else None)
+    temp_ecore = t_centi / 100.0 if t_centi is not None else None
+    asleep_t = [t for rt, t in temps if onset_ds <= rt < end_ds]
+    temp_mean = (oc.median(asleep_t) if len(asleep_t) >= 60 else
+                 oc.median([t for _, t in temps]) if len(temps) >= 60 else temp_ecore)
 
     # --- timing : milieu du SOMMEIL (et non du lit)
     onset_u, end_u = axis(onset_ds), axis(end_ds)
@@ -367,12 +388,14 @@ def compute_night(con, axis, night, charging):
         "hrv_beats": r(oc.mean([x for x in own_rm if x]), 1),
         "hr_source": hr_source,
         "recovery_index": r(recovery_h, 2),
+        "hr_stable_at": int(axis(hr_stable_at)) if hr_stable_at else None,
         "resp_rate": r(resp_rate, 1),
         "resp_n": len(resp),
         "beats_kept_pct": r(100.0 * len(beats) / len(raw_beats), 1) if raw_beats else None,
         "lead_min": feats["lead"] * staging.EPOCH_DS / 600,
         "hr_bins_pct": r(bins_ok, 1),
         "temp_mean": r(temp_mean, 2),
+        "temp_ecore": r(temp_ecore, 2),
         "temp_dev": None, "temp_n": 0, "temp_status": None,
         "movement": round(sm["restless"] / 60, 1),
         "spo2": None,
@@ -441,6 +464,7 @@ SLEEP_COLS = [
     ("score_source", "TEXT"), ("axis_mode", "TEXT"), ("version", "INTEGER"),
     ("provisional", "INTEGER"), ("ref_json", "TEXT"), ("ref_excluded", "TEXT"),
     ("beats_kept_pct", "REAL"), ("lead_min", "REAL"), ("hr_bins_pct", "REAL"),
+    ("hr_stable_at", "INTEGER"), ("temp_ecore", "REAL"), ("brief_hash", "TEXT"),
     ("input_hash", "TEXT"), ("ts", "INTEGER"),
 ]
 
@@ -639,10 +663,12 @@ def readiness_for(i, nights, activity, ref=None):
         w = list(range(1, len(last14) + 1))
         recent = sum(a * b_ for a, b_ in zip(last14, w)) / sum(w)
         ratio = recent / statistics.fmean(long_)
+        mature = len(long_) >= HRV_BALANCE_MIN_NIGHTS
         c["hrv_balance"] = {"score": oc.lerp_score(ratio, [(0.6, 15), (0.75, 45), (0.9, 75),
-                                                           (1.0, 95), (1.05, 100)]),
+                                                           (1.0, 95), (1.05, 100)]) if mature else None,
                             "value": round(recent, 1), "baseline": round(statistics.fmean(long_), 1),
-                            "delta": round((ratio - 1) * 100, 1)}
+                            "delta": round((ratio - 1) * 100, 1), "nights": len(long_),
+                            "status": None if mature else "calibrage"}
 
     if n["temp_dev"] is not None:
         c["temperature"] = {"score": oc.lerp_score(abs(n["temp_dev"]), [(0.2, 100), (0.5, 85), (1.0, 50),
@@ -1046,7 +1072,8 @@ def briefing_context(der, night, days=14):
         contrib = json.loads(rd[1] or "{}")
         tension = json.loads(rd[2] or "{}")
         rec = {"score_recuperation": rd[0],
-               "contributeurs_sur_100": {READY_NAMES.get(k, k): v.get("score") for k, v in contrib.items()},
+               "contributeurs_sur_100": {READY_NAMES.get(k, k): v.get("score") for k, v in contrib.items()
+                                         if v.get("score") is not None},
                "signes_de_tension": {
                    "niveau": tension.get("level"),
                    "reference_provisoire": tension.get("provisional"),
@@ -1184,17 +1211,27 @@ def llm_briefing(der, night, ctx, ctx_hash, tries=3, model=None):
         if not text:
             return None
         bad = unverified_numbers(text, ctx)
-        if not bad:
+        cut = truncated(text)
+        if not bad and not cut:
             break
-        messages += [{"role": "assistant", "content": text},
-                     {"role": "user", "content": "Ces nombres n'existent pas dans le contexte ou ne concernent "
-                      f"pas la nuit à résumer : {', '.join(bad)}. Réécris le résumé en n'utilisant que les "
-                      "valeurs exactes du contexte (score_sommeil et score_recuperation sont distincts)."}]
+        fix = ("Ces nombres n'existent pas dans le contexte ou ne concernent pas la nuit à résumer : "
+               f"{', '.join(bad)}. Réécris le résumé en n'utilisant que les valeurs exactes du contexte "
+               "(score_sommeil et score_recuperation sont distincts)." if bad else
+               "Le résumé est inachevé. Rédige-le en entier, 5 à 8 phrases terminées.")
+        messages += [{"role": "assistant", "content": text}, {"role": "user", "content": fix}]
+        bad = bad or ["(texte inachevé)"]
     der.execute("INSERT INTO llm_briefings (night, model, text, ts, input_hash, checked) VALUES (?,?,?,?,?,?)",
                 (night, model, text, int(time.time()), ctx_hash, 0 if bad else 1))
     if bad:
         print(f"nightly: résumé conservé NON vérifié (chiffres introuvables : {', '.join(bad)})", file=sys.stderr)
     return text
+
+
+def truncated(text):
+    """Résumé manifestement coupé (budget de jetons consommé par le raisonnement :
+    « …efficacité de 89 ») : trop court ou sans ponctuation finale."""
+    t = (text or "").strip()
+    return len(t) < 200 or t[-1] not in ".!?…»)"
 
 
 def briefing_hash(ctx):
@@ -1288,6 +1325,11 @@ def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
     if briefing and nights:
         maybe_briefing(der, nights[-1], now, log=log)
         der.commit()
+    for (night,) in der.execute("SELECT DISTINCT night FROM llm_briefings").fetchall():
+        if night in {n["night"] for n in nights}:
+            der.execute("UPDATE sleep_scores SET brief_hash=? WHERE night=?",
+                        (briefing_hash(briefing_context(der, night)), night))
+    der.commit()
     if not nights_raw:
         log("nightly: aucune fenêtre de sommeil (bedtime_period) en base — rien à dériver")
     con.close()

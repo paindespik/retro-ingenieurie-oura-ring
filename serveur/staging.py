@@ -176,20 +176,29 @@ def stage_night(n, s_ds, motion_events, beats):
     bias = {}
     stages = viterbi(feats, n, bias, lead)
     capped = []
-    for st, cap in CAPS.items():
-        if _share(stages, st) <= cap:
-            continue
-        lo, hi = -6.0, 0.0
-        for _ in range(8):
-            mid = (lo + hi) / 2
-            bias[st] = mid
-            if _share(viterbi(feats, n, bias, lead), st) > cap:
-                hi = mid
-            else:
-                lo = mid
-        bias[st] = lo
-        stages = viterbi(feats, n, bias, lead)
-        capped.append(st)
+    # abaisser l'a priori d'un stade redistribue ses epochs vers les autres :
+    # on boucle jusqu'à ce que TOUS les plafonds soient respectés (06/10 :
+    # profond 25,7 % après correction du REM)
+    for _ in range(4):
+        changed = False
+        for st, cap in CAPS.items():
+            if _share(stages, st) <= cap:
+                continue
+            lo, hi = -6.0, bias.get(st, 0.0)
+            for _ in range(8):
+                mid = (lo + hi) / 2
+                bias[st] = mid
+                if _share(viterbi(feats, n, bias, lead), st) > cap:
+                    hi = mid
+                else:
+                    lo = mid
+            bias[st] = lo
+            stages = viterbi(feats, n, bias, lead)
+            changed = True
+            if st not in capped:
+                capped.append(st)
+        if not changed:
+            break
     return stages, feats, capped
 
 
