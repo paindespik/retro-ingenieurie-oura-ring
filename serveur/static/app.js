@@ -1008,10 +1008,15 @@ async function pageCellier(m) {
       <span id="cl-err" class="small"></span></form></div>`;
     m.querySelector("#cl-form").onsubmit = async (e) => {
       e.preventDefault();
-      const r = await fetch("/api/cellier/auth", { method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: m.querySelector("#cl-pass").value }) });
-      if (r.ok) { render(); } else { m.querySelector("#cl-err").textContent = "mot de passe incorrect"; }
+      const form = e.currentTarget;   // le formulaire soumis, jamais le conteneur en fermeture
+      try {
+        const r = await fetch("/api/cellier/auth", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: form.querySelector("#cl-pass").value }) });
+        if (r.ok) { render(); } else { form.querySelector("#cl-err").textContent = "mot de passe incorrect"; }
+      } catch (err) {
+        form.querySelector("#cl-err").textContent = "erreur réseau";
+      }
     };
     m.querySelector("#cl-pass").focus();
     return;
