@@ -25,7 +25,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import oura_core as oc
@@ -554,6 +554,94 @@ def quality(days: int = Query(30, ge=7, le=365)):
                        " FROM activity_daily ORDER BY day DESC LIMIT ?", (days,))
     d.close()
     return {"nights": nights_q, "days": days_q}
+
+
+# ---------------------------------------------------------------- cellier
+# Onglet protégé par un 2e mot de passe (haché scrypt, jamais en clair).
+# Le hash vient de l'environnement du service (EnvironmentFile=
+# /etc/oura/ingest.env : CELLIER_HASH=scrypt$<n>$<r>$<p>$<hexsalt>$<hexhash>),
+# généré par : python3 serveur/cellier_pass.py   (mot de passe via CELLIER_PASS).
+# Session : cookie HttpOnly signé avec le hash, valide 7 jours.
+CELLIER_COOKIE = "cellier"
+CELLIER_TTL = 7 * 86400
+CELLIER_HASH = os.environ.get("CELLIER_HASH", "")
+
+def _cellier_configured():
+    return bool(CELLIER_HASH)
+
+def _cellier_check(password):
+    try:
+        algo, n, r, p, salt, hashv = CELLIER_HASH.split("$")
+    except (ValueError, AttributeError):
+        return False
+    if algo != "scrypt":
+        return False
+    try:
+        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt),
+                                n=int(n), r=int(r), p=int(p), dklen=32)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest, bytes.fromhex(hashv))
+
+def _cellier_token(exp):
+    return f"{int(exp)}:" + hmac.new(CELLIER_HASH.encode(), str(int(exp)).encode(),
+                                     hashlib.sha256).hexdigest()[:32]
+
+def _cellier_authorized(request: Request):
+    if not CELLIER_HASH:
+        return False
+    c = request.cookies.get(CELLIER_COOKIE, "")
+    try:
+        exp, sig = c.rsplit(":", 1)
+        exp = int(exp)
+    except (ValueError, AttributeError):
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(_cellier_token(exp), c)
+
+@app.post("/api/cellier/auth")
+async def cellier_auth(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not _cellier_configured():
+        raise HTTPException(503, "cellier non configuré")
+    if not _cellier_check(body.get("password", "")):
+        raise HTTPException(401, "mot de passe incorrect")
+    exp = time.time() + CELLIER_TTL
+    return JSONResponse({"ok": True}, headers={
+        "Set-Cookie": f"{CELLIER_COOKIE}={_cellier_token(exp)}; Path=/; HttpOnly; "
+                       f"SameSite=Lax; Max-Age={CELLIER_TTL}"})
+
+@app.post("/api/cellier/logout")
+def cellier_logout():
+    return JSONResponse({"ok": True},
+                        headers={"Set-Cookie": f"{CELLIER_COOKIE}=; Path=/; Max-Age=0"})
+
+@app.get("/api/cellier")
+def cellier(request: Request):
+    """Liste des épisodes détectés (derive_cellier.py, recalculé en nightly)."""
+    if not _cellier_configured():
+        raise HTTPException(503, "cellier non configuré")
+    if not _cellier_authorized(request):
+        raise HTTPException(401, "authentification requise")
+    d = derived()
+    if not d:
+        raise HTTPException(503, "derived.db absent")
+    tables = {r[0] for r in d.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    d.close()
+    if "cellier_episodes" not in tables:
+        return {"episodes": [], "configured": True}   # première nightly pas encore passée
+    d = derived()
+    if not d:
+        raise HTTPException(503, "derived.db absent")
+    eps = safe_q(d, "SELECT start_unix, end_unix, duration_min, hr_mean, hr_max, peak_min,"
+                       " met_mean, skin_mean, skin_before, skin_delta, confidence, day"
+                       " FROM cellier_episodes ORDER BY start_unix DESC LIMIT 500")
+    d.close()
+    return {"episodes": eps, "configured": True}
 
 
 # ---------------------------------------------------------------- API : signaux bruts

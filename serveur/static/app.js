@@ -988,6 +988,58 @@ async function pageAssistant(m) {
 }
 
 let dataTab = "signaux", teleHours = 24, evType = "", evLimit = 100, evAll = false, batDays = 14;
+async function pageCellier(m) {
+  // fetch brut : ici 401 = « mot de passe cellier requis », pas session expirée
+  let j = null, status = 0;
+  try {
+    const r = await fetch("/api/cellier", { credentials: "same-origin" });
+    status = r.status;
+    j = await r.json().catch(() => null);
+  } catch (e) {}
+  if (status === 503) {
+    m.innerHTML = `<div class="card"><h2>Cellier</h2><p class="small">Non configuré sur ce serveur.</p></div>`;
+    return;
+  }
+  if (status === 401) {
+    m.innerHTML = `<div class="card"><h2>Cellier</h2>
+      <p class="small">Espace protégé — entrez le mot de passe.</p>
+      <form id="cl-form"><input id="cl-pass" type="password" placeholder="mot de passe" autocomplete="off"/>
+      <button class="ghost" type="submit">Entrer</button>
+      <span id="cl-err" class="small"></span></form></div>`;
+    m.querySelector("#cl-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const r = await fetch("/api/cellier/auth", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: m.querySelector("#cl-pass").value }) });
+      if (r.ok) { render(); } else { m.querySelector("#cl-err").textContent = "mot de passe incorrect"; }
+    };
+    m.querySelector("#cl-pass").focus();
+    return;
+  }
+  const eps = (j && j.episodes) || [];
+  const badge = { fort: "<span class='badge ok'>signature marquée</span>", possible: "<span class='badge warn'>possible</span>" };
+  const rows = eps.map((e) => {
+    const d = new Date(e.start_unix * 1000);
+    const h1 = new Date(e.end_unix * 1000);
+    const dl = e.skin_delta != null ? `${e.skin_delta >= 0 ? "+" : ""}${num(e.skin_delta, 1)} °C` : "";
+    const met = e.met_mean != null ? `${num(e.met_mean, 1)} MET` : "";
+    return `<div class="kv"><span>${dayLabel(d.toISOString().slice(0, 10), { weekday: "long" })}</span>
+      <span><b>${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}</b> →
+      ${h1.getHours().toString().padStart(2, "0")}:${h1.getMinutes().toString().padStart(2, "0")}
+      · ${e.duration_min} min · FC ${num(e.hr_mean)}<sup>${e.hr_max}</sup> bpm · ${e.peak_min} pic${e.peak_min > 1 ? "s" : ""} ≥145
+      ${met ? `· ${met}` : ""}${dl ? `· peau ${dl}` : ""} · ${badge[e.confidence] || ""}</span></div>`;
+  }).join("");
+  m.innerHTML = `<div class="card"><h2>Cellier</h2>
+    <p class="small">Épisodes détectés par la signature de l'anneau (FC + intensité + thermique) — estimation, pas une certitude.
+    <a href="#" id="cl-out">déconnecter</a></p>
+    ${rows ? `<div>${rows}</div>` : "<p class='small'>Aucun épisode sur les 35 derniers jours.</p>"}</div>`;
+  m.querySelector("#cl-out").onclick = async (e) => {
+    e.preventDefault();
+    await fetch("/api/cellier/logout", { method: "POST" });
+    render();
+  };
+}
+
 async function pageData(m, tab) {
   dataTab = tab || dataTab;
   const tabs = { signaux: "Signaux bruts", batterie: "Batterie", qualite: "Qualité des données",
@@ -1133,6 +1185,7 @@ const PAGES = [
   ["recuperation", "Récupération", pageRecovery], ["activite", "Activité", pageActivity],
   ["tendances", "Tendances", pageTrends], ["journal", "Journal", pageJournal],
   ["assistant", "Assistant", pageAssistant], ["donnees", "Données", pageData],
+  ["cellier", "Cellier", pageCellier],
 ];
 
 function setFresh(ring) {

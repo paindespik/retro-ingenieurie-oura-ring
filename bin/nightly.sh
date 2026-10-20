@@ -28,4 +28,15 @@ mkdir -p /srv/oura/logs
   else
     echo "nightly FAILED (exit $?)"
   fi
+  # Cellier : détection des épisodes (onglet protégé) — indépendant du nightly
+  # de dérivation des nuits (une panne de l'un ne bloque pas l'autre).
+  if [ -f /srv/oura/bin/derive_cellier.py ]; then
+    if python3 /srv/oura/bin/derive_cellier.py \
+         --db /srv/oura/oura.db \
+         --derived /srv/oura/derived.db 2>&1; then
+      echo "cellier OK"
+    else
+      echo "cellier FAILED (exit $?)"
+    fi
+  fi
 } | tee -a "$LOG"

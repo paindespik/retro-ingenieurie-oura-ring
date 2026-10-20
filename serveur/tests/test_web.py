@@ -101,6 +101,40 @@ class WebTest(unittest.TestCase):
         self.assertEqual(self.c.post("/api/tags", json={"day": "x", "kind": "maladie"}).status_code, 422)
         self.assertEqual(self.c.post("/api/tags", json={"day": self.night, "kind": "?"}).status_code, 422)
 
+    def test_cellier_not_configured(self):
+        self.assertFalse(self.web._cellier_configured())
+        self.assertEqual(self.c.get("/api/cellier").status_code, 503)
+
+    def test_cellier_password_flow(self):
+        import hashlib
+        salt = bytes(16)
+        h = hashlib.scrypt(b"test-cellier", salt=salt, n=16384, r=8, p=1, dklen=32)
+        saved = self.web.CELLIER_HASH
+        self.web.CELLIER_HASH = f"scrypt$16384$8$1${salt.hex()}${h.hex()}"
+        try:
+            self.assertEqual(self.c.post("/api/cellier/auth", json={"password": "mauvais"}).status_code, 401)
+            r = self.c.post("/api/cellier/auth", json={"password": "test-cellier"})
+            self.assertEqual(r.status_code, 200)
+            # table absente (base synthétique) → liste vide, pas d'erreur
+            r = self.c.get("/api/cellier")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["episodes"], [])
+        finally:
+            self.web.CELLIER_HASH = saved
+
+    def test_cellier_requires_password(self):
+        # pas de cookie → 401 même si le hash est configuré
+        import hashlib
+        salt = bytes(16)
+        h = hashlib.scrypt(b"test-cellier", salt=salt, n=16384, r=8, p=1, dklen=32)
+        saved = self.web.CELLIER_HASH
+        self.web.CELLIER_HASH = f"scrypt$16384$8$1${salt.hex()}${h.hex()}"
+        try:
+            c2 = TestClient(self.web.app)   # jar de cookies neuf, sans session
+            self.assertEqual(c2.get("/api/cellier").status_code, 401)
+        finally:
+            self.web.CELLIER_HASH = saved
+
     def test_ingest_auth(self):
         body = {"serial": "0000000000000000", "cursor": 1, "events": [
             {"tag": 66, "ring_timestamp": 1, "body_hex": "00ff", "decoded_json": {"unix_time": 1}}]}

@@ -44,8 +44,8 @@ head -c "$MAX_BYTES" | runuser -u "$SVC_USER" -- tar -x -C "$TMP" --no-same-owne
 [ -z "$(find "$TMP" -type l -print -quit)" ] || die "liens symboliques refusés dans l'archive"
 
 PY_WEB=(oura_web.py oura_core.py staging.py)
-PY_BIN=(derive_night.py oura_core.py staging.py)
-REQUIRED=(serveur/oura_web.py serveur/oura_core.py serveur/staging.py serveur/derive_night.py
+PY_BIN=(derive_night.py derive_cellier.py oura_core.py staging.py)
+REQUIRED=(serveur/oura_web.py serveur/oura_core.py serveur/staging.py serveur/derive_night.py serveur/derive_cellier.py
           serveur/static/index.html serveur/static/app.js serveur/static/app.css bin/nightly.sh)
 for f in "${REQUIRED[@]}"; do [ -f "$TMP/$f" ] || die "fichier manquant : $f"; done
 REV=$(tr -dc 'a-f0-9' < "$TMP/REVISION" 2>/dev/null | head -c 40 || true)

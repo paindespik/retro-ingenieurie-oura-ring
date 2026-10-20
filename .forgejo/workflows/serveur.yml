@@ -92,5 +92,6 @@ jobs:
         run: |
           tar -c --exclude=__pycache__ --exclude=serveur/tests \
             REVISION bin/nightly.sh systemd/serveur \
-            serveur/oura_web.py serveur/oura_core.py serveur/staging.py serveur/derive_night.py serveur/static \
+            serveur/oura_web.py serveur/oura_core.py serveur/staging.py serveur/derive_night.py \
+            serveur/derive_cellier.py serveur/static \
           | ssh -i ~/.ssh/id_deploy -o BatchMode=yes -o StrictHostKeyChecking=yes "$USER_SSH@$HOST"
