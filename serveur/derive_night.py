@@ -62,20 +62,21 @@ import staging
 
 VERSION = 5                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
-# Résumé du matin : le gros modèle de la RTX 3090, sinon le 4B de la P40.
-# Depuis le 28/10/2026 : Ling-3.0-flash-Sante (MoE médical 124B-A5.1B, IQ2_S,
-# entrée llama-swap « ling-sante », chargé à la demande) à la place du
-# qwen3.8-27b résident. Retour au 27B : OURA_LLM_MODEL=qwen3.8-27b et
-# OURA_LLM_MAY_SWAP=0.
-# OURA_LLM_MAY_SWAP=1 : le gros modèle est demandé même si un autre occupe la
-# 3090 (llama-swap le décharge). À 0 : on ne le demande que s'il est déjà chargé
-# ou si la 3090 est libre (comportement prévu pour un modèle résident).
-LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "ling-sante")
+# Résumé du matin : le qwen3.8-27b résident de la RTX 3090 (préchargé par
+# llama-swap) quand il est disponible, sinon le 4B de la P40.
+# OURA_LLM_MAY_SWAP=0 (défaut) : on ne demande le gros modèle que s'il est déjà
+# chargé ou si la 3090 est libre (llama-swap déchargerait sinon le modèle d'un
+# autre usage). À 1 : il est demandé quoi qu'il arrive (modèle à la demande).
+# Essai du 28/10/2026 avec Ling-3.0-flash-Sante (OURA_LLM_MODEL=ling-sante,
+# OURA_LLM_MAY_SWAP=1) : résumés justes mais moins bien tournés (trop de chiffres,
+# « 1 h 64 »), plus lents, et chaque résumé déchargeait le 27B → Ling est réservé
+# à l'analyse approfondie du portail (oura_web.py).
+LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")
 LLM_MODEL_FALLBACK = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")
-LLM_MAY_SWAP = os.environ.get("OURA_LLM_MAY_SWAP", "1") == "1"
+LLM_MAY_SWAP = os.environ.get("OURA_LLM_MAY_SWAP", "0") == "1"
 # Qwen 3.8 : « medium » = ~80 s par résumé, nettement plus précis que « low »
 # (~40 s) sur les nuits réelles. Ling (bailing v3) n'a pas de niveaux d'effort :
-# seulement enable_thinking (cf. think_kwargs).
+# seulement enable_thinking (cf. llm_options).
 LLM_REASONING = os.environ.get("OURA_LLM_REASONING", "medium")   # low | medium | xhigh
 
 # Ling : budget de réflexion par requête (llama-server : thinking_budget_tokens).

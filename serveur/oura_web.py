@@ -36,9 +36,14 @@ INBOX_DIR = Path(os.environ.get("OURA_INBOX", "/srv/oura/inbox"))
 STATIC_DIR = Path(__file__).with_name("static")
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 LLM_MODEL = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")      # petit modèle, toujours chargé
-LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL", "ling-sante")               # gros modèle (RTX 3090)
+# « Analyse approfondie » : Ling-3.0-flash-Sante (MoE médical 124B-A5.1B, IQ2_M,
+# entrée llama-swap « ling-sante »), chargé à la demande sur la 3090 (~35 s, il
+# décharge le qwen3.8-27b résident). Le résumé du matin reste au 27B (derive_night).
+# Variables distinctes de celles du nightly (OURA_LLM_MODEL / OURA_LLM_MAY_SWAP).
+LLM_MODEL_DEEP = os.environ.get("OURA_CHAT_MODEL_DEEP", "ling-sante")
 # 1 : l'analyse approfondie peut reprendre la 3090 même si un autre modèle l'occupe
-LLM_MAY_SWAP = os.environ.get("OURA_LLM_MAY_SWAP", "1") == "1"
+# (0 : 409 « 3090 occupée », comportement prévu pour un modèle résident)
+LLM_MAY_SWAP = os.environ.get("OURA_CHAT_MAY_SWAP", "1") == "1"
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
 # Nom d'événement de repli à l'ingestion (colonne `name` NOT NULL) quand la
