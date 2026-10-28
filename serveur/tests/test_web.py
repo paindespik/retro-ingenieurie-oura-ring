@@ -154,5 +154,88 @@ class WebTest(unittest.TestCase):
         self.assertNotIn("110 − 25", js)
 
 
+    # --------------------------------------------------- outils de l'analyse approfondie
+
+    def _tool(self, name, **args):
+        import json
+        out = json.loads(self.web.run_tool(name, args))
+        return out
+
+    def test_chat_tools(self):
+        n = self.night
+        c = self._tool("courbes_nuit", date=n)
+        self.assertNotIn("erreur", c)
+        self.assertTrue(c["points_5_min"])
+        self.assertEqual(len(c["points_5_min"][0]), len(c["colonnes"]))
+        self.assertTrue(c["hypnogramme_estime"])
+        self.assertTrue(all(x[2] in ("éveil", "léger", "profond", "REM") for x in c["hypnogramme_estime"]))
+        self.assertEqual(len(self._tool("nuits", debut="2000-01-01", fin="2100-01-01")["nuits"]), 4)
+        self.assertNotIn("erreur", self._tool("recuperation", date=n))
+        a = self._tool("activite_jour", date=n)
+        self.assertNotIn("erreur", a)
+        self.assertIn("par_quart_d_heure", a)
+        self.assertIn("journal", self._tool("journal", debut="2000-01-01", fin="2100-01-01"))
+        start = c["coucher"]          # « JJ/MM HH:MM »
+        self.assertTrue(start)
+        z = self._tool("zoom", debut=f"{n} 00:00", fin=f"{n} 03:00")
+        self.assertNotIn("erreur", z)
+        self.assertIn("par_minute", z)
+
+    def test_chat_tools_bad_args(self):
+        self.assertIn("erreur", self._tool("courbes_nuit", date="hier"))
+        self.assertIn("erreur", self._tool("courbes_nuit", date="1999-01-01"))
+        self.assertIn("erreur", self._tool("zoom", debut="2026-01-01 00:00", fin="2026-01-01 09:00"))
+        self.assertIn("erreur", self._tool("nimporte"))
+        self.assertIn("erreur", self._tool("nuits", debut="2026-01-01"))       # argument manquant
+
+    def test_deep_chat_tool_loop(self):
+        """Boucle modèle ↔ outils avec un faux llama-swap : appel d'outil, puis réponse."""
+        import asyncio
+        import json
+        web, night = self.web, self.night
+        sent = []
+
+        class Resp:
+            def __init__(self, msg):
+                self.msg = msg
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"choices": [{"message": self.msg}]}
+
+        class Client:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def post(self, _url, json=None):
+                sent.append(json)
+                if len(sent) == 1:
+                    return Resp({"content": "", "tool_calls": [{"id": "a", "type": "function", "function": {
+                        "name": "courbes_nuit", "arguments": '{"date": "%s"}' % night}}]})
+                return Resp({"content": "Votre FC la plus basse était à 03:10."})
+
+        orig = web.httpx.AsyncClient
+        web.httpx.AsyncClient = Client
+        try:
+            job = {"tools": []}
+            asyncio.run(web.deep_chat_job(job, "À quelle heure ma FC était-elle la plus basse ?"))
+        finally:
+            web.httpx.AsyncClient = orig
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(job["tools"], [f"courbes_nuit({night})"])
+        self.assertIn("tools", sent[0])
+        tool_msg = sent[1]["messages"][-1]
+        self.assertEqual(tool_msg["role"], "tool")
+        self.assertIn("points_5_min", json.loads(tool_msg["content"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -961,9 +961,10 @@ async function pageAssistant(m) {
   m.innerHTML = `<div class="card"><h2>Interroger mes données</h2><div class="chatlog" id="log"></div>
     <div class="row"><input id="chat-in" style="flex:1 1 240px" placeholder="ex. comment se compare ma dernière nuit à la semaine ?">
     <button class="primary" id="chat-send">Envoyer</button><button id="chat-deep" title="Ling-3.0-flash-Santé, modèle spécialisé santé, plus lent">Analyse approfondie</button></div>
-    <div class="tiny muted" style="margin-top:.4rem">Modèles locaux (llama-swap) : « Envoyer » utilise le 4B (rapide), « Analyse approfondie »
-    Ling-3.0-flash-Santé, un modèle spécialisé santé (chargé à la demande, 1 à 3 min). Ils ne voient que vos données résumées (30 nuits, récupération, activité, journal) et peuvent se
-    tromper. Ce n'est pas un avis médical.</div></div>
+    <div class="tiny muted" style="margin-top:.4rem">Modèles locaux (llama-swap). « Envoyer » : le 4B (rapide), qui ne voit que vos
+    données résumées (30 nuits, récupération, activité, journal). « Analyse approfondie » : Ling-3.0-flash-Santé, un modèle
+    spécialisé santé qui va en plus chercher lui-même le détail calculé (courbes de nuit, minute par minute, journées,
+    nuits anciennes) ; chargé à la demande, 1 à 5 min. Ils peuvent se tromper. Ce n'est pas un avis médical.</div></div>
     ${b ? `<div class="card"><h2>Dernier résumé du matin <span class="badge">${esc(b.model)}</span>${b.checked !== 1 ? ` <span class="badge warn">chiffres non vérifiés</span>` : ""}</h2><div class="brief md">${md(b.text)}</div>
       <div class="tiny muted">nuit du ${dayLabel(b.night)} · ${dtShort(b.ts)}</div></div>` : ""}`;
   const log = $("#log", m);
@@ -974,12 +975,30 @@ async function pageAssistant(m) {
     const inp = $("#chat-in"), text = inp.value.trim();
     if (!text) return;
     inp.value = "";
-    chatLog.push({ u: true, text }, { u: false, text: deep ? "… (analyse approfondie par Ling-Santé, 1 à 3 min)" : "…" });
+    const slot = { u: false, text: deep ? "… (analyse approfondie par Ling-Santé, 1 à 5 min)" : "…" };
+    chatLog.push({ u: true, text }, slot);
     draw();
     try {
       const r = await post("chat", { message: text, deep });
-      Object.assign(chatLog[chatLog.length - 1], { text: r.reply, model: r.model });
-    } catch (e) { chatLog[chatLog.length - 1].text = "⚠ " + e.message; }
+      if (r.job) {
+        // analyse approfondie : tâche de fond (allers-retours modèle ↔ outils)
+        const t0 = Date.now();
+        for (;;) {
+          await new Promise((ok) => setTimeout(ok, 2000));
+          const j = await api("chat/job/" + r.job);
+          const used = j.tools && j.tools.length ? `\n\nDonnées consultées : ${j.tools.join(" · ")}` : "";
+          if (j.state === "done") {
+            Object.assign(slot, { text: j.reply, model: j.model + (j.tools.length ? " · " + j.tools.join(" · ") : "") });
+            break;
+          }
+          if (j.state === "error") { slot.text = "⚠ " + j.error; break; }
+          slot.text = `… ${j.step || "analyse"} (${Math.round((Date.now() - t0) / 1000)} s)${used}`;
+          draw();
+        }
+      } else {
+        Object.assign(slot, { text: r.reply, model: r.model });
+      }
+    } catch (e) { slot.text = "⚠ " + e.message; }
     draw();
   };
   $("#chat-send", m).onclick = () => send(false);

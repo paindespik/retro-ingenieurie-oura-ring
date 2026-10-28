@@ -12,12 +12,14 @@ Lit en lecture seule :
 L'interface (static/) est du HTML/CSS/JS sans dépendance. Le chat passe par
 llama-swap (API compatible OpenAI) en local.
 """
+import asyncio
 import base64
 import hashlib
 from contextlib import asynccontextmanager
 import hmac
 import json
 import os
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -896,18 +898,23 @@ CHAT_NIGHT_KEYS = (("night", "nuit"), ("score", "score_sommeil"), ("total", "som
 CHAT_HOURS = ("total", "in_bed", "deep", "rem", "recovery_index")
 
 
+def _night_ctx(r):
+    """Ligne de sleep_scores → dictionnaire lisible par le modèle (durées en h/min)."""
+    o = {name: (_hmin(r[k]) if k in CHAT_HOURS else r[k]) for k, name in CHAT_NIGHT_KEYS
+         if r.get(k) is not None}
+    o["coucher_lever"] = f"{r.get('bedtime')}–{r.get('wake_time')}"
+    if r.get("provisional"):
+        o["nuit_en_cours"] = True
+    return o
+
+
 def chat_context():
     ctx = {}
     d = derived()
     if d:
         nights_ = []
         for r in reversed(safe_q(d, "SELECT * FROM sleep_scores ORDER BY night DESC LIMIT 30")):
-            o = {name: (_hmin(r[k]) if k in CHAT_HOURS else r[k]) for k, name in CHAT_NIGHT_KEYS
-                 if r.get(k) is not None}
-            o["coucher_lever"] = f"{r.get('bedtime')}–{r.get('wake_time')}"
-            if r.get("provisional"):
-                o["nuit_en_cours"] = True
-            nights_.append(o)
+            nights_.append(_night_ctx(r))
         ctx["nuits"] = nights_
         ctx["references_personnelles"] = {
             m: {"moyenne": round(b["mean"], 1), "ecart_type": round(b["sd"], 1), "nuits": b["n"]}
@@ -971,6 +978,304 @@ async def swap_running():
         return None
 
 
+# ---------------------------------------------------------------- outils de l'analyse approfondie
+#
+# Le modèle de l'analyse approfondie (Ling-Santé) reçoit le même contexte résumé que
+# le chat rapide, plus des OUTILS pour aller chercher le détail calculé par le code
+# (courbes 5 min, hypnogramme, minute par minute…). Il ne lit jamais le brut de
+# l'anneau : volume (~26 000 événements/nuit) et décodage piégeux (TimeAxis,
+# décisecondes, 3 capteurs de T°) — le code calcule, le modèle interprète.
+
+TOOL_MAX_CHARS = 24000        # ~7 000 jetons par réponse d'outil (contexte 64K)
+CHAT_TOOL_ROUNDS = 5          # allers-retours d'outils maximum avant la réponse
+CHAT_DEEP_DEADLINE_S = 420    # au-delà : réponse forcée avec ce qui a été lu
+CHAT_ROUND_BUDGET = 1200      # réflexion par aller-retour (jetons)
+ZOOM_MAX_H = 4
+
+
+def _hm(unix):
+    return datetime.fromtimestamp(unix).strftime("%H:%M") if unix else None
+
+
+def _rnd(v, nd=0):
+    if v is None:
+        return None
+    v = round(float(v), nd)
+    return int(v) if nd == 0 else v
+
+
+def _parse_day(s):
+    datetime.strptime(str(s), "%Y-%m-%d")
+    return str(s)
+
+
+def _parse_dt(s):
+    s = str(s).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            pass
+    raise ValueError(f"date-heure invalide : {s} (attendu AAAA-MM-JJ HH:MM)")
+
+
+def tool_nuits(debut, fin):
+    """Résumés de nuits sur une période (au-delà des 30 du contexte)."""
+    debut, fin = _parse_day(debut), _parse_day(fin)
+    d = derived()
+    if not d:
+        return {"erreur": "aucune donnée dérivée"}
+    rows = safe_q(d, "SELECT * FROM sleep_scores WHERE night BETWEEN ? AND ? ORDER BY night LIMIT 120",
+                  (debut, fin))
+    d.close()
+    return {"nuits": [_night_ctx(r) for r in rows], "n": len(rows)}
+
+
+def tool_courbes_nuit(date):
+    """Courbes 5 min + hypnogramme estimé (segments) d'une nuit."""
+    date = _parse_day(date)
+    d = derived()
+    if not d:
+        return {"erreur": "aucune donnée dérivée"}
+    n = safe_one(d, "SELECT * FROM sleep_scores WHERE night=?", (date,))
+    if not n:
+        d.close()
+        return {"erreur": f"nuit {date} inconnue (une nuit porte la date du réveil)"}
+    series = safe_q(d, "SELECT t, hr, rmssd, resp, motion, temp FROM night_series WHERE night=? ORDER BY t", (date,))
+    stages = [r["stage"] for r in safe_q(d, "SELECT stage FROM night_staging WHERE night=? ORDER BY epoch", (date,))]
+    d.close()
+    names = {"awake": "éveil", "light": "léger", "deep": "profond", "rem": "REM"}
+    runs, t0 = [], n.get("start_unix")
+    if t0:
+        i = 0
+        while i < len(stages):
+            j = i
+            while j + 1 < len(stages) and stages[j + 1] == stages[i]:
+                j += 1
+            runs.append([_hm(t0 + i * 30), _hm(t0 + (j + 1) * 30), names.get(stages[i], stages[i])])
+            i = j + 1
+    return {
+        "nuit": date, "resume": _night_ctx(n),
+        "coucher": _clock(n.get("start_unix")), "endormissement": _clock(n.get("onset_unix")),
+        "fin_du_sommeil": _clock(n.get("end_unix")), "lever": _clock(n.get("stop_unix")),
+        "fc_stabilisee_a": _clock(n.get("hr_stable_at")),
+        "colonnes": ["heure", "fc_bpm", "hrv_rmssd_ms", "respiration_par_min", "mouvement_max_sans_unite",
+                     "temperature_peau_c"],
+        "points_5_min": [[_hm(r["t"]), _rnd(r["hr"]), _rnd(r["rmssd"]), _rnd(r["resp"], 1),
+                          _rnd(r["motion"], 2), _rnd(r["temp"], 2)] for r in series],
+        "hypnogramme_estime": runs,
+        "note": "stades = estimation heuristique peu fiable ; mouvement = intensité relative (0 = immobile, pics > 10 = gros mouvements) ; valeurs absentes = null",
+    }
+
+
+def tool_recuperation(date):
+    """Score de récupération d'un jour : contributeurs et signes de tension détaillés."""
+    date = _parse_day(date)
+    d = derived()
+    if not d:
+        return {"erreur": "aucune donnée dérivée"}
+    rd = readiness_row(safe_one(d, "SELECT * FROM readiness WHERE day=?", (date,)))
+    d.close()
+    if not rd:
+        return {"erreur": f"pas de récupération pour {date}"}
+    rd["contributors"] = {k: v.get("score") if isinstance(v, dict) else v for k, v in rd["contributors"].items()}
+    rd["sleep_debt"] = _hmin(rd.pop("sleep_debt_h", None))
+    rd["sleep_need"] = _hmin(rd.pop("sleep_need_h", None))
+    return rd
+
+
+def tool_activite_jour(date):
+    """Journée d'activité (04:00 → 03:59) agrégée par quart d'heure."""
+    date = _parse_day(date)
+    a = activity(date=date)
+    q15 = {}
+    for p in a["met"]:
+        b = q15.setdefault(int(p["t"] // 900) * 900, {"met": [], "pas": 0.0, "fc": []})
+        b["met"].append(p["met"])
+        b["pas"] += p["steps"]
+    for p in a["hr"]:
+        if not p.get("night"):
+            q15.setdefault(int(p["t"] // 900) * 900, {"met": [], "pas": 0.0, "fc": []})["fc"].append(p["hr"])
+    rows = []
+    for k in sorted(q15):
+        b = q15[k]
+        fc = sorted(b["fc"])
+        rows.append([_hm(k), _rnd(sum(b["met"]) / len(b["met"]), 1) if b["met"] else None,
+                     _rnd(b["pas"]), fc[len(fc) // 2] if fc else None])
+    s = a.get("summary") or {}
+    return {
+        "jour": date, "journee": "04:00 → 03:59",
+        "resume": {k: s.get(k) for k in ("score", "partial", "steps", "met_min_mh", "inactive_min",
+                                          "active_kcal", "total_kcal", "hr_day_rest", "hr_day_mean") if k in s},
+        "colonnes": ["quart_d_heure", "met_moyen", "pas_estimes", "fc_mediane_bpm"],
+        "par_quart_d_heure": rows,
+        "efforts_met_3_et_plus": [{"debut": _hm(x["start"]), "fin": _hm(x["end"]), "minutes": x["min"],
+                                   "met_moyen": x["met_avg"], "fc_moyenne": x["hr_mean"], "fc_max": x["hr_max"]}
+                                  for x in a["segments"]],
+        "sommeil": [[_hm(x), _hm(y)] for x, y in a["sleep"]],
+        "repos": [{"debut": _hm(x["start_unix"]), "fin": _hm(x["end_unix"]), "type": x["kind"],
+                   "fc_mediane": x["hr_median"]} for x in a["rest_list"]],
+        "charge": [[_hm(x), _hm(y)] for x, y in a["charging"]],
+        "non_porte": a["nonworn"],
+        "note": "pas = estimation non validée ; MET : < 1,05 repos, 1,05–1,5 sédentaire, ≥ 3 modéré, ≥ 6 intense",
+    }
+
+
+def tool_zoom(debut, fin):
+    """Minute par minute (FC de jour, MET, pas) sur une fenêtre de ≤ 4 h."""
+    t0, t1 = _parse_dt(debut), _parse_dt(fin)
+    if not 0 < t1 - t0 <= ZOOM_MAX_H * 3600:
+        return {"erreur": f"fenêtre invalide : fin après début, {ZOOM_MAX_H} h maximum"}
+    c = raw()
+    ax = axis_for(c)
+    hr = oc.day_hr_minutes(c, ax, t0, t1)
+    am = oc.activity_minutes(c, ax, t0, t1)
+    s_ds, e_ds = ax.to_ds(t0 - 600), ax.to_ds(t1 + 600)
+    night = [[_hm(ax(cds)), h, x] for cds, h, x in oc.hrv_bins(c, s_ds, e_ds)
+             if ax(cds) is not None and t0 <= ax(cds) < t1]
+    c.close()
+    mins = sorted(set(int(t // 60) * 60 for t in list(hr) + list(am)))
+    hr_m = {int(t // 60) * 60: v for t, v in hr.items()}
+    am_m = {int(t // 60) * 60: v for t, v in am.items()}
+    return {
+        "debut": _clock(t0), "fin": _clock(t1),
+        "colonnes": ["minute", "fc_bpm", "met", "pas_estimes"],
+        "par_minute": [[_hm(m), _rnd(hr_m.get(m)), _rnd((am_m.get(m) or {}).get("met"), 1),
+                        _rnd((am_m.get(m) or {}).get("steps"))] for m in mins],
+        "fc_de_nuit_5_min": {"colonnes": ["fin_de_fenetre", "fc_bpm", "hrv_rmssd_ms"], "points": night},
+        "note": "FC de jour mesurée par intermittence (minutes sans mesure = null) ; la nuit, FC/HRV par fenêtres de 5 min",
+    }
+
+
+def tool_journal(debut, fin):
+    """Tags du journal sur une période (maladie, alcool, sport, stress…)."""
+    debut, fin = _parse_day(debut), _parse_day(fin)
+    d = derived()
+    if not d:
+        return {"journal": []}
+    rows = safe_q(d, "SELECT day, kind, note FROM tags WHERE day BETWEEN ? AND ? ORDER BY day", (debut, fin))
+    d.close()
+    return {"journal": rows}
+
+
+def _fn(name, desc, props, required):
+    return {"type": "function", "function": {"name": name, "description": desc, "parameters": {
+        "type": "object", "properties": {k: {"type": "string", "description": v} for k, v in props.items()},
+        "required": required}}}
+
+
+_DAY = "date AAAA-MM-JJ"
+CHAT_TOOLS = [
+    _fn("courbes_nuit", "Courbes toutes les 5 min d'une nuit (FC, HRV, respiration, mouvement, température "
+        "de peau), heures de coucher/endormissement/réveil et hypnogramme estimé. Une nuit porte la date du RÉVEIL.",
+        {"date": _DAY}, ["date"]),
+    _fn("nuits", "Résumés de toutes les nuits entre deux dates (pour remonter au-delà des 30 nuits du contexte).",
+        {"debut": _DAY, "fin": _DAY}, ["debut", "fin"]),
+    _fn("recuperation", "Score de récupération d'un jour : contributeurs et signes de tension détaillés "
+        "(écarts aux références).", {"date": _DAY}, ["date"]),
+    _fn("activite_jour", "Journée d'activité (04:00 → 03:59) par quart d'heure : MET, pas estimés, FC de jour ; "
+        "efforts, repos, sommeil, charge, périodes non portées.", {"date": _DAY}, ["date"]),
+    _fn("zoom", f"Minute par minute (FC de jour, MET, pas) et FC/HRV de nuit par 5 min, sur une fenêtre "
+        f"de {ZOOM_MAX_H} h maximum.", {"debut": "AAAA-MM-JJ HH:MM", "fin": "AAAA-MM-JJ HH:MM"}, ["debut", "fin"]),
+    _fn("journal", "Tags du journal de l'utilisateur entre deux dates (maladie, alcool, sport, stress…).",
+        {"debut": _DAY, "fin": _DAY}, ["debut", "fin"]),
+]
+TOOL_FUNCS = {"courbes_nuit": tool_courbes_nuit, "nuits": tool_nuits, "recuperation": tool_recuperation,
+              "activite_jour": tool_activite_jour, "zoom": tool_zoom, "journal": tool_journal}
+
+CHAT_TOOLS_HELP = (
+    "\nOutils : le contexte ci-dessous ne contient que des résumés. Pour toute question qui demande "
+    "du détail (heure d'un minimum ou d'un pic, évolution pendant la nuit, réveils, journée précise, "
+    "nuit ancienne, comparaison fine), appelle d'abord les outils adaptés, puis réponds en t'appuyant "
+    "sur leurs valeurs (cite les heures). N'invente aucune valeur qu'un outil n'a pas renvoyée. "
+    f"Aujourd'hui : {{today}}."
+)
+
+
+def run_tool(name, args):
+    """Exécute un outil et renvoie du JSON compact (erreurs comprises, le modèle les lit)."""
+    f = TOOL_FUNCS.get(name)
+    if not f:
+        out = {"erreur": f"outil inconnu : {name}"}
+    else:
+        try:
+            out = f(**{k: v for k, v in (args or {}).items() if isinstance(k, str)})
+        except HTTPException as e:
+            out = {"erreur": e.detail}
+        except (TypeError, ValueError) as e:
+            out = {"erreur": f"arguments invalides : {e}"}
+    s = json.dumps(out, ensure_ascii=False, default=str, separators=(",", ":"))
+    if len(s) > TOOL_MAX_CHARS:
+        s = s[:TOOL_MAX_CHARS] + "…(tronqué : demander une période plus courte)"
+    return s
+
+
+def _tool_label(name, args):
+    return f"{name}({', '.join(str(v) for v in (args or {}).values())})"
+
+
+CHAT_JOBS: dict[str, dict] = {}
+
+
+async def deep_chat_job(job, msg):
+    """Analyse approfondie : boucle modèle ↔ outils, puis réponse finale."""
+    system = (CHAT_SYSTEM + CHAT_TOOLS_HELP.format(today=datetime.now().strftime("%Y-%m-%d"))
+              + "\nContexte :\n" + await asyncio.to_thread(chat_context))
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": msg}]
+    deadline = time.monotonic() + CHAT_DEEP_DEADLINE_S
+    try:
+        async with httpx.AsyncClient(timeout=300) as cli:
+            for rnd in range(CHAT_TOOL_ROUNDS + 1):
+                final = rnd == CHAT_TOOL_ROUNDS or time.monotonic() > deadline - 120
+                payload = {"model": LLM_MODEL_DEEP, "messages": messages, "temperature": 0.4,
+                           "max_tokens": 6000, **llm_options(LLM_MODEL_DEEP)}
+                if not final:
+                    payload["tools"] = CHAT_TOOLS
+                    if "thinking_budget_tokens" in payload:
+                        payload["thinking_budget_tokens"] = CHAT_ROUND_BUDGET
+                job["step"] = "rédaction de la réponse" if final else (
+                    "chargement du modèle et réflexion" if rnd == 0 else "réflexion")
+                r = await cli.post(LLM_URL, json=payload)
+                r.raise_for_status()
+                m = r.json()["choices"][0]["message"]
+                calls = m.get("tool_calls") or []
+                if calls and not final:
+                    messages.append({"role": "assistant", "content": m.get("content") or "",
+                                     "reasoning_content": m.get("reasoning_content") or "", "tool_calls": calls})
+                    for c in calls:
+                        name = (c.get("function") or {}).get("name", "")
+                        try:
+                            args = json.loads((c.get("function") or {}).get("arguments") or "{}")
+                        except ValueError:
+                            args = {}
+                        job["tools"].append(_tool_label(name, args))
+                        job["step"] = "lecture : " + job["tools"][-1]
+                        out = await asyncio.to_thread(run_tool, name, args)
+                        messages.append({"role": "tool", "tool_call_id": c.get("id") or name, "content": out})
+                    continue
+                content = (m.get("content") or "").strip()
+                if not content:
+                    raise RuntimeError("réponse vide du modèle")
+                job.update(state="done", reply=content, step=None)
+                return
+    except Exception as e:  # noqa: BLE001
+        job.update(state="error", error=f"analyse approfondie impossible : {e}", step=None)
+
+
+def _purge_jobs():
+    old = time.time() - 3600
+    for k in [k for k, j in CHAT_JOBS.items() if j["created"] < old]:
+        CHAT_JOBS.pop(k, None)
+
+
+@app.get("/api/chat/job/{job_id}")
+def chat_job(job_id: str):
+    j = CHAT_JOBS.get(job_id)
+    if not j:
+        raise HTTPException(404, "analyse inconnue ou expirée")
+    return {k: j.get(k) for k in ("state", "step", "tools", "reply", "error", "model", "created")}
+
+
 @app.post("/api/chat")
 async def chat(body: dict):
     msg = (body.get("message") or "").strip()
@@ -985,20 +1290,26 @@ async def chat(body: dict):
         if busy:
             raise HTTPException(409, f"la RTX 3090 est occupée par {busy[0]} : réessayez plus tard "
                                      "ou utilisez « Envoyer » (modèle rapide)")
+    if deep:
+        # plusieurs allers-retours modèle ↔ outils : plus long que le délai de
+        # nginx (300 s) → tâche de fond, la page interroge /api/chat/job/{id}
+        _purge_jobs()
+        jid = secrets.token_urlsafe(9)
+        job = CHAT_JOBS[jid] = {"state": "running", "step": "démarrage", "tools": [], "reply": None,
+                                "error": None, "model": LLM_MODEL_DEEP, "created": time.time()}
+        job["task"] = asyncio.create_task(deep_chat_job(job, msg))
+        return {"job": jid, "model": LLM_MODEL_DEEP}
     payload = {
-        "model": LLM_MODEL_DEEP if deep else LLM_MODEL,
+        "model": LLM_MODEL,
         "messages": [{"role": "system", "content": CHAT_SYSTEM + "\nContexte :\n" + chat_context()},
                      {"role": "user", "content": msg}],
         "temperature": 0.4,
-        # réflexion coupée pour le modèle rapide (sinon elle consomme tout le
-        # budget) ; réflexion bornée pour l'analyse approfondie (~1 min)
-        "max_tokens": 6000 if deep else 800,
-        **(llm_options(LLM_MODEL_DEEP) if deep else {"chat_template_kwargs": {"enable_thinking": False}}),
+        # réflexion coupée pour le modèle rapide (sinon elle consomme tout le budget)
+        "max_tokens": 800,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     try:
-        # 290 s (< proxy_read_timeout 300 s de nginx) : avec LLM_MAY_SWAP, la réponse
-        # peut attendre le chargement du modèle (~1 min) + réflexion bornée (~1 min)
-        async with httpx.AsyncClient(timeout=290 if deep else 280) as cli:
+        async with httpx.AsyncClient(timeout=280) as cli:
             r = await cli.post(LLM_URL, json=payload)
             r.raise_for_status()
             content = (r.json()["choices"][0]["message"].get("content") or "").strip()
