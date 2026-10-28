@@ -62,15 +62,36 @@ import staging
 
 VERSION = 5                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
-# Résumé du matin : le 27B résident de la RTX 3090 (préchargé par llama-swap,
-# jamais déchargé) quand il est disponible, sinon le 4B de la P40. On ne
-# demande JAMAIS le 27B si un autre modèle occupe la 3090 : llama-swap le
-# déchargerait (un seul modèle à la fois sur cette carte).
-LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")
+# Résumé du matin : le gros modèle de la RTX 3090, sinon le 4B de la P40.
+# Depuis le 28/10/2026 : Ling-3.0-flash-Sante (MoE médical 124B-A5.1B, IQ2_S,
+# entrée llama-swap « ling-sante », chargé à la demande) à la place du
+# qwen3.8-27b résident. Retour au 27B : OURA_LLM_MODEL=qwen3.8-27b et
+# OURA_LLM_MAY_SWAP=0.
+# OURA_LLM_MAY_SWAP=1 : le gros modèle est demandé même si un autre occupe la
+# 3090 (llama-swap le décharge). À 0 : on ne le demande que s'il est déjà chargé
+# ou si la 3090 est libre (comportement prévu pour un modèle résident).
+LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "ling-sante")
 LLM_MODEL_FALLBACK = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")
-# « medium » : ~80 s par résumé, nettement plus précis que « low » (~40 s) sur
-# les nuits réelles (valeurs et sous-scores cités, causalité prudente).
+LLM_MAY_SWAP = os.environ.get("OURA_LLM_MAY_SWAP", "1") == "1"
+# Qwen 3.8 : « medium » = ~80 s par résumé, nettement plus précis que « low »
+# (~40 s) sur les nuits réelles. Ling (bailing v3) n'a pas de niveaux d'effort :
+# seulement enable_thinking (cf. think_kwargs).
 LLM_REASONING = os.environ.get("OURA_LLM_REASONING", "medium")   # low | medium | xhigh
+
+# Ling : budget de réflexion par requête (llama-server : thinking_budget_tokens).
+# Sans budget il raisonne ~12 000 jetons (~5 min) pour un résumé ; à 1 500 :
+# ~45 s, résumés vérifiés et plus détaillés que ceux du 27B (comparatif du 28/10/2026).
+LLM_THINK_BUDGET = int(os.environ.get("OURA_LLM_THINK_BUDGET", "2000"))
+THINK_BUDGET_MSG = "Okay, I have thought enough. Now I will write the final answer in French."
+
+def llm_options(model, reasoning=None):
+    """Champs de requête propres au gros modèle selon sa famille de template :
+    Ling (bailing v3) n'a que enable_thinking ; Qwen 3.8 a des niveaux d'effort."""
+    if "ling" in model.lower():
+        return {"chat_template_kwargs": {"enable_thinking": True},
+                "thinking_budget_tokens": LLM_THINK_BUDGET,
+                "reasoning_budget_message": THINK_BUDGET_MSG}
+    return {"chat_template_kwargs": {"reasoning_effort": reasoning or LLM_REASONING}}
 SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo) + "
                 "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
 # Besoin de sommeil NON personnalisé : 7 h 30, choisi par l'utilisateur le 10/10/2026
@@ -1186,11 +1207,13 @@ def running_models():
 
 
 def choose_model():
-    """Le 27B s'il est déjà chargé ou si la 3090 est libre (seul le 4B tourne) ;
-    sinon le 4B, pour ne jamais décharger un modèle utilisé ailleurs."""
+    """Le gros modèle s'il est déjà chargé, si la 3090 est libre (seul le 4B
+    tourne) ou si on a le droit de la reprendre (LLM_MAY_SWAP) ; sinon le 4B."""
     run = running_models()
     if run is None:
         return LLM_MODEL_FALLBACK
+    if LLM_MAY_SWAP:
+        return LLM_MODEL
     others = [m for m in run if m not in (LLM_MODEL, LLM_MODEL_FALLBACK)]
     return LLM_MODEL if (LLM_MODEL in run or not others) else LLM_MODEL_FALLBACK
 
@@ -1200,8 +1223,8 @@ def _llm(model, messages, temperature):
     big = model != LLM_MODEL_FALLBACK
     payload = {"model": model, "messages": messages, "temperature": temperature,
                "max_tokens": 6000 if big else 800,
-               "chat_template_kwargs": {"reasoning_effort": LLM_REASONING} if big
-               else {"enable_thinking": False}}
+               **(llm_options(model) if big
+                  else {"chat_template_kwargs": {"enable_thinking": False}})}
     req = urllib.request.Request(LLM_URL, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=900 if big else 240) as resp:
@@ -1217,7 +1240,11 @@ def llm_briefing(der, night, ctx, ctx_hash, tries=3, model=None):
         try:
             text = _llm(model, messages, 0.3 if k == 0 else 0.1)
         except Exception as e:  # noqa: BLE001
-            print(f"nightly: briefing LLM indisponible : {e}", file=sys.stderr)
+            print(f"nightly: briefing LLM indisponible ({model}) : {e}", file=sys.stderr)
+            if k == 0 and model != LLM_MODEL_FALLBACK:
+                # gros modèle en échec (chargement, OOM) : le 4B ce matin, et la
+                # réécriture par le gros modèle reste possible (maybe_briefing)
+                return llm_briefing(der, night, ctx, ctx_hash, tries, LLM_MODEL_FALLBACK)
             return None
         if not text:
             return None
@@ -1249,7 +1276,7 @@ def briefing_hash(ctx):
     """Empreinte des éléments qui justifient une réécriture : la nuit, les
     comparaisons, le score et les signes de tension, le journal. Les petites
     variations des contributeurs (activité de la veille recalculée) n'en font
-    pas partie : chaque réécriture coûte un appel au 27B."""
+    pas partie : chaque réécriture coûte un appel au gros modèle."""
     c = json.loads(ctx)
     rec = c.get("recuperation_du_jour") or {}
     key = {"n": c.get("nuit_a_resumer"), "cmp": c.get("comparaison_a_vos_references"),
@@ -1262,8 +1289,8 @@ def maybe_briefing(der, latest, now, upgrade_window_s=18 * 3600, log=print):
     """(Ré)écrit le résumé de la dernière nuit, une fois la nuit CLOSE (signe
     d'éveil observé après la fin de sa fenêtre, cf. night_closed) :
     - entrées modifiées → réécriture ;
-    - résumé écrit par le 4B faute de 3090 libre → réécrit par le 27B dès qu'il
-      redevient disponible (pendant 18 h après le réveil)."""
+    - résumé écrit par le 4B (3090 indisponible, échec du gros modèle) → réécrit
+      par le gros modèle dès qu'il redevient disponible (pendant 18 h après le réveil)."""
     stop = latest.get("stop_unix") or now
     if latest.get("provisional"):
         return

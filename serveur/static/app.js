@@ -960,9 +960,9 @@ async function pageAssistant(m) {
   const b = await api("briefing").catch(() => null);
   m.innerHTML = `<div class="card"><h2>Interroger mes données</h2><div class="chatlog" id="log"></div>
     <div class="row"><input id="chat-in" style="flex:1 1 240px" placeholder="ex. comment se compare ma dernière nuit à la semaine ?">
-    <button class="primary" id="chat-send">Envoyer</button><button id="chat-deep" title="modèle 27B de la RTX 3090, plus lent">Analyse approfondie</button></div>
+    <button class="primary" id="chat-send">Envoyer</button><button id="chat-deep" title="gros modèle de la RTX 3090, plus lent">Analyse approfondie</button></div>
     <div class="tiny muted" style="margin-top:.4rem">Modèles locaux (llama-swap) : « Envoyer » utilise le 4B (rapide), « Analyse approfondie »
-    le 27B s'il est libre. Ils ne voient que vos données résumées (30 nuits, récupération, activité, journal) et peuvent se
+    le gros modèle de la RTX 3090 (chargé à la demande, plus lent). Ils ne voient que vos données résumées (30 nuits, récupération, activité, journal) et peuvent se
     tromper. Ce n'est pas un avis médical.</div></div>
     ${b ? `<div class="card"><h2>Dernier résumé du matin <span class="badge">${esc(b.model)}</span>${b.checked !== 1 ? ` <span class="badge warn">chiffres non vérifiés</span>` : ""}</h2><div class="brief md">${md(b.text)}</div>
       <div class="tiny muted">nuit du ${dayLabel(b.night)} · ${dtShort(b.ts)}</div></div>` : ""}`;
@@ -974,7 +974,7 @@ async function pageAssistant(m) {
     const inp = $("#chat-in"), text = inp.value.trim();
     if (!text) return;
     inp.value = "";
-    chatLog.push({ u: true, text }, { u: false, text: deep ? "… (analyse approfondie par le 27B, environ 1 min)" : "…" });
+    chatLog.push({ u: true, text }, { u: false, text: deep ? "… (analyse approfondie, 1 à 3 min)" : "…" });
     draw();
     try {
       const r = await post("chat", { message: text, deep });

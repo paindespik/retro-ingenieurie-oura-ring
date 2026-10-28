@@ -36,7 +36,9 @@ INBOX_DIR = Path(os.environ.get("OURA_INBOX", "/srv/oura/inbox"))
 STATIC_DIR = Path(__file__).with_name("static")
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 LLM_MODEL = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")      # petit modèle, toujours chargé
-LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")               # gros modèle résident
+LLM_MODEL_DEEP = os.environ.get("OURA_LLM_MODEL", "ling-sante")               # gros modèle (RTX 3090)
+# 1 : l'analyse approfondie peut reprendre la 3090 même si un autre modèle l'occupe
+LLM_MAY_SWAP = os.environ.get("OURA_LLM_MAY_SWAP", "1") == "1"
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
 # Nom d'événement de repli à l'ingestion (colonne `name` NOT NULL) quand la
@@ -944,6 +946,17 @@ def chat_context():
     return json.dumps(ctx, ensure_ascii=False, default=str)
 
 
+def llm_options(model):
+    """Champs de requête du gros modèle : Ling (bailing v3) n'a que
+    enable_thinking, borné par un budget de réflexion (sinon ~5 min) ;
+    Qwen 3.8 a des niveaux d'effort."""
+    if "ling" in model.lower():
+        return {"chat_template_kwargs": {"enable_thinking": True},
+                "thinking_budget_tokens": int(os.environ.get("OURA_LLM_THINK_BUDGET", "2000")),
+                "reasoning_budget_message": "Okay, I have thought enough. Now I will write the final answer in French."}
+    return {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+
+
 async def swap_running():
     try:
         async with httpx.AsyncClient(timeout=5) as cli:
@@ -959,7 +972,7 @@ async def chat(body: dict):
     deep = bool(body.get("deep"))
     if not msg:
         raise HTTPException(400, "message vide")
-    if deep:
+    if deep and not LLM_MAY_SWAP:
         # la 3090 ne porte qu'un modèle à la fois : ne jamais décharger un
         # modèle utilisé ailleurs pour une question du portail
         run = await swap_running()
@@ -973,12 +986,14 @@ async def chat(body: dict):
                      {"role": "user", "content": msg}],
         "temperature": 0.4,
         # réflexion coupée pour le modèle rapide (sinon elle consomme tout le
-        # budget) ; effort « medium » pour l'analyse approfondie (~1 min)
+        # budget) ; réflexion bornée pour l'analyse approfondie (~1 min)
         "max_tokens": 6000 if deep else 800,
-        "chat_template_kwargs": {"reasoning_effort": "medium"} if deep else {"enable_thinking": False},
+        **(llm_options(LLM_MODEL_DEEP) if deep else {"chat_template_kwargs": {"enable_thinking": False}}),
     }
     try:
-        async with httpx.AsyncClient(timeout=280) as cli:
+        # 290 s (< proxy_read_timeout 300 s de nginx) : avec LLM_MAY_SWAP, la réponse
+        # peut attendre le chargement du modèle (~1 min) + réflexion bornée (~1 min)
+        async with httpx.AsyncClient(timeout=290 if deep else 280) as cli:
             r = await cli.post(LLM_URL, json=payload)
             r.raise_for_status()
             content = (r.json()["choices"][0]["message"].get("content") or "").strip()

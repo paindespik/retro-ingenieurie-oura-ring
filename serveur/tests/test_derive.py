@@ -172,18 +172,32 @@ class RecoveryTest(Base):
         self.assertEqual(dn.unverified_numbers(good, ctx), [])
         self.assertIn("987", dn.unverified_numbers("récupération 987", ctx))
 
-    def test_model_choice_never_evicts(self):
-        cases = {("qwen3.8-27b", "qwen3.5-4b"): "qwen3.8-27b",      # résident → 27B
-                 ("qwen3.5-4b",): "qwen3.8-27b",                    # 3090 libre → 27B (défaut)
-                 ("gemma4-31b", "qwen3.5-4b"): "qwen3.5-4b",        # 3090 occupée → 4B
-                 None: "qwen3.5-4b"}                                # llama-swap illisible → 4B
-        orig = dn.running_models
+    def test_model_choice(self):
+        big, small = dn.LLM_MODEL, dn.LLM_MODEL_FALLBACK
+        # mode « résident » (OURA_LLM_MAY_SWAP=0) : ne jamais décharger la 3090
+        polite = {(big, small): big,                       # déjà chargé → gros modèle
+                  (small,): big,                           # 3090 libre → gros modèle
+                  ("gemma4-31b", small): small,            # 3090 occupée → 4B
+                  None: small}                             # llama-swap illisible → 4B
+        # mode « à la demande » (défaut depuis Ling) : la 3090 peut être reprise
+        swap = {**polite, ("gemma4-31b", small): big}
+        orig, orig_swap = dn.running_models, dn.LLM_MAY_SWAP
         try:
-            for run, want in cases.items():
-                dn.running_models = lambda r=run: list(r) if r else r
-                self.assertEqual(dn.choose_model(), want, run)
+            for may, cases in ((False, polite), (True, swap)):
+                dn.LLM_MAY_SWAP = may
+                for run, want in cases.items():
+                    dn.running_models = lambda r=run: list(r) if r else r
+                    self.assertEqual(dn.choose_model(), want, (may, run))
         finally:
-            dn.running_models = orig
+            dn.running_models, dn.LLM_MAY_SWAP = orig, orig_swap
+
+    def test_llm_options_per_family(self):
+        ling = dn.llm_options("ling-sante")
+        self.assertEqual(ling["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertGreater(ling["thinking_budget_tokens"], 0)
+        self.assertNotIn("reasoning_effort", ling["chat_template_kwargs"])
+        self.assertEqual(dn.llm_options("qwen3.8-27b")["chat_template_kwargs"],
+                         {"reasoning_effort": dn.LLM_REASONING})
 
     def test_briefing_hash_ignores_contributor_noise(self):
         night = self.rows[-1]["night"]
