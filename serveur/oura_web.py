@@ -862,8 +862,12 @@ CHAT_SYSTEM = (
     "son activité récente (dont des pas ESTIMÉS non validés), sa dette de sommeil, ses références "
     "personnelles, son journal (tags), l'état de l'anneau et les dernières mesures avec leur ancienneté.\n"
     "Règles : réponds en français en vouvoyant, concis et factuel ; n'utilise QUE les chiffres du "
-    "contexte (si une donnée manque, dis-le) ; n'affirme aucune cause sans appui dans les données ou "
-    "le journal ; les stades de sommeil sont des estimations peu fiables ; aucun diagnostic médical "
+    "contexte (si une donnée manque, dis-le) ; pour les moyennes, minimums et maximums, reprends "
+    "« statistiques_nuits » (ou l'outil statistiques) et ne calcule jamais toi-même ; tiens compte de "
+    "« maintenant » (date ET heure) pour situer les mesures ; n'affirme aucun lien de cause ni aucun "
+    "enchaînement (« après les journées actives… ») sans l'avoir vérifié nuit par nuit dans les "
+    "données — sinon présente-le explicitement comme une hypothèse à vérifier ; "
+    "les stades de sommeil sont des estimations peu fiables ; aucun diagnostic médical "
     "— ces mesures sont des estimations non validées cliniquement ; en cas de symptômes inquiétants, "
     "oriente vers un médecin (urgence : 15 ou 112)."
 )
@@ -885,7 +889,8 @@ def _age(unix):
     if not unix:
         return None
     m = int((time.time() - unix) // 60)
-    return f"il y a {m} min" if m < 120 else f"il y a {m // 60} h {m % 60:02d}"
+    ago = f"il y a {m} min" if m < 120 else f"il y a {m // 60} h {m % 60:02d}"
+    return f"{ago} (à {_clock(unix)})"
 
 
 CHAT_NIGHT_KEYS = (("night", "nuit"), ("score", "score_sommeil"), ("total", "sommeil_total"),
@@ -908,14 +913,62 @@ def _night_ctx(r):
     return o
 
 
+JOURS_FR = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+
+# (colonne, nom, format) des statistiques de nuits ; « h » = heures → « 7 h 40 »
+STAT_NIGHT = (("score", "score_sommeil", None), ("total", "sommeil_total", "h"),
+              ("efficiency", "efficacite_pct", None), ("latency", "latence_min", None),
+              ("waso", "eveil_nocturne_min", None), ("hr_min", "fc_la_plus_basse_bpm", None),
+              ("hr_mean", "fc_moyenne_bpm", None), ("hrv_rmssd", "hrv_moyen_ms", None),
+              ("recovery_index", "indice_de_recuperation", "h"),
+              ("resp_rate", "respiration_par_min", None), ("temp_dev", "ecart_temperature_c", None))
+STAT_ACT = (("met_min_mh", "effort_modere_intense_met_min", None), ("steps", "pas_estimes_non_valides", None),
+            ("inactive_min", "temps_inactif", "min"), ("total_kcal", "kcal_totales_estimees", None))
+
+
+def _stat(rows, key, fmt, label="night"):
+    """Moyenne, minimum et maximum (avec leur date) d'une colonne : calculés ici,
+    jamais par le modèle (il se trompe sur 30 valeurs)."""
+    vals = [(r[label], r[key]) for r in rows if r.get(key) is not None]
+    if not vals:
+        return None
+    lo, hi = min(vals, key=lambda x: x[1]), max(vals, key=lambda x: x[1])
+    mean = sum(v for _, v in vals) / len(vals)
+    f = (lambda v: _hmin(v)) if fmt == "h" else (lambda v: _hmin(v / 60)) if fmt == "min" else (
+        lambda v: round(v, 2 if key == "temp_dev" else 1))
+    return {"moyenne": f(mean), "min": f(lo[1]), "date_min": lo[0], "max": f(hi[1]), "date_max": hi[0],
+            "n": len(vals)}
+
+
+def night_stats(rows):
+    out = {name: _stat(rows, k, fmt) for k, name, fmt in STAT_NIGHT}
+    return {k: v for k, v in out.items() if v}
+
+
+def activity_stats(rows):
+    full = [r for r in rows if not r.get("partial")]
+    out = {name: _stat(full, k, fmt, "day") for k, name, fmt in STAT_ACT}
+    return {k: v for k, v in out.items() if v}
+
+
+def _now_label():
+    n = datetime.now()
+    return f"{JOURS_FR[n.weekday()]} {n.strftime('%d/%m/%Y %H:%M')}"
+
+
 def chat_context():
-    ctx = {}
+    ctx = {"maintenant": _now_label()}
     d = derived()
     if d:
         nights_ = []
-        for r in reversed(safe_q(d, "SELECT * FROM sleep_scores ORDER BY night DESC LIMIT 30")):
+        rows30 = list(reversed(safe_q(d, "SELECT * FROM sleep_scores ORDER BY night DESC LIMIT 30")))
+        for r in rows30:
             nights_.append(_night_ctx(r))
         ctx["nuits"] = nights_
+        full = [r for r in rows30 if not r.get("provisional")]
+        ctx["statistiques_nuits"] = {
+            "periode": f"{full[0]['night']} → {full[-1]['night']} ({len(full)} nuits)" if full else None,
+            **night_stats(full)}
         ctx["references_personnelles"] = {
             m: {"moyenne": round(b["mean"], 1), "ecart_type": round(b["sd"], 1), "nuits": b["n"]}
             for m, b in baselines(d).items() if m in ("hr_min", "hr_mean", "hrv_rmssd", "resp_rate", "total")}
@@ -932,6 +985,8 @@ def chat_context():
              "temps_inactif": _hmin(a["inactive_min"] / 60), "kcal_totales_estimees": a.get("total_kcal"),
              "fc_repos_de_jour_bpm": a.get("hr_day_rest")}
             for a in safe_q(d, "SELECT * FROM activity_daily ORDER BY day DESC LIMIT 7")]
+        ctx["statistiques_activite_7j_completes"] = activity_stats(
+            safe_q(d, "SELECT * FROM activity_daily ORDER BY day DESC LIMIT 7"))
         ctx["repos_7j"] = [{"debut": _clock(x["start_unix"]), "minutes": x["minutes"], "type": x["kind"]}
                            for x in safe_q(d, "SELECT * FROM rests WHERE start_unix>? ORDER BY start_unix",
                                            (time.time() - 7 * 86400,))]
@@ -1147,6 +1202,23 @@ def tool_zoom(debut, fin):
     }
 
 
+def tool_statistiques(debut, fin):
+    """Moyenne / min / max (avec dates) des nuits, de la récupération et de l'activité sur une période."""
+    debut, fin = _parse_day(debut), _parse_day(fin)
+    d = derived()
+    if not d:
+        return {"erreur": "aucune donnée dérivée"}
+    nights_ = [r for r in safe_q(d, "SELECT * FROM sleep_scores WHERE night BETWEEN ? AND ? ORDER BY night",
+                                 (debut, fin)) if not r.get("provisional")]
+    rd = safe_q(d, "SELECT day, score FROM readiness WHERE day BETWEEN ? AND ? ORDER BY day", (debut, fin))
+    act = safe_q(d, "SELECT * FROM activity_daily WHERE day BETWEEN ? AND ? ORDER BY day", (debut, fin))
+    d.close()
+    return {"periode": f"{debut} → {fin}", "nuits": len(nights_), "sommeil": night_stats(nights_),
+            "score_recuperation": _stat(rd, "score", None, "day"),
+            "activite_jours_complets": activity_stats(act),
+            "note": "valeurs calculées par le code : les reprendre telles quelles"}
+
+
 def tool_journal(debut, fin):
     """Tags du journal sur une période (maladie, alcool, sport, stress…)."""
     debut, fin = _parse_day(debut), _parse_day(fin)
@@ -1177,17 +1249,23 @@ CHAT_TOOLS = [
         "efforts, repos, sommeil, charge, périodes non portées.", {"date": _DAY}, ["date"]),
     _fn("zoom", f"Minute par minute (FC de jour, MET, pas) et FC/HRV de nuit par 5 min, sur une fenêtre "
         f"de {ZOOM_MAX_H} h maximum.", {"debut": "AAAA-MM-JJ HH:MM", "fin": "AAAA-MM-JJ HH:MM"}, ["debut", "fin"]),
+    _fn("statistiques", "Moyenne, minimum et maximum (avec leur date) du sommeil, de la récupération et de "
+        "l'activité sur une période quelconque. À utiliser pour toute moyenne ou comparaison de périodes.",
+        {"debut": _DAY, "fin": _DAY}, ["debut", "fin"]),
     _fn("journal", "Tags du journal de l'utilisateur entre deux dates (maladie, alcool, sport, stress…).",
         {"debut": _DAY, "fin": _DAY}, ["debut", "fin"]),
 ]
 TOOL_FUNCS = {"courbes_nuit": tool_courbes_nuit, "nuits": tool_nuits, "recuperation": tool_recuperation,
-              "activite_jour": tool_activite_jour, "zoom": tool_zoom, "journal": tool_journal}
+              "activite_jour": tool_activite_jour, "zoom": tool_zoom, "journal": tool_journal,
+              "statistiques": tool_statistiques}
 
 CHAT_TOOLS_HELP = (
     "\nOutils : le contexte ci-dessous ne contient que des résumés. Pour toute question qui demande "
     "du détail (heure d'un minimum ou d'un pic, évolution pendant la nuit, réveils, journée précise, "
     "nuit ancienne, comparaison fine), appelle d'abord les outils adaptés, puis réponds en t'appuyant "
-    "sur leurs valeurs (cite les heures). N'invente aucune valeur qu'un outil n'a pas renvoyée. "
+    "sur leurs valeurs (cite les heures). Avant d'affirmer un enchaînement ou une tendance (« après "
+    "les journées actives, la HRV baisse »), vérifie-le avec nuits / activite_jour / statistiques. "
+    "N'invente aucune valeur qu'un outil n'a pas renvoyée. "
     f"Aujourd'hui : {{today}}."
 )
 

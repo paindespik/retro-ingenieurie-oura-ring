@@ -181,6 +181,23 @@ class WebTest(unittest.TestCase):
         self.assertNotIn("erreur", z)
         self.assertIn("par_minute", z)
 
+    def test_chat_stats_and_clock(self):
+        import json
+        import sqlite3
+        ctx = json.loads(self.web.chat_context())
+        self.assertRegex(ctx["maintenant"], r"^\w+ \d\d/\d\d/\d{4} \d\d:\d\d$")
+        con = sqlite3.connect(os.environ["OURA_DERIVED_DB"])
+        rows = con.execute("SELECT night, hr_min FROM sleep_scores WHERE provisional=0 AND hr_min IS NOT NULL").fetchall()
+        con.close()
+        st = ctx["statistiques_nuits"]["fc_la_plus_basse_bpm"]
+        lo = min(rows, key=lambda r: r[1])
+        self.assertEqual((st["min"], st["date_min"]), (round(lo[1], 1), lo[0]))
+        self.assertAlmostEqual(st["moyenne"], round(sum(r[1] for r in rows) / len(rows), 1))
+        self.assertRegex(ctx["statistiques_nuits"]["sommeil_total"]["moyenne"], r"^\d+ h \d\d$")
+        t = self._tool("statistiques", debut="2000-01-01", fin="2100-01-01")
+        self.assertNotIn("erreur", t)
+        self.assertEqual(t["sommeil"]["fc_la_plus_basse_bpm"]["date_min"], lo[0])
+
     def test_chat_tools_bad_args(self):
         self.assertIn("erreur", self._tool("courbes_nuit", date="hier"))
         self.assertIn("erreur", self._tool("courbes_nuit", date="1999-01-01"))
