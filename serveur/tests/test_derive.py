@@ -179,7 +179,7 @@ class RecoveryTest(Base):
                   (small,): big,                           # 3090 libre → gros modèle
                   ("gemma4-31b", small): small,            # 3090 occupée → 4B
                   None: small}                             # llama-swap illisible → 4B
-        # mode « à la demande » (défaut depuis Ling) : la 3090 peut être reprise
+        # mode « à la demande » (OURA_LLM_MAY_SWAP=1) : la 3090 peut être reprise
         swap = {**polite, ("gemma4-31b", small): big}
         orig, orig_swap = dn.running_models, dn.LLM_MAY_SWAP
         try:
@@ -191,11 +191,7 @@ class RecoveryTest(Base):
         finally:
             dn.running_models, dn.LLM_MAY_SWAP = orig, orig_swap
 
-    def test_llm_options_per_family(self):
-        ling = dn.llm_options("ling-sante")
-        self.assertEqual(ling["chat_template_kwargs"], {"enable_thinking": True})
-        self.assertGreater(ling["thinking_budget_tokens"], 0)
-        self.assertNotIn("reasoning_effort", ling["chat_template_kwargs"])
+    def test_llm_options(self):
         self.assertEqual(dn.llm_options("qwen3.8-27b")["chat_template_kwargs"],
                          {"reasoning_effort": dn.LLM_REASONING})
 

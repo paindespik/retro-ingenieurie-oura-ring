@@ -38,14 +38,14 @@ INBOX_DIR = Path(os.environ.get("OURA_INBOX", "/srv/oura/inbox"))
 STATIC_DIR = Path(__file__).with_name("static")
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 LLM_MODEL = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")      # petit modèle, toujours chargé
-# « Analyse approfondie » : Ling-3.0-flash-Sante (MoE médical 124B-A5.1B, IQ2_M,
-# entrée llama-swap « ling-sante »), chargé à la demande sur la 3090 (~35 s, il
-# décharge le qwen3.8-27b résident). Le résumé du matin reste au 27B (derive_night).
-# Variables distinctes de celles du nightly (OURA_LLM_MODEL / OURA_LLM_MAY_SWAP).
-LLM_MODEL_DEEP = os.environ.get("OURA_CHAT_MODEL_DEEP", "ling-sante")
+# « Analyse approfondie » : qwen3.8-27b, résident de la RTX 3090, avec les outils
+# (courbes, minute par minute, statistiques…). Essai Ling-3.0-flash-Sante (IQ2_M)
+# du 28/10/2026 abandonné : comptages faux et veilles/nuits mal alignées, étiquetés
+# « confirmé » ; sur la même question avec les mêmes outils, le 27B ne s'est pas trompé.
+LLM_MODEL_DEEP = os.environ.get("OURA_CHAT_MODEL_DEEP", "qwen3.8-27b")
 # 1 : l'analyse approfondie peut reprendre la 3090 même si un autre modèle l'occupe
-# (0 : 409 « 3090 occupée », comportement prévu pour un modèle résident)
-LLM_MAY_SWAP = os.environ.get("OURA_CHAT_MAY_SWAP", "1") == "1"
+# (0, défaut : 409 « 3090 occupée », on ne décharge jamais le modèle d'un autre usage)
+LLM_MAY_SWAP = os.environ.get("OURA_CHAT_MAY_SWAP", "0") == "1"
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
 # Nom d'événement de repli à l'ingestion (colonne `name` NOT NULL) quand la
@@ -1043,13 +1043,7 @@ def chat_context():
 
 
 def llm_options(model):
-    """Champs de requête du gros modèle : Ling (bailing v3) n'a que
-    enable_thinking, borné par un budget de réflexion (sinon ~5 min) ;
-    Qwen 3.8 a des niveaux d'effort."""
-    if "ling" in model.lower():
-        return {"chat_template_kwargs": {"enable_thinking": True},
-                "thinking_budget_tokens": int(os.environ.get("OURA_LLM_THINK_BUDGET", "2000")),
-                "reasoning_budget_message": "Okay, I have thought enough. Now I will write the final answer in French."}
+    """Champs de requête du gros modèle (Qwen 3.8 : niveau d'effort)."""
     return {"chat_template_kwargs": {"reasoning_effort": "medium"}}
 
 
@@ -1064,7 +1058,7 @@ async def swap_running():
 
 # ---------------------------------------------------------------- outils de l'analyse approfondie
 #
-# Le modèle de l'analyse approfondie (Ling-Santé) reçoit le même contexte résumé que
+# Le modèle de l'analyse approfondie (27B) reçoit le même contexte résumé que
 # le chat rapide, plus des OUTILS pour aller chercher le détail calculé par le code
 # (courbes 5 min, hypnogramme, minute par minute…). Il ne lit jamais le brut de
 # l'anneau : volume (~26 000 événements/nuit) et décodage piégeux (TimeAxis,
@@ -1072,13 +1066,11 @@ async def swap_running():
 
 TOOL_MAX_CHARS = 24000        # ~7 000 jetons par réponse d'outil (contexte 64K)
 CHAT_TOOL_ROUNDS = 5          # allers-retours d'outils maximum avant la réponse
-# Réflexion de Ling (~44 jetons/s) : 4 000 par aller-retour d'outils, 6 000 pour la
-# réponse finale. À 1 200 (premier réglage), une demande « réfléchis profondément »
-# recopiait les statistiques sans rien vérifier (28/10/2026).
-CHAT_ROUND_BUDGET = int(os.environ.get("OURA_CHAT_THINK_ROUND", "4000"))
-CHAT_FINAL_BUDGET = int(os.environ.get("OURA_CHAT_THINK_FINAL", "6000"))
+# Réponse maximale par tour (raisonnement compris) ; réflexion réglée par
+# reasoning_effort (llm_options).
+CHAT_MAX_TOKENS = int(os.environ.get("OURA_CHAT_MAX_TOKENS", "10000"))
 CHAT_DEEP_DEADLINE_S = 720    # au-delà : réponse forcée avec ce qui a été lu
-CHAT_FINAL_RESERVE_S = 240    # temps gardé pour la réponse forcée (6 000 jetons ≈ 2 min 20)
+CHAT_FINAL_RESERVE_S = 240    # temps gardé pour la réponse forcée
 ZOOM_MAX_H = 4
 
 
@@ -1343,11 +1335,8 @@ async def deep_chat_job(job, msg):
         async with httpx.AsyncClient(timeout=300) as cli:
             for rnd in range(CHAT_TOOL_ROUNDS + 1):
                 final = rnd == CHAT_TOOL_ROUNDS or time.monotonic() > deadline - CHAT_FINAL_RESERVE_S
-                budget = CHAT_FINAL_BUDGET if final else CHAT_ROUND_BUDGET
                 payload = {"model": LLM_MODEL_DEEP, "messages": messages, "temperature": 0.4,
-                           "max_tokens": budget + 4000, **llm_options(LLM_MODEL_DEEP)}
-                if "thinking_budget_tokens" in payload:
-                    payload["thinking_budget_tokens"] = budget
+                           "max_tokens": CHAT_MAX_TOKENS, **llm_options(LLM_MODEL_DEEP)}
                 if not final:
                     payload["tools"] = CHAT_TOOLS
                 job["step"] = "rédaction de la réponse" if final else (
@@ -1357,8 +1346,8 @@ async def deep_chat_job(job, msg):
                 m = r.json()["choices"][0]["message"]
                 calls = m.get("tool_calls") or []
                 if calls and not final:
-                    # raisonnement NON renvoyé : 5 tours x 4 000 jetons + réponses d'outils
-                    # dépasseraient le contexte de 64K du modèle
+                    # raisonnement NON renvoyé dans l'historique : il ne sert plus et
+                    # gonflerait le contexte à chaque tour
                     messages.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": calls})
                     for c in calls:
                         name = (c.get("function") or {}).get("name", "")

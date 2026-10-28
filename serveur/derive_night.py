@@ -67,32 +67,20 @@ LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completi
 # OURA_LLM_MAY_SWAP=0 (défaut) : on ne demande le gros modèle que s'il est déjà
 # chargé ou si la 3090 est libre (llama-swap déchargerait sinon le modèle d'un
 # autre usage). À 1 : il est demandé quoi qu'il arrive (modèle à la demande).
-# Essai du 28/10/2026 avec Ling-3.0-flash-Sante (OURA_LLM_MODEL=ling-sante,
-# OURA_LLM_MAY_SWAP=1) : résumés justes mais moins bien tournés (trop de chiffres,
-# « 1 h 64 »), plus lents, et chaque résumé déchargeait le 27B → Ling est réservé
-# à l'analyse approfondie du portail (oura_web.py).
+# Essai du 28/10/2026 avec Ling-3.0-flash-Sante (MoE médical 124B, IQ2_M, à la
+# demande) : résumés justes mais moins bien tournés, plus lents, déchargeant le 27B,
+# puis erreurs de comptage et de dates en analyse → abandonné, modèle supprimé.
 LLM_MODEL = os.environ.get("OURA_LLM_MODEL", "qwen3.8-27b")
 LLM_MODEL_FALLBACK = os.environ.get("OURA_LLM_MODEL_FALLBACK", "qwen3.5-4b")
 LLM_MAY_SWAP = os.environ.get("OURA_LLM_MAY_SWAP", "0") == "1"
 # Qwen 3.8 : « medium » = ~80 s par résumé, nettement plus précis que « low »
-# (~40 s) sur les nuits réelles. Ling (bailing v3) n'a pas de niveaux d'effort :
-# seulement enable_thinking (cf. llm_options).
+# (~40 s) sur les nuits réelles.
 LLM_REASONING = os.environ.get("OURA_LLM_REASONING", "medium")   # low | medium | xhigh
 
-# Ling : budget de réflexion par requête (llama-server : thinking_budget_tokens).
-# Sans budget il raisonne ~12 000 jetons (~5 min) pour un résumé ; à 1 500 :
-# ~45 s, résumés vérifiés et plus détaillés que ceux du 27B (comparatif du 28/10/2026).
-LLM_THINK_BUDGET = int(os.environ.get("OURA_LLM_THINK_BUDGET", "2000"))
-THINK_BUDGET_MSG = "Okay, I have thought enough. Now I will write the final answer in French."
-
 def llm_options(model, reasoning=None):
-    """Champs de requête propres au gros modèle selon sa famille de template :
-    Ling (bailing v3) n'a que enable_thinking ; Qwen 3.8 a des niveaux d'effort."""
-    if "ling" in model.lower():
-        return {"chat_template_kwargs": {"enable_thinking": True},
-                "thinking_budget_tokens": LLM_THINK_BUDGET,
-                "reasoning_budget_message": THINK_BUDGET_MSG}
+    """Champs de requête propres au gros modèle (Qwen 3.8 : niveau d'effort)."""
     return {"chat_template_kwargs": {"reasoning_effort": reasoning or LLM_REASONING}}
+
 SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo) + "
                 "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
 # Besoin de sommeil NON personnalisé : 7 h 30, choisi par l'utilisateur le 10/10/2026

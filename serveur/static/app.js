@@ -960,11 +960,11 @@ async function pageAssistant(m) {
   const b = await api("briefing").catch(() => null);
   m.innerHTML = `<div class="card"><h2>Interroger mes données</h2><div class="chatlog" id="log"></div>
     <div class="row"><input id="chat-in" style="flex:1 1 240px" placeholder="ex. comment se compare ma dernière nuit à la semaine ?">
-    <button class="primary" id="chat-send">Envoyer</button><button id="chat-deep" title="Ling-3.0-flash-Santé, modèle spécialisé santé, plus lent">Analyse approfondie</button></div>
+    <button class="primary" id="chat-send">Envoyer</button><button id="chat-deep" title="Qwen 3.8 27B avec accès au détail de vos données, plus lent">Analyse approfondie</button></div>
     <div class="tiny muted" style="margin-top:.4rem">Modèles locaux (llama-swap). « Envoyer » : le 4B (rapide), qui ne voit que vos
-    données résumées (30 nuits, récupération, activité, journal). « Analyse approfondie » : Ling-3.0-flash-Santé, un modèle
-    spécialisé santé qui va en plus chercher lui-même le détail calculé (courbes de nuit, minute par minute, journées,
-    nuits anciennes) ; chargé à la demande, réflexion longue : 2 à 8 min. Ils peuvent se tromper. Ce n'est pas un avis médical.</div></div>
+    données résumées (30 nuits, récupération, activité, journal). « Analyse approfondie » : le 27B de la RTX 3090,
+    qui va en plus chercher lui-même le détail calculé (courbes de nuit, minute par minute, journées, nuits anciennes,
+    statistiques) ; réflexion longue : 1 à 5 min. Ils peuvent se tromper. Ce n'est pas un avis médical.</div></div>
     ${b ? `<div class="card"><h2>Dernier résumé du matin <span class="badge">${esc(b.model)}</span>${b.checked !== 1 ? ` <span class="badge warn">chiffres non vérifiés</span>` : ""}</h2><div class="brief md">${md(b.text)}</div>
       <div class="tiny muted">nuit du ${dayLabel(b.night)} · ${dtShort(b.ts)}</div></div>` : ""}`;
   const log = $("#log", m);
@@ -975,7 +975,7 @@ async function pageAssistant(m) {
     const inp = $("#chat-in"), text = inp.value.trim();
     if (!text) return;
     inp.value = "";
-    const slot = { u: false, text: deep ? "… (analyse approfondie par Ling-Santé, 2 à 8 min)" : "…" };
+    const slot = { u: false, text: deep ? "… (analyse approfondie par le 27B, 1 à 5 min)" : "…" };
     chatLog.push({ u: true, text }, slot);
     draw();
     try {
