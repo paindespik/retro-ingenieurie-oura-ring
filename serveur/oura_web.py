@@ -940,8 +940,33 @@ def _stat(rows, key, fmt, label="night"):
             "n": len(vals)}
 
 
+def _clock_stat(rows, f):
+    """Statistiques d'une heure de la nuit (coucher, lever, milieu du sommeil) :
+    minutes depuis 18:00 pour que 23:30 et 01:30 se comparent, écart-type compris
+    (la régularité des horaires est un facteur majeur de la qualité du sommeil)."""
+    vals = []
+    for r in rows:
+        u = f(r)
+        if u:
+            t = datetime.fromtimestamp(u)
+            vals.append((r["night"], (t.hour * 60 + t.minute - 18 * 60) % 1440))
+    if len(vals) < 2:
+        return None
+    hm = lambda m: f"{int((m + 18 * 60) % 1440) // 60:02d}:{int(m) % 60:02d}"  # noqa: E731
+    mean = sum(v for _, v in vals) / len(vals)
+    sd = (sum((v - mean) ** 2 for _, v in vals) / (len(vals) - 1)) ** 0.5
+    lo, hi = min(vals, key=lambda x: x[1]), max(vals, key=lambda x: x[1])
+    return {"moyenne": hm(mean), "ecart_type_min": round(sd), "plus_tot": hm(lo[1]), "date_plus_tot": lo[0],
+            "plus_tard": hm(hi[1]), "date_plus_tard": hi[0], "amplitude": _hmin((hi[1] - lo[1]) / 60),
+            "n": len(vals)}
+
+
 def night_stats(rows):
     out = {name: _stat(rows, k, fmt) for k, name, fmt in STAT_NIGHT}
+    out["heure_coucher"] = _clock_stat(rows, lambda r: r.get("start_unix"))
+    out["heure_lever"] = _clock_stat(rows, lambda r: r.get("stop_unix"))
+    out["milieu_du_sommeil"] = _clock_stat(
+        rows, lambda r: (r["onset_unix"] + r["end_unix"]) / 2 if r.get("onset_unix") and r.get("end_unix") else None)
     return {k: v for k, v in out.items() if v}
 
 
@@ -957,7 +982,9 @@ def _now_label():
 
 
 def chat_context():
-    ctx = {"maintenant": _now_label()}
+    ctx = {"maintenant": _now_label(),
+           "convention": "une nuit porte la date du RÉVEIL (nuit du 28/10 = coucher le 27 au soir, réveil le "
+                         "28) ; le journal du jour J concerne la nuit J+1 ; journée d'activité = 04:00 → 03:59"}
     d = derived()
     if d:
         nights_ = []
@@ -969,8 +996,10 @@ def chat_context():
         ctx["statistiques_nuits"] = {
             "periode": f"{full[0]['night']} → {full[-1]['night']} ({len(full)} nuits)" if full else None,
             **night_stats(full)}
+        # durées en « 7 h 30 » : 7,5 h a été lu « 7 h 5 » (28/10/2026)
         ctx["references_personnelles"] = {
-            m: {"moyenne": round(b["mean"], 1), "ecart_type": round(b["sd"], 1), "nuits": b["n"]}
+            m: ({"moyenne": _hmin(b["mean"]), "ecart_type": _hmin(b["sd"]), "nuits": b["n"]} if m == "total" else
+                {"moyenne": round(b["mean"], 1), "ecart_type": round(b["sd"], 1), "nuits": b["n"]})
             for m, b in baselines(d).items() if m in ("hr_min", "hr_mean", "hrv_rmssd", "resp_rate", "total")}
         rd = readiness_row(safe_one(d, "SELECT * FROM readiness ORDER BY day DESC LIMIT 1"))
         if rd:
@@ -1043,8 +1072,13 @@ async def swap_running():
 
 TOOL_MAX_CHARS = 24000        # ~7 000 jetons par réponse d'outil (contexte 64K)
 CHAT_TOOL_ROUNDS = 5          # allers-retours d'outils maximum avant la réponse
-CHAT_DEEP_DEADLINE_S = 420    # au-delà : réponse forcée avec ce qui a été lu
-CHAT_ROUND_BUDGET = 1200      # réflexion par aller-retour (jetons)
+# Réflexion de Ling (~44 jetons/s) : 4 000 par aller-retour d'outils, 6 000 pour la
+# réponse finale. À 1 200 (premier réglage), une demande « réfléchis profondément »
+# recopiait les statistiques sans rien vérifier (28/10/2026).
+CHAT_ROUND_BUDGET = int(os.environ.get("OURA_CHAT_THINK_ROUND", "4000"))
+CHAT_FINAL_BUDGET = int(os.environ.get("OURA_CHAT_THINK_FINAL", "6000"))
+CHAT_DEEP_DEADLINE_S = 720    # au-delà : réponse forcée avec ce qui a été lu
+CHAT_FINAL_RESERVE_S = 240    # temps gardé pour la réponse forcée (6 000 jetons ≈ 2 min 20)
 ZOOM_MAX_H = 4
 
 
@@ -1265,6 +1299,10 @@ CHAT_TOOLS_HELP = (
     "nuit ancienne, comparaison fine), appelle d'abord les outils adaptés, puis réponds en t'appuyant "
     "sur leurs valeurs (cite les heures). Avant d'affirmer un enchaînement ou une tendance (« après "
     "les journées actives, la HRV baisse »), vérifie-le avec nuits / activite_jour / statistiques. "
+    "Pour une demande d'analyse (qualité, tendance, explication, « réfléchis »), ne te contente pas de "
+    "recopier les statistiques : identifie 2 ou 3 hypothèses, VÉRIFIE-LES avec les outils (par exemple "
+    "courbes_nuit des nuits extrêmes, nuits ou statistiques sur des sous-périodes, activite_jour la veille), "
+    "puis dis lesquelles tiennent et lesquelles ne tiennent pas. "
     "N'invente aucune valeur qu'un outil n'a pas renvoyée. "
     f"Aujourd'hui : {{today}}."
 )
@@ -1304,13 +1342,14 @@ async def deep_chat_job(job, msg):
     try:
         async with httpx.AsyncClient(timeout=300) as cli:
             for rnd in range(CHAT_TOOL_ROUNDS + 1):
-                final = rnd == CHAT_TOOL_ROUNDS or time.monotonic() > deadline - 120
+                final = rnd == CHAT_TOOL_ROUNDS or time.monotonic() > deadline - CHAT_FINAL_RESERVE_S
+                budget = CHAT_FINAL_BUDGET if final else CHAT_ROUND_BUDGET
                 payload = {"model": LLM_MODEL_DEEP, "messages": messages, "temperature": 0.4,
-                           "max_tokens": 6000, **llm_options(LLM_MODEL_DEEP)}
+                           "max_tokens": budget + 4000, **llm_options(LLM_MODEL_DEEP)}
+                if "thinking_budget_tokens" in payload:
+                    payload["thinking_budget_tokens"] = budget
                 if not final:
                     payload["tools"] = CHAT_TOOLS
-                    if "thinking_budget_tokens" in payload:
-                        payload["thinking_budget_tokens"] = CHAT_ROUND_BUDGET
                 job["step"] = "rédaction de la réponse" if final else (
                     "chargement du modèle et réflexion" if rnd == 0 else "réflexion")
                 r = await cli.post(LLM_URL, json=payload)
@@ -1318,8 +1357,9 @@ async def deep_chat_job(job, msg):
                 m = r.json()["choices"][0]["message"]
                 calls = m.get("tool_calls") or []
                 if calls and not final:
-                    messages.append({"role": "assistant", "content": m.get("content") or "",
-                                     "reasoning_content": m.get("reasoning_content") or "", "tool_calls": calls})
+                    # raisonnement NON renvoyé : 5 tours x 4 000 jetons + réponses d'outils
+                    # dépasseraient le contexte de 64K du modèle
+                    messages.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": calls})
                     for c in calls:
                         name = (c.get("function") or {}).get("name", "")
                         try:

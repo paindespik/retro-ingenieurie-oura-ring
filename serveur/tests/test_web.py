@@ -198,6 +198,17 @@ class WebTest(unittest.TestCase):
         self.assertNotIn("erreur", t)
         self.assertEqual(t["sommeil"]["fc_la_plus_basse_bpm"]["date_min"], lo[0])
 
+    def test_clock_stats_wrap_midnight(self):
+        from datetime import datetime
+        u = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M").timestamp()  # noqa: E731
+        rows = [{"night": "2026-10-01", "t": u("2026-09-30 23:30")},
+                {"night": "2026-10-02", "t": u("2026-10-02 01:30")}]
+        st = self.web._clock_stat(rows, lambda r: r["t"])
+        self.assertEqual(st["moyenne"], "00:30")          # pas 12:30
+        self.assertEqual((st["plus_tot"], st["plus_tard"]), ("23:30", "01:30"))
+        self.assertEqual(st["amplitude"], "2 h 00")
+        self.assertEqual(st["ecart_type_min"], 85)
+
     def test_chat_tools_bad_args(self):
         self.assertIn("erreur", self._tool("courbes_nuit", date="hier"))
         self.assertIn("erreur", self._tool("courbes_nuit", date="1999-01-01"))
