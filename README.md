@@ -117,11 +117,12 @@ modèle propriétaire. Les valeurs sont des **estimations** :
 | Mesure | Méthode |
 |---|---|
 | Fenêtre de sommeil | analyse embarquée de l'anneau (`bedtime_period`) |
-| Stades (30 s) | heuristique ouverte : mouvement + FC et régularité battement par battement, lissage par modèle de Markov caché, a priori circadiens, plafonds physiologiques — non validée contre polysomnographie |
+| Stades (30 s) | heuristique ouverte : mouvement + FC et régularité battement par battement, lissage par modèle de Markov caché, a priori circadiens, plafonds physiologiques — non validée contre polysomnographie, **indicative** (le profond tend à être placé trop tard dans la nuit) ; demi-poids dans le score |
 | FC la plus basse, FC moyenne, HRV | bins de 5 min calculés par l'anneau (minimum des moyennes 10 min, moyenne des RMSSD) |
-| Indice de récupération | sommeil restant après la FC la plus basse |
-| Respiration (expérimental) | arythmie sinusale respiratoire extraite des intervalles entre battements |
+| Indice de récupération | sommeil restant après la stabilisation de la FC (moyenne sur 10 min revenue près de la plus basse), moyenné sur les seuils +2 à +5 bpm ; demi-poids dans la récupération |
+| Respiration (expérimental) | arythmie sinusale respiratoire extraite des intervalles entre battements, pic spectral interpolé |
 | Température | capteur cutané pendant le sommeil ; écart à la médiane des nuits précédentes |
+| Score de sommeil | sous-scores et poids estimés d'Oura (stades à demi-poids) ; horaire décalé selon le milieu de sommeil habituel (≤ 2 h) |
 | Récupération, signes de tension | écarts à la ligne de base personnelle (barèmes locaux) |
 | Activité | MET par minute de l'anneau, temps inactif, MET-min modérées/intenses |
 

@@ -96,7 +96,7 @@ class WebTest(unittest.TestCase):
         r = self.c.post("/api/tags", json={"day": self.night, "kind": "maladie", "note": "test"})
         self.assertEqual(r.status_code, 200)
         tid = r.json()["id"]
-        self.assertTrue(any(t["id"] == tid for t in self.c.get("/api/tags").json()["tags"]))
+        self.assertTrue(any(t["id"] == tid for t in self.c.get("/api/tags?days=730").json()["tags"]))
         self.assertEqual(self.c.delete(f"/api/tags/{tid}").status_code, 200)
         self.assertEqual(self.c.post("/api/tags", json={"day": "x", "kind": "maladie"}).status_code, 422)
         self.assertEqual(self.c.post("/api/tags", json={"day": self.night, "kind": "?"}).status_code, 422)

@@ -532,7 +532,16 @@ def _welch_peak(ts, xs, fs=2.0, seg_s=120, f_lo=0.15, f_hi=0.5):
         return None, 0.0
     i = max(range(len(power)), key=lambda q: power[q])
     tot = sum(power) or 1.0
-    return freqs[i][1], power[i] / tot
+    f = freqs[i][1]
+    # interpolation gaussienne du pic (parabole sur le log de la puissance) : sans
+    # elle, la fréquence est quantifiée au pas spectral 1/seg_s (0,5 cycle/min pour
+    # 120 s), plus grossier que la variation d'une nuit à l'autre (σ ≈ 0,4 /min)
+    if 0 < i < len(power) - 1 and min(power[i - 1], power[i], power[i + 1]) > 0:
+        a, b, c = (math.log(power[j]) for j in (i - 1, i, i + 1))
+        den = a - 2 * b + c
+        if den < 0:
+            f += 0.5 * (a - c) / den * (freqs[i][1] - freqs[i - 1][1])
+    return f, power[i] / tot
 
 
 def resp_rate_windows(clean, s_ds, e_ds, win_s=300, min_cover=0.8):

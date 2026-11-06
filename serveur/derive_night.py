@@ -22,9 +22,15 @@ Définitions alignées sur la documentation Oura quand elle existe :
 - FC la plus basse = minimum des moyennes glissantes 10 min (bins 5 min de
   l'anneau) pendant le sommeil ; HRV = moyenne des RMSSD 5 min (+ max) ;
 - Recovery Index = sommeil restant après la STABILISATION de la FC : premier
-  instant où la moyenne sur 10 min revient à moins de 3 bpm de la FC la plus
-  basse (Oura, « Readiness Score » ; optimal ≥ 6 h). Le minimum strict est
-  souvent un plateau atteint tard : l'indice basculait pour 0,5 bpm ;
+  instant où la moyenne sur 10 min revient près de la FC la plus basse (Oura,
+  « Readiness Score » ; optimal ≥ 6 h), MOYENNÉ sur les seuils +2, +3, +4 et
+  +5 bpm. Le minimum est souvent un plateau atteint tard : avec un seuil
+  unique (+3), 1 bpm de plus déplaçait l'indice jusqu'à 3,2 h (audit du
+  06/11/2026) ; avec la moyenne des seuils, 0,9 h au plus ;
+- horaire : la courbe du sous-score (100 jusqu'à un milieu de sommeil à
+  02:40) est décalée selon le milieu de sommeil HABITUEL (médiane des nuits de
+  référence, ≥ 14) au-delà de 03:30, de 2 h au plus — Oura ajuste lui aussi
+  l'horaire au chronotype ;
 - température de la nuit = médiane des échantillons cutanés (tag 117) entre
   l'endormissement et la fin du sommeil (l'estimateur ecore, minimum des
   maxima de fenêtres de 30 échantillons, reste en valeur secondaire
@@ -60,7 +66,7 @@ from datetime import datetime, timedelta
 import oura_core as oc
 import staging
 
-VERSION = 5                      # incrémenter → recalcul de toutes les nuits
+VERSION = 6                      # incrémenter → recalcul de toutes les nuits
 LLM_URL = os.environ.get("OURA_LLM_URL", "http://127.0.0.1:8012/v1/chat/completions")
 # Résumé du matin : le qwen3.8-27b résident de la RTX 3090 (préchargé par
 # llama-swap) quand il est disponible, sinon le 4B de la P40.
@@ -82,11 +88,13 @@ def llm_options(model, reasoning=None):
     return {"chat_template_kwargs": {"reasoning_effort": reasoning or LLM_REASONING}}
 
 SCORE_SOURCE = ("sous-scores : anchors publiés (dmturner44/oura_sleep_score_algo) + "
-                "restfulness locale ; poids Oura 35/15/10/10/10/10/10 — estimation")
-# Besoin de sommeil NON personnalisé : 7 h 30, choisi par l'utilisateur le 10/10/2026
-# en attendant une estimation personnelle (Oura : 90 jours d'historique, nuits
-# atypiques filtrées), prévue à la passe de conformité à ~30 nuits.
-SLEEP_NEED_H = 7.5
+                "restfulness locale ; poids 35/15/10/10/10/5/5 (stades à demi-poids) ; "
+                "horaire ajusté au milieu de sommeil habituel — estimation")
+# Besoin de sommeil : 7 h 45, estimé à la passe de conformité du 06/11/2026 sur
+# 46 nuits (moyenne des nuits saines 7 h 40, nuits sans réveil contraint — lever
+# après 10:00 — 7 h 54, nuits libres 8 h 05). Avant : 7 h 30 fixé à la main.
+# La dette y est très sensible (+0,5 h de besoin ≈ +4 h de dette sur 14 jours).
+SLEEP_NEED_H = 7.75
 # Dette de sommeil (Oura, support « Sleep Debt ») : 14 derniers jours, nuits
 # récentes pondérées davantage, au moins 5 nuits ; aucune / faible < 2 h /
 # modérée 2–5 h / élevée > 5 h.
@@ -100,6 +108,18 @@ SICK_TAG = "maladie"
 # fenêtre longue n'est guère plus longue que la courte, le rapport vaut ~1 et le
 # contributeur sature à 100 → « calibrage », hors du score, avant 60 nuits.
 HRV_BALANCE_MIN_NIGHTS = 60
+# Indice de récupération : moyenne des indices obtenus avec ces seuils de
+# stabilisation (bpm au-dessus de la FC la plus basse) ; demi-poids dans la
+# récupération (il portait 56 % de sa variance tout en étant le contributeur le
+# moins robuste : passe de conformité du 06/11/2026, 46 nuits).
+RI_THRESHOLDS = (2, 3, 4, 5)
+READY_WEIGHTS = {"recovery_index": 0.5}
+# Horaire ajusté au chronotype : décalage = milieu de sommeil habituel − 03:30,
+# borné à [0, 2 h], arrondi au quart d'heure, à partir de 14 nuits de référence.
+TIMING_NEUTRAL_H = 3.5
+TIMING_MAX_SHIFT_H = 2.0
+TIMING_SHIFT_STEP_H = 0.25
+TIMING_MIN_NIGHTS = 14
 
 # Clôture de la nuit. L'anneau réémet la fenêtre « bedtime » en cours au fil de
 # la nuit (fin = heure d'émission), parfois après 4 à 5 h sans révision : une
@@ -234,8 +254,30 @@ def subscore_restfulness(waso_min, awakenings, restless_frac):
     return 0.4 * w + 0.3 * a + 0.3 * m
 
 
+# Poids Oura estimés (35/15/10/10/10/10/10), sauf profond et REM ramenés à 5 :
+# le staging place le profond en milieu de nuit au lieu du début et sa quantité
+# suit surtout la pente de FC de la nuit (r = −0,71, audit du 06/11/2026). Le
+# score est la moyenne pondérée des sous-scores disponibles (somme des poids 90).
 WEIGHTS = {"total_sleep": 35, "restfulness": 15, "efficiency": 10,
-           "latency": 10, "deep": 10, "rem": 10, "timing": 10}
+           "latency": 10, "deep": 5, "rem": 5, "timing": 10}
+
+
+def sleep_score(subs):
+    avail = {k: v for k, v in subs.items() if v is not None and k in WEIGHTS}
+    wsum = sum(WEIGHTS[k] for k in avail)
+    return int(round(sum(WEIGHTS[k] * v for k, v in avail.items()) / wsum)) if wsum else None
+
+
+def timing_shift(ref):
+    """Décalage (h) de la courbe d'horaire selon le milieu de sommeil habituel
+    des nuits de référence → (décalage, milieu habituel | None)."""
+    mids = [p["timing"] - 24 if p["timing"] >= 12 else p["timing"]
+            for p in ref if p.get("timing") is not None]
+    if len(mids) < TIMING_MIN_NIGHTS:
+        return 0.0, None
+    habit = statistics.median(mids)
+    raw = max(0.0, min(TIMING_MAX_SHIFT_H, habit - TIMING_NEUTRAL_H))
+    return round(raw / TIMING_SHIFT_STEP_H) * TIMING_SHIFT_STEP_H, habit % 24
 
 
 # ---------------------------------------------------------------- nuit
@@ -294,17 +336,23 @@ def compute_night(con, axis, night, charging):
     if hr_low is None and hrs:
         c, h = min(hrs, key=lambda p: p[1])
         hr_low, hr_low_at = float(h), c
-    # stabilisation : 1er instant où la moyenne sur 10 min ≤ FC la plus basse + 3 bpm
-    hr_stable_at = hr_low_at
+    # stabilisation : 1er instant où la moyenne sur 10 min ≤ FC la plus basse + seuil,
+    # pour chaque seuil de RI_THRESHOLDS ; indice = moyenne des sommeils restants,
+    # heure affichée = médiane des instants de stabilisation
+    hr_stable_at, recovery_h = hr_low_at, None
     if hr_low is not None:
-        for (c0, h0), (c1, h1) in zip(hrs, hrs[1:]):
-            if c1 - c0 <= 3300 and (h0 + h1) / 2 <= hr_low + 3:
-                hr_stable_at = (c0 + c1) / 2
-                break
-    recovery_h = None
-    if hr_stable_at is not None:
-        k = int((hr_stable_at - S) // staging.EPOCH_DS)
-        recovery_h = sum(staging.EPOCH_DS / 10 for s in stages[max(0, k):] if s != "awake") / 3600
+        stab = []
+        for thr in RI_THRESHOLDS:
+            t = hr_low_at
+            for (c0, h0), (c1, h1) in zip(hrs, hrs[1:]):
+                if c1 - c0 <= 3300 and (h0 + h1) / 2 <= hr_low + thr:
+                    t = (c0 + c1) / 2
+                    break
+            stab.append(t)
+        rem_h = [sum(staging.EPOCH_DS / 10 for s in stages[max(0, int((t - S) // staging.EPOCH_DS)):]
+                     if s != "awake") / 3600 for t in stab]
+        recovery_h = statistics.fmean(rem_h)
+        hr_stable_at = statistics.median(stab)
 
     # RMSSD « maison » sur les battements : contrôle croisé seulement
     own_rm = []
@@ -345,9 +393,9 @@ def compute_night(con, axis, night, charging):
         "timing": subscore_timing(mid_h) if mid_h is not None else None,
         "restfulness": subscore_restfulness(sm["waso"] / 60, sm["awakenings"], restless_frac),
     }
-    avail = {k: v for k, v in subs.items() if v is not None}
-    wsum = sum(WEIGHTS[k] for k in avail)
-    score = int(round(sum(WEIGHTS[k] * v for k, v in avail.items()) / wsum)) if wsum else None
+    # score provisoire (horaire non ajusté) : update_references le recalcule avec
+    # le décalage d'horaire tiré des nuits de référence
+    score = sleep_score(subs)
 
     # --- séries 5 min pour les graphes
     series = {}
@@ -475,6 +523,7 @@ SLEEP_COLS = [
     ("provisional", "INTEGER"), ("ref_json", "TEXT"), ("ref_excluded", "TEXT"),
     ("beats_kept_pct", "REAL"), ("lead_min", "REAL"), ("hr_bins_pct", "REAL"),
     ("hr_stable_at", "INTEGER"), ("temp_ecore", "REAL"), ("brief_hash", "TEXT"),
+    ("timing_shift", "REAL"), ("timing_habit", "REAL"),
     ("input_hash", "TEXT"), ("ts", "INTEGER"),
 ]
 
@@ -592,8 +641,10 @@ def update_references(der, nights):
     non notée ne doit pas non plus gonfler la moyenne et l'écart-type.
 
     Écrit pour chaque nuit l'écart de température, ses références figées
-    (ref_json, affichées sur sa page même des semaines plus tard) et le motif
-    d'exclusion ; renseigne n["_ref"] et n["_tension"] pour la récupération."""
+    (ref_json, affichées sur sa page même des semaines plus tard), le motif
+    d'exclusion, et le score de sommeil final (horaire ajusté au milieu de
+    sommeil habituel des références) ; renseigne n["_ref"] et n["_tension"]
+    pour la récupération."""
     sick = sick_nights(der)
     clean = []
     for i, n in enumerate(nights):
@@ -604,6 +655,14 @@ def update_references(der, nights):
             dev = round(n["temp_mean"] - statistics.median(prev_t), 2)
             status = "fiable" if len(prev_t) >= BASE_RELIABLE_N else "provisoire"
         n["temp_dev"], n["temp_n"], n["temp_status"] = dev, len(prev_t), status
+        # horaire ajusté au milieu de sommeil habituel (nuits de référence) → score final
+        shift, habit = timing_shift(ref)
+        subs = json.loads(n.get("subscores") or "{}")
+        if n.get("timing") is not None and subs:
+            subs["timing"] = r(subscore_timing((n["timing"] - shift) % 24), 1)
+            n["score"] = sleep_score(subs)
+        n["subscores"] = json.dumps(subs)
+        n["timing_shift"], n["timing_habit"] = shift, r(habit, 2)
         n["_ref"] = ref
         n["_tension"] = tension_for(i, nights, ref)
         reason = ("maladie (journal)" if n["night"] in sick else
@@ -611,8 +670,9 @@ def update_references(der, nights):
         n["ref_json"] = json.dumps(ref_stats(ref))
         n["ref_excluded"] = reason
         der.execute("UPDATE sleep_scores SET temp_dev=?, temp_n=?, temp_status=?, ref_json=?,"
-                    " ref_excluded=? WHERE night=?",
-                    (dev, len(prev_t), status, n["ref_json"], reason, n["night"]))
+                    " ref_excluded=?, score=?, subscores=?, timing_shift=?, timing_habit=? WHERE night=?",
+                    (dev, len(prev_t), status, n["ref_json"], reason, n["score"], n["subscores"],
+                     n["timing_shift"], n["timing_habit"], n["night"]))
         if reason is None:
             clean.append(n)
 
@@ -718,8 +778,11 @@ def readiness_for(i, nights, activity, ref=None):
     for k in c:
         c[k]["score"] = r(c[k]["score"], 0)
         c[k]["rating"] = oc.rating(c[k]["score"])
-    scores = [x["score"] for x in c.values() if x["score"] is not None]
-    score = round(statistics.fmean(scores)) if len(scores) >= 5 else None
+        if k in READY_WEIGHTS:
+            c[k]["weight"] = READY_WEIGHTS[k]
+    avail = [(x["score"], READY_WEIGHTS.get(k, 1.0)) for k, x in c.items() if x["score"] is not None]
+    score = (round(sum(s * w for s, w in avail) / sum(w for _, w in avail))
+             if len(avail) >= 5 else None)
     return score, c, len(prev)
 
 
@@ -874,6 +937,12 @@ def compute_activity_day(con, axis, day, nights, rests, charging_ds, weight, now
 
     frac = max(0.0, min(1.0, (end - t0) / 86400))
     bmr_day = bmr * frac if bmr else None
+    # journée partielle (pas de score) : en cours, ou moins de 80 % du temps hors
+    # lit/repos couvert par une mesure d'intensité (anneau retiré, en charge,
+    # trous). L'ancien seuil absolu de 600 min d'éveil mesuré privait de score une
+    # journée complète avec une longue nuit (28/10 : 596 min, couverture 95 %).
+    seen = len(awake) + states.get("non porté", 0) + states.get("retiré", 0) + states.get("charge", 0)
+    partial = t1 > now or seen < 360 or len(measured) < 0.8 * seen
     return {"day": day,
             "worn_min": sum(n for s, n in states.items() if s in ("éveil", "lit", "repos")),
             "awake_min": len(awake), "in_bed_min": states.get("lit", 0), "sleep_min": round(sleep_min),
@@ -882,7 +951,7 @@ def compute_activity_day(con, axis, day, nights, rests, charging_ds, weight, now
             "rest_awake_min": rest_awake, "inactive_min": inactive, "low_min": low, "medium_min": med,
             "high_min": high, "met_min_mh": round(met_mh, 1), "sedentary_bouts": sedentary_bouts(grid),
             "active_kcal": round(kcal), "easy_day": int(high <= 15 and med + high <= 85),
-            "partial": int(len(measured) < 600 or t1 > now),
+            "partial": int(partial),
             "steps": int(round(sum(g["steps"] for g in grid.values()))),
             "bmr_kcal": round(bmr_day) if bmr_day else None,
             "total_kcal": round(bmr_day) + round(kcal) if bmr_day else None,
@@ -1102,15 +1171,19 @@ def briefing_context(der, night, days=14):
                               for x in tension.get("signals", [])]}}
         if rd[3] is not None:
             rec["dette_de_sommeil_14j"] = _hmin(rd[3])
-            rec["besoin_de_sommeil_retenu"] = _hmin(rd[4] or SLEEP_NEED_H) + " (non personnalisé)"
+            rec["besoin_de_sommeil_retenu"] = _hmin(rd[4] or SLEEP_NEED_H) + " (estimé sur vos nuits)"
+    # journal : un tag du jour J décrit la journée qui PRÉCÈDE la nuit J+1 → pour la
+    # nuit J, les jours J−2 et J−1 seulement (un tag saisi le soir du jour J, après
+    # la nuit, ne doit ni l'expliquer ni faire réécrire son résumé : cas du 03/11)
+    d0 = datetime.strptime(night, "%Y-%m-%d")
     tags = [dict(zip(("jour", "type", "note"), t)) for t in der.execute(
         "SELECT day, kind, note FROM tags WHERE day>=? AND day<=? ORDER BY day",
-        ((datetime.strptime(night, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"), night))]
+        ((d0 - timedelta(days=2)).strftime("%Y-%m-%d"), (d0 - timedelta(days=1)).strftime("%Y-%m-%d")))]
     ctx = {"nuit_a_resumer": _brief_night(nights[-1]),
            "comparaison_a_vos_references": reference_comparison(upto[-1]),
            "recuperation_du_jour": rec,
            "nuits_precedentes_pour_comparaison": [_brief_night(n) for n in nights[:-1]],
-           "journal": tags}
+           "journal_des_jours_precedant_la_nuit": tags}
     return json.dumps(ctx, ensure_ascii=False)
 
 
@@ -1157,8 +1230,9 @@ BRIEFING_SYSTEM = (
     "Vous rédigez le résumé matinal des données de sommeil d'une personne qui porte un anneau Oura "
     "(données calculées localement, sans cloud). Vous recevez en JSON : la nuit à résumer, sa "
     "comparaison aux références personnelles (déjà calculée), la récupération du jour (score, "
-    "contributeurs sur 100, signes de tension), les nuits précédentes et le journal (tags saisis "
-    "par la personne).\n"
+    "contributeurs sur 100, signes de tension), les nuits précédentes et le journal des deux jours "
+    "qui précèdent la nuit (tags saisis par la personne ; la note de la veille décrit la journée "
+    "qui a précédé la nuit).\n"
     "Forme : français, VOUVOIEMENT, 5 à 8 phrases en trois temps — (1) la nuit : durée, efficacité, "
     "continuité, et ce qui s'écarte des références ; (2) la récupération : son score et les 2 ou 3 "
     "contributeurs les plus bas, les signes de tension ; (3) une suggestion concrète pour la journée "
@@ -1268,9 +1342,13 @@ def briefing_hash(ctx):
     pas partie : chaque réécriture coûte un appel au gros modèle."""
     c = json.loads(ctx)
     rec = c.get("recuperation_du_jour") or {}
-    key = {"n": c.get("nuit_a_resumer"), "cmp": c.get("comparaison_a_vos_references"),
+    # le milieu du sommeil (HH:MM) dépend de l'axe horaire, réajusté à chaque
+    # nouvelle ancre : il bougeait de 1 à 3 min d'un passage à l'autre et faisait
+    # réécrire le résumé jusqu'à 3 fois par matin (04/11) → hors empreinte
+    night = {k: v for k, v in (c.get("nuit_a_resumer") or {}).items() if k != "milieu_du_sommeil"}
+    key = {"n": night, "cmp": c.get("comparaison_a_vos_references"),
            "s": rec.get("score_recuperation"), "t": (rec.get("signes_de_tension") or {}).get("niveau"),
-           "j": c.get("journal")}
+           "j": c.get("journal_des_jours_precedant_la_nuit")}
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -1325,7 +1403,7 @@ def run(db, derived, briefing=False, recompute_all=False, now=None, log=print):
             continue
         row = compute_night(con, axis, n, charging)
         write_night(der, row, h)
-        log(f"nightly: nuit {row['night']} — score {row['score']} ({row['total']} h, "
+        log(f"nightly: nuit {row['night']} — score avant horaire ajusté {row['score']} ({row['total']} h, "
             f"profond {row['deep']} h, REM {row['rem']} h, eff {row['efficiency']} %, "
             f"FC basse {row['hr_min']}, HRV {row['hrv_rmssd']}, resp {row['resp_rate']}, axe {row['axis_mode']})")
     der.commit()

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -88,6 +89,20 @@ class SignalTest(Base):
         self.assertGreater(len(rr), 20)
         med = sorted(v for _, v in rr)[len(rr) // 2]
         self.assertAlmostEqual(med, 14.0, delta=1.0)
+
+    def test_resp_peak_interpolated(self):
+        """Pic spectral interpolé : la fréquence n'est plus quantifiée au pas de
+        0,5 cycle/min (segments de 120 s)."""
+        for bpm in (13.3, 14.25, 15.6):
+            f = bpm / 60
+            ts, xs, t = [], [], 0.0
+            while t < 300:
+                ibi = 900 + 60 * math.sin(2 * math.pi * f * t)
+                t += ibi / 1000
+                ts.append(t)
+                xs.append(ibi)
+            peak, _ = oc._welch_peak(ts, xs)
+            self.assertAlmostEqual(peak * 60, bpm, delta=0.12)
 
     def test_skin_temp_uses_first_sensor_only(self):
         self.assertEqual(oc.skin_temp({"temps_c": [34.4, 36, 37.1]}), 34.4)
@@ -202,9 +217,65 @@ class RecoveryTest(Base):
         for k in (ctx["recuperation_du_jour"] or {}).get("contributeurs_sur_100", {}):
             ctx["recuperation_du_jour"]["contributeurs_sur_100"][k] = 1
         self.assertEqual(dn.briefing_hash(json.dumps(ctx)), h)
-        ctx["journal"] = [{"jour": night, "type": "maladie", "note": None}]
+        # l'axe horaire réajusté déplace le milieu du sommeil d'une minute : pas de réécriture
+        ctx["nuit_a_resumer"]["milieu_du_sommeil"] = "09:59"
+        self.assertEqual(dn.briefing_hash(json.dumps(ctx)), h)
+        ctx["journal_des_jours_precedant_la_nuit"] = [{"jour": night, "type": "maladie", "note": None}]
         self.assertNotEqual(dn.briefing_hash(json.dumps(ctx)), h)
         self.assertIn("comparaison_a_vos_references", ctx)
+
+    def test_briefing_journal_days_before_night(self):
+        """Le tag du jour J décrit la journée qui précède la nuit J+1 : pour la nuit J,
+        seuls les tags de J−2 et J−1 entrent dans le contexte."""
+        night = self.rows[-1]["night"]
+        d0 = datetime.strptime(night, "%Y-%m-%d")
+        days = [(d0 + timedelta(days=k)).strftime("%Y-%m-%d") for k in (-3, -2, -1, 0)]
+        self.derived.executemany("INSERT INTO tags (day, kind, note, created_unix) VALUES (?, 'stress', ?, 0)",
+                                 [(d, d) for d in days])
+        try:
+            ctx = json.loads(dn.briefing_context(self.derived, night))
+            self.assertEqual([t["jour"] for t in ctx["journal_des_jours_precedant_la_nuit"]], days[1:3])
+        finally:
+            self.derived.execute("DELETE FROM tags WHERE note IN (?,?,?,?)", days)
+
+    def test_recovery_index_threshold_average(self):
+        """Indice = moyenne des sommeils restants pour les seuils +2..+5 bpm ; l'heure
+        de stabilisation affichée en est la médiane."""
+        self.assertEqual(dn.RI_THRESHOLDS, (2, 3, 4, 5))
+        for r in self.rows:
+            if r["recovery_index"] is not None:
+                self.assertIsNotNone(r["hr_stable_at"])
+                self.assertGreaterEqual(r["hr_stable_at"], r["hr_lowest_at"] - 86400)
+
+    def test_readiness_weights(self):
+        """Indice de récupération à demi-poids dans la moyenne de récupération."""
+        for row in self.derived.execute("SELECT score, contributors FROM readiness WHERE score IS NOT NULL"):
+            c = json.loads(row[1])
+            avail = [(v["score"], dn.READY_WEIGHTS.get(k, 1.0)) for k, v in c.items() if v["score"] is not None]
+            self.assertEqual(row[0], round(sum(s * w for s, w in avail) / sum(w for _, w in avail)))
+            if "recovery_index" in c:
+                self.assertEqual(c["recovery_index"]["weight"], 0.5)
+
+    def test_sleep_score_weights(self):
+        self.assertEqual(sum(dn.WEIGHTS.values()), 90)
+        subs = {k: 100.0 for k in dn.WEIGHTS}
+        self.assertEqual(dn.sleep_score(subs), 100)
+        subs["deep"] = 0.0
+        self.assertEqual(dn.sleep_score(subs), round(100 * 85 / 90))
+        subs["timing"] = None
+        self.assertEqual(dn.sleep_score(subs), round(100 * 75 / 80))
+
+    def test_timing_shift(self):
+        """Décalage de l'horaire = milieu habituel − 03:30, borné à [0, 2 h], au quart
+        d'heure, à partir de 14 nuits ; un milieu après minuit reste correctement ordonné."""
+        ref = lambda mid, k=20: [{"timing": mid}] * k
+        self.assertEqual(dn.timing_shift(ref(5.0, 13)), (0.0, None))
+        self.assertEqual(dn.timing_shift(ref(5.0))[0], 1.5)
+        self.assertEqual(dn.timing_shift(ref(7.9))[0], 2.0)
+        self.assertEqual(dn.timing_shift(ref(23.5))[0], 0.0)    # milieu avant minuit
+        self.assertEqual(dn.timing_shift(ref(4.6))[0], 1.0)     # 1,1 h → 1,0
+        # courbe décalée : 05:00 avec +1,5 h équivaut à 03:30 sans décalage
+        self.assertEqual(dn.subscore_timing((5.0 - 1.5) % 24), dn.subscore_timing(3.5))
 
     def test_lerp_score(self):
         pts = [(0, 10), (2, 35), (6, 100)]

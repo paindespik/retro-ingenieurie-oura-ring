@@ -82,7 +82,13 @@ function debtText(r) {
   const [c] = debtCat(r.sleep_debt_h);
   const val = r.sleep_debt_h < 1 / 60 ? "<b>aucune</b>" : `<b>${dur(r.sleep_debt_h)}</b> · ${c}`;
   return `dette de sommeil (14 j) : ${val}
-    <span class="muted">— besoin fixé à ${dur(r.sleep_need_h)}, non personnalisé</span>`;
+    <span class="muted">— besoin estimé à ${dur(r.sleep_need_h)} sur vos nuits</span>`;
+}
+// Horaire du score de sommeil : courbe (100 jusqu'à 02:40) décalée selon le milieu de sommeil habituel
+function timingNote(n) {
+  if (n.timing_habit == null) return "note maximale jusqu'à 02:40 (ajustement à votre rythme après 14 nuits de référence)";
+  const sh = n.timing_shift || 0;
+  return `note maximale jusqu'à ${hmDec(2 + 40 / 60 + sh)} (votre milieu habituel : ${hmDec(n.timing_habit)}${sh ? ` ; courbe décalée de ${dur(sh)}` : ""})`;
 }
 // dernière mesure : en gras si elle a moins de 30 min, grisée sinon (ex. FC de jour suspendue la nuit)
 function lastVal(v, t) {
@@ -469,10 +475,10 @@ function sleepContribValue(k, n) {
     total_sleep: `${dur(n.total)} (repère adulte 7–9 h)`,
     efficiency: `${num(n.efficiency)} % du temps au lit (repère > 85 %)`,
     restfulness: `éveil après endormissement ${num(n.waso)} min · ${pl(n.awakenings ?? 0, "réveil")} > 5 min · ${num(n.movement)} min agitées`,
-    rem: `${dur(n.rem)} · ${num((100 * n.rem) / sleep)} % (ordre de grandeur adulte ~20–25 %)`,
-    deep: `${dur(n.deep)} · ${num((100 * n.deep) / sleep)} % (ordre de grandeur adulte ~15–25 %)`,
+    rem: `${dur(n.rem)} · ${num((100 * n.rem) / sleep)} % (ordre de grandeur adulte ~20–25 %) · estimation, demi-poids`,
+    deep: `${dur(n.deep)} · ${num((100 * n.deep) / sleep)} % (ordre de grandeur adulte ~15–25 %) · estimation, demi-poids`,
     latency: `${num(n.latency)} min (repère Oura 15–20 min)`,
-    timing: `milieu du sommeil ${hmDec(n.timing)} (100 jusqu'à 02:40 ; courbe fixe, non ajustée au chronotype)`,
+    timing: `milieu du sommeil ${hmDec(n.timing)} · ${timingNote(n)}`,
   }[k];
 }
 
@@ -483,9 +489,9 @@ function readyContribValue(k, c) {
       ? `calibrage : ${c.nights}/60 nuits, hors du score · ${num(c.value, 0)} ms (14 j pondérés) vs ${num(c.baseline, 0)} ms`
       : `${num(c.value, 0)} ms (14 j pondérés) vs ${num(c.baseline, 0)} ms · ${signed(c.delta, 0)} %`;
     case "temperature": return `${signed(c.value, 2)} °C · référence ${c.status}`;
-    case "recovery_index": return `${dur(c.value)} de sommeil après la stabilisation de la FC`;
+    case "recovery_index": return `${dur(c.value)} de sommeil après la stabilisation de la FC${c.weight ? " · demi-poids (indicateur instable)" : ""}`;
     case "sleep": return dur(c.value);
-    case "sleep_balance": return `moyenne pondérée ${dur(c.value)} / besoin ${dur(c.need)} (non personnalisé)`;
+    case "sleep_balance": return `moyenne pondérée ${dur(c.value)} / besoin ${dur(c.need)} (estimé sur vos nuits)`;
     case "sleep_regularity": return `écart-type du milieu de sommeil ${c.value} min`;
     case "previous_day_activity": return `${num(c.value)} MET-min · ${dur(c.inactive_min / 60)} inactif`;
     default: return "";
@@ -581,12 +587,15 @@ async function pageSleep(m, date) {
         ${tile("Latence", num(n.latency), "min", "repère 15–20 min", n.latency > 30 ? "up-bad" : "")}
         ${tile("Éveil après endormissement", num(n.waso), "min", `${pl(n.awakenings ?? 0, "réveil")} > 5 min`, n.waso > 20 ? "up-bad" : "")}
         ${tile("Au lit", `${n.bedtime}–${n.wake_time}`, "", `endormi ${hm(n.onset_unix)} · réveil ${hm(n.end_unix)}`)}
-        ${tile("Milieu du sommeil", hmDec(n.timing), "", "note maximale jusqu'à 02:40 (non ajusté au chronotype)")}
+        ${tile("Milieu du sommeil", hmDec(n.timing), "", n.timing_habit == null ? "note maximale jusqu'à 02:40"
+          : `note maximale jusqu'à ${hmDec(2 + 40 / 60 + (n.timing_shift || 0))} · habituel ${hmDec(n.timing_habit)}`)}
       </div></div></div>`;
   html += `<div class="card"><h2>Hypnogramme <span class="right small muted">estimation — voir « Méthode »</span></h2>
     <div id="hyp"></div>${stageBreakdown(n)}
     <div class="tiny muted" style="margin-top:.3rem">Ordres de grandeur chez l'adulte : profond ~15–25 %, REM ~20–25 % du sommeil.
-    La National Sleep Foundation (Ohayon 2017) ne juge défavorables que profond ≤ 5 % ou REM ≥ 41 %.</div></div>`;
+    La National Sleep Foundation (Ohayon 2017) ne juge défavorables que profond ≤ 5 % ou REM ≥ 41 %.
+    <b>Stades indicatifs</b> : l'heuristique place souvent le profond en milieu de nuit (il domine normalement le premier tiers)
+    et manque le premier REM ; leur durée suit surtout la baisse de FC de la nuit. Ils comptent à demi-poids dans le score.</div></div>`;
   html += `<div class="grid"><div class="card"><h2>Contributeurs du score</h2>
       ${Object.keys(SLEEP_CONTRIB).map((k) => contribRow(SLEEP_CONTRIB[k], sub[k] == null ? null : { score: sub[k] }, sleepContribValue(k, n))).join("")}</div>
     <div class="card"><h2>Constantes</h2><div class="tiles">${vitalTiles(n, B)}</div></div></div>`;
@@ -617,18 +626,26 @@ async function pageSleep(m, date) {
     (mouvement de l'accéléromètre + FC et régularité de la FC battement par battement, lissage par modèle de Markov caché,
     a priori circadiens : peu de REM dans la première heure, profond plutôt en début de nuit), avec des plafonds
     physiologiques (profond ≤ 25 %, REM ≤ 30 %). Non validée contre polysomnographie : l'éveil calme et le REM restent
-    difficiles à distinguer, les durées par stade sont indicatives.</p>
+    difficiles à distinguer, les durées par stade sont indicatives. Limites mesurées sur vos nuits (audit du 06/11/2026) :
+    le profond culmine aux 6e–7e dixièmes de la nuit au lieu du premier tiers, le premier REM arrive en médiane 2 h 15
+    après l'endormissement (repère 70–120 min), et la part de profond est d'autant plus faible que la FC baisse au fil
+    de la nuit (la FC est comparée à la médiane de toute la nuit).</p>
     <p><b>FC la plus basse</b> : minimum des moyennes sur 10 min pendant le sommeil. <b>HRV</b> : moyenne des RMSSD
     sur 5 min calculés par l'anneau. <b>Indice de récupération</b> : sommeil restant après la stabilisation de la FC,
-    premier instant où sa moyenne sur 10 min revient à moins de 3 bpm de la plus basse (Oura : optimal ≥ 6 h). <b>Respiration</b> : estimée à partir de l'arythmie sinusale respiratoire (variation de la FC
-    avec la respiration) — expérimentale, non vérifiée contre une référence. <b>Température</b> : médiane du capteur cutané entre
+    premier instant où sa moyenne sur 10 min revient près de la plus basse ; moyenne des indices obtenus avec des seuils
+    de +2, +3, +4 et +5 bpm (un seuil unique le déplaçait de plusieurs heures pour 1 bpm) ; Oura : optimal ≥ 6 h.
+    <b>Respiration</b> : estimée à partir de l'arythmie sinusale respiratoire (variation de la FC
+    avec la respiration), pic spectral interpolé — expérimentale, non vérifiée contre une référence. <b>Température</b> : médiane du capteur cutané entre
     l'endormissement et la fin du sommeil ; l'écart est comparé à la médiane de vos nuits saines précédentes (provisoire avant 14 nuits).</p>
     <p><b>Références</b> : vos nuits précédentes, sans celles qui suivent un jour noté « malade » dans le journal ni celles
     qui présentent des signes de tension marqués ; elles sont figées au calcul de chaque nuit.</p>
-    <p><b>Score</b> : 7 contributeurs pondérés 35/15/10/10/10/10/10 (pondération estimée par rétro-ingénierie,
-    dmturner44/oura_sleep_score_algo : Oura ne la publie pas), barèmes de la même source pour
-    durée/stades/efficacité/latence/horaire et barème local pour la tranquillité (seuils NSF). L'horaire suit une courbe
-    fixe (100 jusqu'à un milieu de sommeil à 02:40, 0 à partir de 05:43), non ajustée au chronotype. ${esc(n.score_source || "")}</p>
+    <p><b>Score</b> : 7 contributeurs pondérés durée 35, tranquillité 15, efficacité 10, latence 10, horaire 10,
+    profond 5 et REM 5 (pondération Oura estimée par rétro-ingénierie, dmturner44/oura_sleep_score_algo, avec les stades
+    ramenés de 10 à 5 tant qu'ils ne sont pas fiables), barèmes de la même source pour
+    durée/stades/efficacité/latence/horaire et barème local pour la tranquillité (seuils NSF). <b>Horaire</b> : courbe
+    100 jusqu'à un milieu de sommeil à 02:40, 0 trois heures plus tard, décalée selon votre milieu de sommeil habituel
+    (médiane de vos nuits de référence) au-delà de 03:30, de 2 h au plus — comme Oura, qui ajuste l'horaire au
+    chronotype. ${esc(n.score_source || "")}</p>
     <p class="muted">Axe horaire : ${esc(n.axis_mode)} · source FC : ${esc(n.hr_source)} · HRV recalculé sur les battements
     (contrôle) : ${num(n.hrv_beats)} ms · calcul ${dtShort(n.ts)}</p></div></details></div>`;
   m.innerHTML = html;
@@ -638,7 +655,7 @@ async function pageSleep(m, date) {
   const hrB = B.hr_min;
   $("#c-hr", m).append(timeChart({ x0, x1, height: 170, series: [{ name: "FC", color: "var(--hr)", unit: "bpm", points: pts("hr") }],
     markers: [...(n.hr_lowest_at ? [{ t: n.hr_lowest_at, v: n.hr_min, label: `FC la plus basse ${num(n.hr_min)} bpm à ${hm(n.hr_lowest_at)}`, color: "var(--hr)" }] : []),
-      ...(n.hr_stable_at && n.hr_stable_at !== n.hr_lowest_at ? [{ t: n.hr_stable_at, v: n.hr_min + 3, label: `FC stabilisée (≤ +3 bpm) à ${hm(n.hr_stable_at)}`, color: "var(--fair)" }] : [])],
+      ...(n.hr_stable_at && n.hr_stable_at !== n.hr_lowest_at ? [{ t: n.hr_stable_at, v: n.hr_min + 3.5, label: `FC stabilisée (seuils +2 à +5 bpm, médiane) à ${hm(n.hr_stable_at)}`, color: "var(--fair)" }] : [])],
     band: hrB && hrB.n >= 3 ? [hrB.mean - Math.max(hrB.sd, 1), hrB.mean + Math.max(hrB.sd, 1), "FC la plus basse habituelle (± 1 écart-type)"] : null, legend: true }));
   $("#c-hrv", m).append(timeChart({ x0, x1, width: gridChartWidth(260, 2), height: 140, series: [{ name: "RMSSD", color: "var(--hrv)", unit: "ms", points: pts("rmssd") }],
     hline: n.hrv_rmssd ? { v: n.hrv_rmssd } : null }));
@@ -676,15 +693,18 @@ async function pageRecovery(m, date) {
     (baisse au-delà de +3 à +5 bpm), équilibre HRV (14 derniers jours pondérés vs moyenne longue), écart de
     température (ne peut que diminuer la note), indice de récupération (optimal ≥ 6 h), sommeil de la nuit, équilibre
     du sommeil sur 14 jours, régularité du milieu de sommeil, activité de la veille.</p>
-    <p><b>Besoin de sommeil</b> : fixé à 7 h 30 (non personnalisé ; Oura l'estime sur 90 jours d'historique).
+    <p><b>Besoin de sommeil</b> : 7 h 45, estimé le 06/11/2026 sur 46 nuits (moyenne 7 h 40, nuits sans réveil
+    contraint 7 h 54, nuits libres 8 h 05) ; Oura l'estime sur 90 jours d'historique. La dette y est très sensible
+    (une demi-heure de besoin en plus ≈ 4 h de dette sur 14 jours).
     <b>Dette de sommeil</b> (définition Oura) : manque de sommeil des 14 derniers jours par rapport à ce besoin, les nuits
     récentes pesant davantage ; une nuit plus longue la rembourse. Aucune, faible (&lt; 2 h), modérée (2–5 h), élevée (&gt; 5 h) ;
     au moins 5 nuits sur 14 jours.</p>
-    <p>Barèmes et pondération (moyenne simple) sont <b>locaux</b> : Oura ne publie pas les siens. Le score global
-    n'apparaît qu'à partir de 5 contributeurs disponibles. L'<b>équilibre HRV</b> reste en calibrage, hors du score,
+    <p>Barèmes et pondération sont <b>locaux</b> : Oura ne publie pas les siens. Moyenne des contributeurs, l'indice de
+    récupération à <b>demi-poids</b> (il faisait à lui seul plus de la moitié des variations du score tout en étant le
+    moins robuste). Le score global n'apparaît qu'à partir de 5 contributeurs disponibles. L'<b>équilibre HRV</b> reste en calibrage, hors du score,
     tant qu'il n'y a pas 60 nuits : avant, la moyenne longue se confond avec les 14 derniers jours et il vaut toujours ~100.
-    <b>Indice de récupération</b> : sommeil restant après le premier instant où la FC (moyenne sur 10 min) revient à moins
-    de 3 bpm de sa valeur la plus basse.</p>
+    <b>Indice de récupération</b> : sommeil restant après le premier instant où la FC (moyenne sur 10 min) revient près
+    de sa valeur la plus basse, en moyenne sur les seuils +2, +3, +4 et +5 bpm.</p>
     <p><b>Signes de tension</b> : FC la plus basse ≥ +5 bpm (et ≥ 2 écarts-types), FC moyenne ≥ +8 bpm, HRV ≤ −25 %,
     température ≥ +0,5 °C, respiration ≥ +2/min, par rapport à vos nuits saines précédentes (sans les nuits qui
     suivent un jour noté « malade » dans le journal ni celles qui présentent elles-mêmes des signes marqués). « Marqués » = au moins deux signaux
